@@ -1,0 +1,372 @@
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+
+type Bindings = {
+  MOUSER_API_KEY: string
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
+
+app.use('/api/*', cors())
+
+// ── PART MAP — primary + fallback per category ────────────────────────────────
+const PART_MAP: Record<string, { label: string; parts: string[] }> = {
+  pm_ldo:    { label: 'LDO Regulators',       parts: ['TPS7A8300RGWR','TPS7A4501DCQR'] },
+  pm_acdc:   { label: 'AC/DC Switching',       parts: ['UCC28180D','UCC28C40DR'] },
+  pm_dcdc:   { label: 'DC/DC Switching',       parts: ['TPS54360BDDA','LM5176PWPR'] },
+  pm_super:  { label: 'Supervisor & Reset',    parts: ['TPS3839G33DQNR','TPS3700DDCR2'] },
+  pm_batt:   { label: 'Battery Mgmt',          parts: ['BQ25896RTWT','BQ76952PFBR'] },
+  amp_op:    { label: 'Op-Amps',               parts: ['OPA376AIDBVR','TLV2372IDGKR'] },
+  amp_instr: { label: 'Instrumentation',       parts: ['INA826AIDR','INA333AIDR'] },
+  amp_audio: { label: 'Audio Amps',            parts: ['TPA3118D2DAPR','LM4871M/NOPB'] },
+  dac_adc:   { label: 'ADC',                   parts: ['ADS1115IRUGR','ADS8685IPW'] },
+  dac_dac:   { label: 'DAC',                   parts: ['DAC8552IDGK','DAC60508ZCRTET'] },
+  if_can:    { label: 'CAN Transceivers',      parts: ['TCAN1042DRBTQ1','TCAN1051DRQ1'] },
+  if_lin:    { label: 'LIN Transceivers',      parts: ['TLIN1021DRBRQ1','SN65HVDA100DR'] },
+  if_eth:    { label: 'Ethernet PHYs',         parts: ['DP83867IRRGZR','DP83826ERHBR'] },
+  iso_dig:   { label: 'Digital Isolators',     parts: ['ISO7742DWR','ISO1541DWR'] },
+  iso_rein:  { label: 'Reinforced Isolators',  parts: ['ISO7042CDWR','ISO5852SQDWRQ1'] },
+  mcu_msp:   { label: 'MSP430',                parts: ['MSP430FR2355TRHAT','MSP430G2553IPW28R'] },
+  mcu_c2k:   { label: 'C2000 Real-Time',       parts: ['TMS320F28035PNT','TMS320F280049CPMS'] },
+  mcu_m0:    { label: 'MSPM0',                 parts: ['MSPM0G3507SPTR','MSPM0L1306SRHAR'] },
+  mcu_cc:    { label: 'SimpleLink',            parts: ['CC2652R1FRGZR','CC2640R2FRGZR'] },
+  mcu_sit:   { label: 'Sitara MPU',            parts: ['AM3352BZCZD80','AM3359BZCZD80'] },
+  gan_342:   { label: 'LMG342x (600V)',        parts: ['LMG3422R030RQZT','LMG3410R070RJZR'] },
+  gan_365:   { label: 'LMG3650 (TOLL)',        parts: ['LMG3652R070KLAR','LMG3650R070KLAR'] },  // LMG3652 has unit pricing; LMG3650 is reel-only (min=2000)
+  gan_520:   { label: 'LMG5200 (80V)',         parts: ['LMG5200MOFT','LMG5350R070YFFT'] },
+  dc_48v:    { label: '48V Bus Converters',    parts: ['LM5180NGUR','LM25180RNXR'] },
+  dc_sps:    { label: 'Smart Power Stages',    parts: ['TPS53688RSBT','TPS53689RSBR'] },
+  dc_efuse:  { label: 'eFuses',                parts: ['TPS2595DRCR','TPS25940ARVCR'] },
+  dc_hswap:  { label: 'Hot-Swap Controllers',  parts: ['TPS23861PW','TPS2484PWR'] },
+  dc_tps:    { label: 'TPS536xx (AI Power)',   parts: ['TPS53622RSLR','TPS53681RSBT'] },
+}
+
+// ── BASELINES — Mouser qty=1 unit prices, clean anchor set 27-Feb-2026 (USD) ───
+// Methodology: qty=1 price break, INR→USD at ₹83.5, verified via direct API call
+// Anchor: 27-Feb-2026 (mid-Q1 2026). Label = "QTD vs 27-Feb-26"
+// QoQ % = (live_price - baseline) / baseline * 100
+// When Mar-26 quarter ends (31-Mar-2026), replace these with Mar-31 closing prices
+// to compute a true QoQ for the Jun-26 column.
+const BASELINES: Record<string, number> = {
+  pm_ldo:    6.8752,   // TPS7A8300RGWR   qty=1  ₹574.08
+  pm_acdc:   1.9582,   // UCC28180D        qty=1  ₹163.51
+  pm_dcdc:   5.7562,   // TPS54360BDDA     qty=1  ₹480.64
+  pm_super:  0.8177,   // TPS3839G33DQNR   qty=1  ₹68.28
+  pm_batt:   5.2398,   // BQ25896RTWT      qty=1  ₹437.52
+  amp_op:    2.1303,   // OPA376AIDBVR     qty=1  ₹177.88
+  amp_instr: 3.6366,   // INA826AIDR       qty=1  ₹303.66
+  amp_audio: 1.9366,   // TPA3118D2DAPR    qty=1  ₹161.71
+  dac_adc:   5.5087,   // ADS1115IRUGR     qty=1  ₹459.98
+  dac_dac:   21.4540,  // DAC60508ZCRTET   qty=1  ₹1791.41
+  if_can:    2.6898,   // TCAN1042DRBTQ1   qty=1  ₹224.60
+  if_lin:    1.6784,   // TLIN1021DRBRQ1   qty=1  ₹140.14
+  if_eth:    7.7789,   // DP83867IRRGZR    qty=1  ₹649.54
+  iso_dig:   3.2816,   // ISO7742DWR       qty=1  ₹274.01
+  iso_rein:  7.2625,   // ISO5852SQDWRQ1   qty=1  ₹606.42
+  mcu_msp:   4.7879,   // MSP430FR2355TRHAT qty=1  ₹399.89
+  mcu_c2k:   15.6117,  // TMS320F28035PNT  qty=1  ₹1303.58
+  mcu_m0:    2.5392,   // MSPM0G3507SPTR   qty=1  ₹212.02
+  mcu_cc:    7.2841,   // CC2652R1FRGZR    qty=1  ₹608.22
+  mcu_sit:   17.6667,  // AM3352BZCZD80    qty=1  ₹1475.17
+  gan_342:   29.1792,  // LMG3422R030RQZT  qty=1  ₹2436.47
+  gan_365:   9.5758,   // LMG3650R070KLAR  qty=2000 ₹799.58 (reel; no unit break)
+  gan_520:   18.2692,  // LMG5200MOFT      qty=1  ₹1525.48
+  dc_48v:    4.8740,   // LM5180NGUR       qty=1  ₹406.98
+  dc_sps:    14.2990,  // TPS53688RSBT     qty=1  ₹1193.97
+  dc_efuse:  2.6898,   // TPS25940ARVCR    qty=1  ₹224.60
+  dc_hswap:  4.9492,   // TPS23861PW       qty=1  ₹413.26
+  dc_tps:    12.9327,  // TPS53681RSBT     qty=1  ₹1079.88
+}
+
+// Baseline capture date — shown in UI
+const BASELINE_DATE = '27-Feb-2026'
+
+const INR_TO_USD = 1 / 83.5
+const CONCURRENCY = 6   // parallel requests at a time — safe for Mouser free tier
+const PER_BATCH_DELAY = 200  // ms between batches
+
+type RateLimitError = { rateLimited: true; retryAfterMs: number; message: string }
+type PriceResult    = { price: number; partNumber: string; availability: string }
+
+// ── Fetch a single part number from Mouser ────────────────────────────────────
+async function fetchPartPrice(
+  apiKey: string,
+  partNumber: string
+): Promise<PriceResult | RateLimitError | null> {
+  try {
+    const res = await fetch(
+      `https://api.mouser.com/api/v1/search/partnumber?apiKey=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          SearchByPartRequest: { mouserPartNumber: partNumber, partSearchOptions: 'Exact' }
+        })
+      }
+    )
+
+    // Mouser uses BOTH 429 and 403 for rate limiting
+    if (res.status === 429 || res.status === 403) {
+      const retryAfter = parseInt(res.headers.get('Retry-After') || '60') * 1000
+      // Try to parse body for more info, but treat any 403/429 as rate limit
+      try {
+        const errData: any = await res.json()
+        const errList = errData.Errors || (Array.isArray(errData) ? errData : [])
+        const code = (errList[0]?.Code || errList[0]?.ErrorCode || '').toLowerCase()
+        const msg  = (errList[0]?.Message || '').toLowerCase()
+        // 403 that is NOT a rate limit (e.g. invalid key) — surface as real error
+        if (res.status === 403 && !code.includes('toomany') && !msg.includes('maximum') && !msg.includes('rate') && !msg.includes('limit')) {
+          return null  // genuine auth error, not rate limit
+        }
+        return { rateLimited: true, retryAfterMs: retryAfter || 60_000, message: errList[0]?.Message || `HTTP ${res.status}` }
+      } catch {
+        return { rateLimited: true, retryAfterMs: retryAfter || 60_000, message: `HTTP ${res.status}` }
+      }
+    }
+
+    const data: any = await res.json()
+
+    // ── PRIORITY: check SearchResults FIRST ──────────────────────────────────
+    // Mouser sometimes returns BOTH valid SearchResults AND a rate-limit warning
+    // in the Errors array (HTTP 200 with partial data). If we have usable prices,
+    // return them — do NOT discard valid data just because Errors is also populated.
+    const parts = (data.SearchResults?.Parts || []) as any[]
+    const withPrice = parts.filter((p: any) => p.PriceBreaks?.length > 0)
+
+    // Only fall through to error-checking if we got no usable price data
+    if (!withPrice.length) {
+      if (data.Errors?.length) {
+        const code = (data.Errors[0]?.Code || data.Errors[0]?.ErrorCode || '').toLowerCase()
+        const msg  = (data.Errors[0]?.Message || '').toLowerCase()
+        if (code.includes('toomany') || msg.includes('maximum') || msg.includes('rate') || msg.includes('429') || msg.includes('limit') || msg.includes('throttl')) {
+          return { rateLimited: true, retryAfterMs: 60_000, message: data.Errors[0]?.Message || 'Rate limited' }
+        }
+        return null
+      }
+      return null
+    }
+
+    const unitParts = withPrice.filter((p: any) => parseInt(p.Min || '9999') <= 10)
+    const target = unitParts.length > 0 ? unitParts[0] : withPrice[0]
+    const breaks = [...target.PriceBreaks].sort((a: any, b: any) => a.Quantity - b.Quantity)
+    const pb = breaks.find((b: any) => b.Quantity <= 10) || breaks[0]
+
+    const numStr = (pb.Price as string).replace(/[^0-9.]/g, '')
+    let price = parseFloat(numStr)
+    if (isNaN(price) || price <= 0) return null
+    if (pb.Currency === 'INR') price *= INR_TO_USD
+    if (price > 200) return null  // reel/kit outlier
+
+    return {
+      price: Math.round(price * 10000) / 10000,
+      partNumber: target.ManufacturerPartNumber || partNumber,
+      availability: target.Availability || '—'
+    }
+  } catch (e: any) {
+    // Surface the error in diag endpoint for debugging
+    return { _error: e?.message || String(e) } as any
+  }
+}
+
+// ── Fetch one category: try primary, then fallback ────────────────────────────
+async function fetchCategory(
+  apiKey: string,
+  catId: string,
+  catData: { label: string; parts: string[] }
+): Promise<{ catId: string; result: PriceResult | null; rateLimited: boolean; retryAfterMs: number; error?: string }> {
+  for (const partNum of catData.parts) {
+    const r = await fetchPartPrice(apiKey, partNum)
+    if (!r) continue
+    if ('rateLimited' in r) {
+      return { catId, result: null, rateLimited: true, retryAfterMs: r.retryAfterMs }
+    }
+    if ('_error' in r) {
+      return { catId, result: null, rateLimited: false, retryAfterMs: 0, error: (r as any)._error }
+    }
+    return { catId, result: r, rateLimited: false, retryAfterMs: 0 }
+  }
+  return { catId, result: null, rateLimited: false, retryAfterMs: 0 }
+}
+
+// ── Fetch all 28 categories in parallel batches ───────────────────────────────
+// Batches of CONCURRENCY to avoid Mouser rate limits.
+// Total wall-clock time: ceil(28/6) = 5 batches × ~1.5s per batch ≈ 8–10s
+async function fetchAllPrices(apiKey: string) {
+  const fetchedAt = new Date().toISOString()
+  const categories = Object.entries(PART_MAP)
+  const results: Record<string, any> = {}
+  let globalRateLimited = false
+  let globalRetryAfterMs = 60_000
+  let fetchedCount = 0
+
+  // Split into batches of CONCURRENCY
+  for (let i = 0; i < categories.length; i += CONCURRENCY) {
+    const batch = categories.slice(i, i + CONCURRENCY)
+
+    // Fire batch in parallel
+    const batchResults = await Promise.all(
+      batch.map(([catId, catData]) => fetchCategory(apiKey, catId, catData))
+    )
+
+    for (const { catId, result, rateLimited, retryAfterMs } of batchResults) {
+      const catData = PART_MAP[catId]
+      const baseline = BASELINES[catId] ?? 0
+
+      if (rateLimited) {
+        globalRateLimited = true
+        globalRetryAfterMs = Math.max(globalRetryAfterMs, retryAfterMs)
+      }
+
+      if (result && !rateLimited) {
+        fetchedCount++
+        results[catId] = {
+          label: catData.label,
+          avgPriceUSD: result.price,
+          baselinePriceUSD: baseline,
+          qoqPct: baseline > 0
+            ? Math.round(((result.price - baseline) / baseline) * 1000) / 10
+            : null,
+          parts: [{ part: result.partNumber, price: result.price, availability: result.availability }],
+          fetchedAt,
+          live: true
+        }
+      } else {
+        results[catId] = {
+          label: catData.label,
+          avgPriceUSD: baseline,
+          baselinePriceUSD: baseline,
+          qoqPct: null,
+          parts: [],
+          fetchedAt,
+          live: false,
+          error: rateLimited ? 'Rate limit — pending retry' : 'No pricing data available'
+        }
+      }
+    }
+
+    // Small pause between batches — avoids hammering the API
+    if (i + CONCURRENCY < categories.length) {
+      await new Promise(r => setTimeout(r, PER_BATCH_DELAY))
+    }
+  }
+
+  return {
+    results,
+    rateLimited: globalRateLimited,
+    rateLimitedAt: globalRateLimited ? new Date().toISOString() : null,
+    retryAfterMs: globalRetryAfterMs,
+    fetchedCount,
+    totalCount: categories.length
+  }
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+// NOTE: CF Workers are stateless — each edge PoP is a separate instance.
+// In-memory cache (_cache) only persists within one instance's lifetime.
+// We use CF's HTTP Cache API for cross-instance caching instead.
+
+const CACHE_KEY = 'https://ti-price-dashboard-cache/prices'
+const CACHE_TTL_SECONDS = 6 * 60 * 60  // 6 hours
+
+app.get('/api/prices', async (c) => {
+  const force = c.req.query('refresh') === 'true'
+
+  // Try CF HTTP cache first (shared across all edge instances)
+  if (!force) {
+    const cache = caches.default
+    const cached = await cache.match(CACHE_KEY)
+    if (cached) {
+      const data = await cached.json()
+      return c.json({ source: 'cache', cachedAt: data._cachedAt, fetchedCount: data._fetchedCount, totalCount: data._totalCount, data: data._results, nextRefreshMs: data._nextRefreshMs })
+    }
+  }
+
+  const apiKey = c.env.MOUSER_API_KEY
+  if (!apiKey) return c.json({ error: 'MOUSER_API_KEY not configured' }, 500)
+
+  const { results, rateLimited, rateLimitedAt, retryAfterMs, fetchedCount, totalCount } =
+    await fetchAllPrices(apiKey)
+
+  const now = new Date().toISOString()
+  const payload = { _results: results, _cachedAt: now, _fetchedCount: fetchedCount, _totalCount: totalCount, _nextRefreshMs: CACHE_TTL_SECONDS * 1000 }
+
+  // Only cache successful full fetches
+  if (!rateLimited && fetchedCount > 0) {
+    const cache = caches.default
+    const cacheResponse = new Response(JSON.stringify(payload), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}`
+      }
+    })
+    await cache.put(CACHE_KEY, cacheResponse)
+  }
+
+  return c.json({
+    source: 'live',
+    fetchedAt: now,
+    fetchedCount,
+    totalCount,
+    rateLimited,
+    rateLimitedAt,
+    retryAfterMs: rateLimited ? retryAfterMs : 0,
+    retryAt: rateLimited ? new Date(Date.now() + retryAfterMs).toISOString() : null,
+    data: results
+  })
+})
+
+// ── Diagnostic: test parallel fetches from within CF Worker ──────────────────
+app.get('/api/diag', async (c) => {
+  const apiKey = c.env.MOUSER_API_KEY
+  if (!apiKey) return c.json({ error: 'no key' }, 500)
+
+  // Fire 3 requests in parallel (like the batch does) and capture all results
+  const testParts = ['TPS7A8300RGWR', 'UCC28180D', 'TPS54360BDDA']
+  const parallelResults = await Promise.all(
+    testParts.map(async (partNum) => {
+      try {
+        const res = await fetch(
+          `https://api.mouser.com/api/v1/search/partnumber?apiKey=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              SearchByPartRequest: { mouserPartNumber: partNum, partSearchOptions: 'Exact' }
+            })
+          }
+        )
+        const body = await res.text()
+        let parsed: any = null
+        try { parsed = JSON.parse(body) } catch {}
+        const errors = parsed?.Errors ?? []
+        const parts = parsed?.SearchResults?.Parts ?? []
+        const firstPrice = parts[0]?.PriceBreaks?.[0] ?? null
+        return {
+          part: partNum,
+          httpStatus: res.status,
+          errors: errors.length ? errors[0] : null,
+          partsFound: parts.length,
+          price: firstPrice,
+          parseResult: await fetchPartPrice(apiKey, partNum)
+        }
+      } catch (e: any) {
+        return { part: partNum, fetchError: e?.message || String(e) }
+      }
+    })
+  )
+
+  return c.json({ parallelResults, ts: new Date().toISOString() })
+})
+
+app.get('/api/status', async (c) => {
+  const cache = caches.default
+  const cached = await cache.match(CACHE_KEY)
+  return c.json({
+    cached: !!cached,
+    categories: Object.keys(PART_MAP).length,
+    cacheTtlHours: CACHE_TTL_SECONDS / 3600,
+    hint: cached ? 'Cache hit — serving from CF edge cache' : 'No cache — next /api/prices will fetch live'
+  })
+})
+
+export default app
