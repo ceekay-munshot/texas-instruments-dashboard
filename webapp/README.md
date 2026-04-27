@@ -20,7 +20,7 @@
 ## Data Architecture
 - **Historical Data**: Verified QoQ % observations Jun-22 → Mar-26 (16 quarters, 28 categories, hard-coded ground truth in `public/index.html`)
 - **Live Data**: Mouser Electronics Search API — real-time unit prices fetched for 2-3 representative TI part numbers per category, averaged and compared against Feb-26 baselines to compute current-quarter QoQ %
-- **Baselines**: Actual Mouser prices captured 20-Feb-2026 (USD), stored in `src/index.ts`
+- **Baselines**: Actual Mouser prices captured 27-Feb-2026 (USD), stored in `src/index.ts`
 - **Storage**: In-memory cache at Worker instance level (6-hour TTL); secrets managed via Cloudflare Pages environment variables
 - **Currency**: INR→USD conversion at ₹83.5/$ for Mouser India API responses
 
@@ -46,10 +46,19 @@
 
 ## Technical Architecture
 - **Backend**: Hono Worker (`src/index.ts`) compiled by esbuild → `dist/_worker.js`
-- **Frontend**: Vanilla HTML + React (CDN) + Babel (in-browser) in `public/index.html`
-- **Build**: `node build.mjs` — esbuild compiles Worker, copies static files, writes `_routes.json`
+- **Frontend (production)**: React app in `src/app.jsx`, compiled by esbuild → `dist/app.js` and referenced from the patched `dist/index.html`. Production ships `src/app.jsx`, **not** the inline JSX block in `public/index.html` — that block is dev-only fallback and is stripped by `build.mjs` on every build.
+- **Build**: `node build.mjs` — esbuild compiles Worker + React app, copies static files, patches `index.html`, writes `_routes.json`
 - **Routing**: `_routes.json` sends `/api/*` to the Worker; all other paths served as static files by Cloudflare CDN
 - **API**: `GET /api/prices` (cached), `GET /api/prices?refresh=true` (force fetch), `GET /api/status`
+
+## Methodology
+
+- **Historical rows (Jun-22 → Mar-26)** are verified QoQ percentage changes for each category. The Mar-26 row is marked with a small `est` superscript because it was captured mid-quarter (27-Feb-26) and may be revised once the quarter closes.
+- **Live row (★)** is a **live price monitor**, not a reported financial-quarter metric. It is computed as: current Mouser qty=1 spot price ÷ baseline price captured 27-Feb-2026, expressed as a percentage. Same part number, same quantity break in both ends of the comparison.
+- **Live row label** in the UI is "★ Live" / "Live vs 27-Feb-26 anchor" — wording chosen to avoid confusion with formal company-reported QTD/quarter metrics.
+- **Default pricing basis** is qty=1 unit price for all parts. One exception: **LMG3650 (TOLL)** has no unit pricing on Mouser and is tracked at its reel/2000 price. The tooltip on that category shows a `⚠ reel/2000 price — no unit break` note.
+- **Currency**: USD throughout. Mouser India (INR) responses are converted at ₹83.5 / USD before comparison.
+- **`L` superscript** on a live cell means the value came from a successful live Mouser fetch in the current request. A cell without `L` (showing `—` or `…`) means that category did not return live data this fetch (rate-limit, no parts, etc.).
 
 ## Deployment
 

@@ -224,7 +224,7 @@ function App(){
   function exportCSV(){
     const rows=[['Period',...visCats.map(c=>c.l)]];
     HP.forEach(p=>rows.push([p,...visCats.map(c=>HIST[p]?.[c.id]??'')]));
-    if(liveData)rows.push(['QTD Mar-26 LIVE',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
+    if(liveData)rows.push(['Live vs 27-Feb-26 anchor',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'}));
     a.download=`ti_prices_${new Date().toISOString().slice(0,10)}.csv`;a.click();
@@ -234,7 +234,7 @@ function App(){
     const d=liveData?.[catId];if(!d)return null;
     const cat=CATS.find(c=>c.id===catId);
     return <>
-      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l} · Mouser qty=1 · vs 27-Feb-26 anchor</div>
+      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs 27-Feb-26 anchor</div>
       {d.parts?.length>0?d.parts.map((p,i)=>(
         <div key={i} style={{fontSize:'0.6rem',marginBottom:3,display:'flex',justifyContent:'space-between',gap:14}}>
           <span style={{color:'#c4d4e8',fontFamily:'monospace'}}>{p.part}</span>
@@ -301,7 +301,8 @@ function App(){
       <div style={{display:'flex',gap:10,padding:'3px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.57rem',color:'#2d4a6b',flexWrap:'wrap',background:'#050810'}}>
         <span style={{color:'#00c9a7'}}>■ positive</span><span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ bold ≥5%</span><span>·</span>
-        <span style={{color:'#ffd700'}}>★ QTD Mar-26 = live Mouser qty=1 spot price ÷ 27-Feb-26 anchor · same SKU, same qty break · hover for detail</span>
+        <span style={{color:'#ffd700'}}>★ Live = Mouser qty=1 spot price vs 27-Feb-26 anchor · same SKU &amp; qty break · L superscript = live Mouser datapoint · price monitor, not a reported financial quarter · hover for detail</span>
+        <span style={{color:'#f0a84e',marginLeft:6}}>· → Mar-26 hist = partial est. (captured 27-Feb-26) · LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
       </div>
 
       {/* ── Table ── */}
@@ -320,12 +321,12 @@ function App(){
           </thead>
           <tbody>
             {HP.map((p,pi)=>{
-              const isLast=p==="Mar-26",isRecent=["Dec-25","Mar-26"].includes(p);
+              const isLast=p==="Mar-26",isRecent=["Dec-25","Mar-26"].includes(p),isEstimate=p==="Mar-26";
               const bg=isLast?"rgba(61,142,240,0.07)":isRecent?"rgba(61,142,240,0.03)":pi%2===0?"#080c14":"#06080f";
               return(
                 <tr key={p} style={{background:bg}}>
                   <td style={{padding:'4px 12px 4px 16px',borderRight:`1px solid ${B}`,borderBottom:`1px solid #0d1520`,fontFamily:'monospace',fontSize:'0.7rem',position:'sticky',left:0,background:bg,zIndex:2,color:isLast?'#3d8ef0':isRecent?'#7aaee8':'#4a6a8a',fontWeight:isRecent?'600':'normal'}}>
-                    {isRecent?'→ ':'   '}{p}
+                    {isRecent?'→ ':'   '}{p}{isEstimate&&<sup style={{fontSize:'0.42rem',color:'#f0a84e',marginLeft:2}} title='Partial estimate — captured 27-Feb-2026 (mid-Q1)'>est</sup>}
                   </td>
                   {visCats.map((c,i)=>{const iF=i===0||visCats[i-1].g!==c.g;const{txt,col,bold}=fmt(HIST[p]?.[c.id]);return(
                     <td key={c.id} style={{padding:'4px 6px',textAlign:'right',borderBottom:`1px solid #0d1520`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.74rem':'0.7rem',color:col,fontWeight:bold?'bold':'normal'}}>{txt}</td>
@@ -338,7 +339,7 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'3px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center'}}>
-                  <span>▼ LIVE DATA — MOUSER ELECTRONICS API {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
+                  <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs 27-FEB-26 ANCHOR {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
                   {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
                 </div>
               </td>
@@ -352,7 +353,7 @@ function App(){
                       <span style={{width:6,height:6,border:'1.5px solid #4a6480',borderTopColor:'#ffd700',borderRadius:'50%',display:'inline-block',animation:'spin 0.7s linear infinite'}}/>
                       Loading…
                     </span>
-                  : '★ QTD'}
+                  : '★ Live'}
               </td>
               {visCats.map((c,i)=>{
                 const iF=i===0||visCats[i-1].g!==c.g;
@@ -390,7 +391,7 @@ function App(){
       </div>
 
       <div style={{padding:'8px 16px 16px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
-        <span>Historical: verified QoQ % Jun-22→Mar-26 · Live row: Mouser qty=1 spot vs 27-Feb-26 anchor · same SKU &amp; qty break guaranteed · USD · INR→USD ₹83.5/$</span>
+        <span>Historical rows: verified QoQ % Jun-22→Mar-26 · Live row (★): Mouser qty=1 spot price vs 27-Feb-26 anchor · L = live datapoint · same SKU &amp; qty break · USD · INR→USD ₹83.5/$ · Live row is a price monitor, not a reported financial quarter</span>
         <span>TI Product Price Intelligence · Professional use only</span>
       </div>
     </div>
