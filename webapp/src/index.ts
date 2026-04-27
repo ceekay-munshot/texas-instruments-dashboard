@@ -82,8 +82,10 @@ const BASELINES: Record<string, number> = {
 const BASELINE_DATE = '27-Feb-2026'
 
 const INR_TO_USD = 1 / 83.5
-const CONCURRENCY = 6   // parallel requests at a time — safe for Mouser free tier
-const PER_BATCH_DELAY = 200  // ms between batches
+const CONCURRENCY = 3              // halved from 6 — keeps peak QPS under Mouser's burst threshold
+const PER_BATCH_DELAY = 400        // doubled from 200ms — wider inter-batch gap
+const RETRY_DELAY_MS = 2500        // wait this long after pass 1 before re-fetching the few that failed
+const RETRY_MAX_FAILURES = 4       // skip retry if more than this many failed (likely true global rate-limit; let frontend auto-retry instead)
 
 type RateLimitError = { rateLimited: true; retryAfterMs: number; message: string }
 type PriceResult    = { price: number; partNumber: string; availability: string }
@@ -188,75 +190,105 @@ async function fetchCategory(
   return { catId, result: null, rateLimited: false, retryAfterMs: 0 }
 }
 
-// ── Fetch all 28 categories in parallel batches ───────────────────────────────
-// Batches of CONCURRENCY to avoid Mouser rate limits.
-// Total wall-clock time: ceil(28/6) = 5 batches × ~1.5s per batch ≈ 8–10s
+// ── Fetch all 28 categories — two-pass: parallel batches + bounded retry ─────
+// Pass 1: parallel batches of CONCURRENCY with PER_BATCH_DELAY between them.
+// Pass 2: if a small number (1..RETRY_MAX_FAILURES) of categories failed in
+// pass 1, wait RETRY_DELAY_MS and re-fetch them in parallel. This recovers
+// the common transient-rate-limit case (e.g. 26-27/28) without burning
+// extra quota when the failure mode is a true global rate limit.
+type CatData = { label: string; parts: string[] }
+
 async function fetchAllPrices(apiKey: string) {
   const fetchedAt = new Date().toISOString()
   const categories = Object.entries(PART_MAP)
   const results: Record<string, any> = {}
-  let globalRateLimited = false
-  let globalRetryAfterMs = 60_000
+  const failed: Array<{ catId: string; catData: CatData; rateLimited: boolean }> = []
+  let maxRetryAfterMs = 60_000
   let fetchedCount = 0
 
-  // Split into batches of CONCURRENCY
+  function writeSuccess(catId: string, catData: CatData, r: PriceResult) {
+    const baseline = BASELINES[catId] ?? 0
+    results[catId] = {
+      label: catData.label,
+      avgPriceUSD: r.price,
+      baselinePriceUSD: baseline,
+      qoqPct: baseline > 0 ? Math.round(((r.price - baseline) / baseline) * 1000) / 10 : null,
+      parts: [{ part: r.partNumber, price: r.price, availability: r.availability }],
+      fetchedAt,
+      live: true
+    }
+    fetchedCount++
+  }
+
+  function writeFailure(catId: string, catData: CatData, rateLimited: boolean) {
+    const baseline = BASELINES[catId] ?? 0
+    results[catId] = {
+      label: catData.label,
+      avgPriceUSD: baseline,
+      baselinePriceUSD: baseline,
+      qoqPct: null,
+      parts: [],
+      fetchedAt,
+      live: false,
+      error: rateLimited ? 'Rate limit — pending retry' : 'No pricing data available'
+    }
+  }
+
+  // Pass 1: parallel batches at lower concurrency
   for (let i = 0; i < categories.length; i += CONCURRENCY) {
     const batch = categories.slice(i, i + CONCURRENCY)
-
-    // Fire batch in parallel
     const batchResults = await Promise.all(
       batch.map(([catId, catData]) => fetchCategory(apiKey, catId, catData))
     )
-
     for (const { catId, result, rateLimited, retryAfterMs } of batchResults) {
-      const catData = PART_MAP[catId]
-      const baseline = BASELINES[catId] ?? 0
-
-      if (rateLimited) {
-        globalRateLimited = true
-        globalRetryAfterMs = Math.max(globalRetryAfterMs, retryAfterMs)
-      }
-
       if (result && !rateLimited) {
-        fetchedCount++
-        results[catId] = {
-          label: catData.label,
-          avgPriceUSD: result.price,
-          baselinePriceUSD: baseline,
-          qoqPct: baseline > 0
-            ? Math.round(((result.price - baseline) / baseline) * 1000) / 10
-            : null,
-          parts: [{ part: result.partNumber, price: result.price, availability: result.availability }],
-          fetchedAt,
-          live: true
-        }
+        writeSuccess(catId, PART_MAP[catId], result)
       } else {
-        results[catId] = {
-          label: catData.label,
-          avgPriceUSD: baseline,
-          baselinePriceUSD: baseline,
-          qoqPct: null,
-          parts: [],
-          fetchedAt,
-          live: false,
-          error: rateLimited ? 'Rate limit — pending retry' : 'No pricing data available'
-        }
+        if (rateLimited) maxRetryAfterMs = Math.max(maxRetryAfterMs, retryAfterMs)
+        failed.push({ catId, catData: PART_MAP[catId], rateLimited })
       }
     }
-
-    // Small pause between batches — avoids hammering the API
     if (i + CONCURRENCY < categories.length) {
       await new Promise(r => setTimeout(r, PER_BATCH_DELAY))
     }
   }
 
+  // Pass 2: bounded retry — only when a small number of categories failed.
+  // If too many failed, treat it as a real global rate-limit and let the
+  // frontend's countdown handle the retry instead of burning more quota now.
+  if (failed.length > 0 && failed.length <= RETRY_MAX_FAILURES) {
+    await new Promise(r => setTimeout(r, RETRY_DELAY_MS))
+    const retrying = failed.splice(0, failed.length)
+    const retryResults = await Promise.all(
+      retrying.map(({ catId, catData }) => fetchCategory(apiKey, catId, catData))
+    )
+    for (let i = 0; i < retryResults.length; i++) {
+      const orig = retrying[i]
+      const { result, rateLimited, retryAfterMs } = retryResults[i]
+      if (result && !rateLimited) {
+        writeSuccess(orig.catId, orig.catData, result)
+      } else {
+        if (rateLimited) maxRetryAfterMs = Math.max(maxRetryAfterMs, retryAfterMs)
+        failed.push({ ...orig, rateLimited: rateLimited || orig.rateLimited })
+      }
+    }
+  }
+
+  // Write failure records for whatever is still missing.
+  for (const f of failed) writeFailure(f.catId, f.catData, f.rateLimited)
+
+  // Final rate-limited state reflects what's still missing after retry.
+  const finalRateLimited = failed.some(f => f.rateLimited)
+  const failedCategories = failed.map(f => f.catId)
+
   return {
     results,
-    rateLimited: globalRateLimited,
-    rateLimitedAt: globalRateLimited ? new Date().toISOString() : null,
-    retryAfterMs: globalRetryAfterMs,
+    rateLimited: finalRateLimited,
+    rateLimitedAt: finalRateLimited ? new Date().toISOString() : null,
+    retryAfterMs: maxRetryAfterMs,
     fetchedCount,
-    totalCount: categories.length
+    totalCount: categories.length,
+    failedCategories
   }
 }
 
@@ -284,13 +316,15 @@ app.get('/api/prices', async (c) => {
   const apiKey = c.env.MOUSER_API_KEY
   if (!apiKey) return c.json({ error: 'MOUSER_API_KEY not configured' }, 500)
 
-  const { results, rateLimited, rateLimitedAt, retryAfterMs, fetchedCount, totalCount } =
+  const { results, rateLimited, rateLimitedAt, retryAfterMs, fetchedCount, totalCount, failedCategories } =
     await fetchAllPrices(apiKey)
 
   const now = new Date().toISOString()
   const payload = { _results: results, _cachedAt: now, _fetchedCount: fetchedCount, _totalCount: totalCount, _nextRefreshMs: CACHE_TTL_SECONDS * 1000 }
 
-  // Only cache successful full fetches
+  // Only cache successful (or partial-but-not-rate-limited) fetches.
+  // Rate-limited responses are intentionally not cached so the next refresh
+  // gets a fresh attempt instead of being trapped on stale partial data.
   if (!rateLimited && fetchedCount > 0) {
     const cache = caches.default
     const cacheResponse = new Response(JSON.stringify(payload), {
@@ -310,7 +344,9 @@ app.get('/api/prices', async (c) => {
     rateLimited,
     rateLimitedAt,
     retryAfterMs: rateLimited ? retryAfterMs : 0,
+    retryAfterSeconds: rateLimited ? Math.ceil(retryAfterMs / 1000) : 0,
     retryAt: rateLimited ? new Date(Date.now() + retryAfterMs).toISOString() : null,
+    failedCategories: failedCategories.length > 0 ? failedCategories : undefined,
     data: results
   })
 })
