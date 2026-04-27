@@ -1,4 +1,4 @@
-const { useState, useEffect, useCallback, useRef } = React;
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
 const GC = {"Power Management":"#f0a84e","Amplifiers":"#3d8ef0","Data Converters":"#00c9a7","Interface ICs":"#ab6af0","Isolation":"#f05c5c","Microcontrollers":"#6af0d4","GaN Power":"#f06090","Data Center Power":"#ffd700"};
 const CATS = [
   {id:"pm_ldo",g:"Power Management",l:"LDO Regulators"},{id:"pm_acdc",g:"Power Management",l:"AC/DC Switching"},
@@ -126,6 +126,174 @@ function ToastShell({ toast, onDismiss }) {
           animation:`countdown ${toast.duration}ms linear forwards`
         }}/>
       )}
+    </div>
+  );
+}
+
+// ── Signal Summary — derived metrics from liveData ────────────────────────────
+// Pure function; safe for any subset of live categories. Returns a state token
+// so the UI can render Waiting / No-live / Ready uniformly.
+function computeSignal(liveData) {
+  if (!liveData) return { state: 'waiting' };
+  const live = CATS
+    .map(c => ({ ...c, ...(liveData[c.id] || {}) }))
+    .filter(d => d.live && d.qoqPct != null && Number.isFinite(d.qoqPct));
+  const total = CATS.length;
+  if (live.length === 0) return { state: 'no-live', total };
+
+  const values = live.map(d => d.qoqPct);
+  const sorted = [...values].sort((a, b) => a - b);
+  const median = sorted.length % 2
+    ? sorted[(sorted.length - 1) / 2]
+    : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  const mean = values.reduce((s, v) => s + v, 0) / values.length;
+  const upCount = values.filter(v => v > 0).length;
+  const downCount = values.filter(v => v < 0).length;
+  const breadthUp = upCount / values.length;
+  const breadthDown = downCount / values.length;
+
+  const groups = {};
+  live.forEach(c => { (groups[c.g] = groups[c.g] || []).push(c.qoqPct); });
+  const groupAvgs = Object.entries(groups)
+    .map(([g, vs]) => ({ g, avg: vs.reduce((s, v) => s + v, 0) / vs.length, n: vs.length }))
+    .sort((a, b) => b.avg - a.avg);
+  const strongestGroup = groupAvgs[0];
+  const weakestGroup = groupAvgs[groupAvgs.length - 1];
+
+  const topUp = [...live].filter(d => d.qoqPct > 0).sort((a, b) => b.qoqPct - a.qoqPct).slice(0, 5);
+  const topDown = [...live].filter(d => d.qoqPct < 0).sort((a, b) => a.qoqPct - b.qoqPct).slice(0, 5);
+
+  const inflationFlags = live.filter(d => d.qoqPct >= 5);
+  const deflationFlags = live.filter(d => d.qoqPct <= -5);
+  const outliers = live.filter(d => Math.abs(d.qoqPct) >= 10);
+
+  const partial = live.length < total * 0.5;
+  let tone, toneColor;
+  if (partial) { tone = 'Insufficient live data'; toneColor = '#f0a84e'; }
+  else if (breadthUp >= 0.75 && median >= 2) { tone = 'Broad inflation'; toneColor = '#4dffc3'; }
+  else if (breadthUp >= 0.50 && median > 0) { tone = 'Selective inflation'; toneColor = '#00c9a7'; }
+  else if (breadthDown >= 0.75 && median <= -2) { tone = 'Broad deflation'; toneColor = '#ff7575'; }
+  else { tone = 'Mixed'; toneColor = '#f0a84e'; }
+
+  const fmtSigned = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+  let interp;
+  if (partial) {
+    interp = `partial live coverage (${live.length}/${total}) — interpretation pending broader fetch.`;
+  } else if (tone === 'Broad inflation') {
+    interp = `price pressure is broadening across ${strongestGroup.g} and adjacent groups (median ${fmtSigned(median)}, ${(breadthUp*100).toFixed(0)}% of basket positive).`;
+  } else if (tone === 'Selective inflation') {
+    if (inflationFlags.length === 0) {
+      interp = `mild upward bias; no category currently above the +5% inflation flag (median ${fmtSigned(median)}).`;
+    } else {
+      const lead = inflationFlags.slice(0, 2).map(d => d.l).join(', ');
+      interp = `inflation concentrated in ${inflationFlags.length} ${inflationFlags.length === 1 ? 'category' : 'categories'} (${lead}${inflationFlags.length > 2 ? ', …' : ''}); broad basket remains modest.`;
+    }
+  } else if (tone === 'Broad deflation') {
+    interp = `prices softening broadly, led by ${weakestGroup.g} (group avg ${fmtSigned(weakestGroup.avg)}).`;
+  } else {
+    interp = `live spot pricing is mixed; no clean broad-cycle signal yet (median ${fmtSigned(median)}, ${(breadthUp*100).toFixed(0)}% positive).`;
+  }
+
+  return {
+    state: 'ready', partial, total, liveCount: live.length,
+    tone, toneColor, median, mean,
+    upCount, downCount, breadthUp,
+    topUp, topDown, strongestGroup, weakestGroup,
+    inflationFlags, deflationFlags, outliers, interp
+  };
+}
+
+function SignalSummary({ liveData }) {
+  const sig = useMemo(() => computeSignal(liveData), [liveData]);
+  const fmt = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+  const baseRow = { padding: '7px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+
+  if (sig.state === 'waiting') {
+    return (
+      <div style={{ ...baseRow, fontSize: '0.6rem', color: '#2d4a6b', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ letterSpacing: '0.12em' }}>▼ SIGNAL SUMMARY</span>
+        <span style={{ color: '#4a6a8a' }}>· Waiting for live Mouser data…</span>
+      </div>
+    );
+  }
+  if (sig.state === 'no-live') {
+    return (
+      <div style={{ ...baseRow, fontSize: '0.6rem', color: '#f0a84e', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ letterSpacing: '0.12em' }}>▼ SIGNAL SUMMARY</span>
+        <span>· No live categories available — waiting for live Mouser data.</span>
+      </div>
+    );
+  }
+
+  const Tile = ({ label, value, color }) => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      <div style={{ fontSize: '0.5rem', color: '#2d4a6b', letterSpacing: '0.12em', textTransform: 'uppercase' }}>{label}</div>
+      <div style={{ fontSize: '0.72rem', fontFamily: 'monospace', color: color || '#c4d4e8' }}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div style={baseRow}>
+      <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+          <div style={{ fontSize: '0.5rem', color: '#2d4a6b', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+            ▼ Signal Summary{sig.partial && <span style={{ color: '#f0a84e' }}> · partial coverage</span>}
+          </div>
+          <div style={{ fontSize: '0.85rem', fontWeight: 'bold', color: sig.toneColor, fontFamily: 'monospace' }}>{sig.tone}</div>
+        </div>
+        <Tile label="Breadth" value={`${sig.upCount}/${sig.liveCount} ↑ ${(sig.breadthUp * 100).toFixed(0)}%`} />
+        <Tile label="Median" value={fmt(sig.median)} color={sig.median >= 0 ? '#00c9a7' : '#f05c5c'} />
+        <Tile label="Average" value={fmt(sig.mean)} color={sig.mean >= 0 ? '#00c9a7' : '#f05c5c'} />
+        <Tile label="Strongest group" value={`${sig.strongestGroup.g} ${fmt(sig.strongestGroup.avg)}`} color={GC[sig.strongestGroup.g]} />
+        <Tile label="Weakest group" value={`${sig.weakestGroup.g} ${fmt(sig.weakestGroup.avg)}`} color={GC[sig.weakestGroup.g]} />
+      </div>
+
+      <div style={{ marginTop: 6, display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: '0.6rem', fontFamily: 'monospace', alignItems: 'baseline' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+          <span style={{ color: '#2d4a6b', fontSize: '0.5rem', letterSpacing: '0.12em' }}>TOP UP</span>
+          {sig.topUp.length === 0
+            ? <span style={{ color: '#4a6a8a' }}>none</span>
+            : sig.topUp.map((d, i) => (
+                <span key={d.id}>
+                  <span style={{ color: '#c4d4e8' }}>{d.l}</span>{' '}
+                  <span style={{ color: Math.abs(d.qoqPct) >= 5 ? '#4dffc3' : '#00c9a7', fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
+                  {i < sig.topUp.length - 1 && <span style={{ color: '#2d4a6b' }}>{' · '}</span>}
+                </span>
+              ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 3, display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: '0.6rem', fontFamily: 'monospace', alignItems: 'baseline' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+          <span style={{ color: '#2d4a6b', fontSize: '0.5rem', letterSpacing: '0.12em' }}>TOP DOWN</span>
+          {sig.topDown.length === 0
+            ? <span style={{ color: '#4a6a8a' }}>none</span>
+            : sig.topDown.map((d, i) => (
+                <span key={d.id}>
+                  <span style={{ color: '#c4d4e8' }}>{d.l}</span>{' '}
+                  <span style={{ color: Math.abs(d.qoqPct) >= 5 ? '#ff7575' : '#f05c5c', fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
+                  {i < sig.topDown.length - 1 && <span style={{ color: '#2d4a6b' }}>{' · '}</span>}
+                </span>
+              ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 6, display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: '0.58rem', fontFamily: 'monospace', alignItems: 'baseline' }}>
+        <span style={{ color: '#2d4a6b', fontSize: '0.5rem', letterSpacing: '0.12em' }}>FLAGS</span>
+        <span style={{ color: sig.inflationFlags.length > 0 ? '#4dffc3' : '#4a6a8a' }}>
+          ⚡ inflation ≥ +5%: {sig.inflationFlags.length}{sig.inflationFlags.length > 0 ? ` (${sig.inflationFlags.map(d => d.l).join(', ')})` : ''}
+        </span>
+        <span style={{ color: sig.deflationFlags.length > 0 ? '#ff7575' : '#4a6a8a' }}>
+          ⬇ deflation ≤ −5%: {sig.deflationFlags.length}{sig.deflationFlags.length > 0 ? ` (${sig.deflationFlags.map(d => d.l).join(', ')})` : ''}
+        </span>
+        <span style={{ color: sig.outliers.length > 0 ? '#f0a84e' : '#4a6a8a' }}>
+          ◆ |Δ| ≥ 10%: {sig.outliers.length}{sig.outliers.length > 0 ? ` (${sig.outliers.map(d => d.l).join(', ')})` : ''}
+        </span>
+      </div>
+
+      <div style={{ marginTop: 8, fontSize: '0.62rem', color: '#c4d4e8', fontStyle: 'italic' }}>
+        <span style={{ color: '#ffd700', fontWeight: 'bold', fontStyle: 'normal' }}>Signal:</span> {sig.interp}
+      </div>
     </div>
   );
 }
@@ -304,6 +472,9 @@ function App(){
         <span style={{color:'#ffd700'}}>★ Live = Mouser qty=1 spot price vs 27-Feb-26 anchor · same SKU &amp; qty break · L superscript = live Mouser datapoint · price monitor, not a reported financial quarter · hover for detail</span>
         <span style={{color:'#f0a84e',marginLeft:6}}>· → Mar-26 hist = partial est. (captured 27-Feb-26) · LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
       </div>
+
+      {/* ── Signal Summary ── */}
+      <SignalSummary liveData={liveData}/>
 
       {/* ── Table ── */}
       <div style={{overflowX:'auto',position:'relative',zIndex:1}}>

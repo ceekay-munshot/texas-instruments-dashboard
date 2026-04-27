@@ -60,6 +60,23 @@
 - **Currency**: USD throughout. Mouser India (INR) responses are converted at ₹83.5 / USD before comparison.
 - **`L` superscript** on a live cell means the value came from a successful live Mouser fetch in the current request. A cell without `L` (showing `—` or `…`) means that category did not return live data this fetch (rate-limit, no parts, etc.).
 
+### Signal Summary (above the table)
+
+A compact panel that derives a price-monitor signal layer from the live row only — it is **not company guidance** and not a reported financial metric.
+
+- **Source data**: live Mouser qty=1 spot prices vs the 27-Feb-26 anchor for the categories that returned successfully in the current fetch.
+- **Tone**: one of `Broad inflation`, `Selective inflation`, `Mixed`, `Broad deflation`, or `Insufficient live data` (when fewer than 50% of categories are live). Determined from breadth (% of basket positive) and median % change.
+- **Breadth**: count and percentage of live categories with a positive change vs anchor.
+- **Median / Average**: across the live categories only.
+- **Top 5 movers** in each direction, plus **strongest / weakest product group** by group-average change.
+- **Anomaly flags** (thresholds applied to the absolute live % change vs anchor):
+  - `⚡ inflation flag` — change ≥ **+5%**
+  - `⬇ deflation flag` — change ≤ **−5%**
+  - `◆ major outlier` — `|change| ≥ 10%`
+- **Signal sentence**: a one-line interpretation generated from the metrics above.
+
+If `liveData` is missing the panel shows "Waiting for live Mouser data." If only a subset of categories returned live, the panel marks itself "partial coverage" and notes the count in the interpretation line.
+
 ## Deployment
 
 **Platform**: Cloudflare Pages (Git integration with this repo's `main` branch)
