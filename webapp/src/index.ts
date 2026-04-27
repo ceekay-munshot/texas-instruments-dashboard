@@ -78,8 +78,38 @@ const BASELINES: Record<string, number> = {
   dc_tps:    12.9327,  // TPS53681RSBT     qty=1  ₹1079.88
 }
 
-// Baseline capture date — shown in UI
-const BASELINE_DATE = '27-Feb-2026'
+// ── Baseline metadata ────────────────────────────────────────────────────────
+// The dashboard is fundamentally a quarter-over-quarter monitor. The live row
+// compares current Mouser spot prices against the "latest baseline" — the most
+// recent controlled snapshot. Rolling the baseline forward at the end of a
+// quarter is a manual operation: capture new prices, update BASELINES + the
+// constants below in a single PR.
+const BASELINE_DATE = '2026-02-27'
+const BASELINE_PERIOD_LABEL = 'Q1-26 snapshot'
+const BASELINE_LABEL = 'Latest baseline'
+const BASELINE_DISPLAY = 'Q1-26 snapshot · captured 27-Feb-26'
+const BASELINE_DESCRIPTION = 'Pre-quarter-close baseline used for live spot-price comparison'
+const BASELINE_ROLLOVER_POLICY = 'Manual rollover after controlled quarterly baseline capture'
+const BASELINE_REVIEW_AFTER_DAYS = 90
+
+function getBaselineMeta() {
+  const baselineMs = Date.parse(BASELINE_DATE)
+  const ageDays = Number.isFinite(baselineMs)
+    ? Math.max(0, Math.floor((Date.now() - baselineMs) / 86_400_000))
+    : 0
+  return {
+    baselineDate: BASELINE_DATE,
+    baselinePeriodLabel: BASELINE_PERIOD_LABEL,
+    baselineLabel: BASELINE_LABEL,
+    baselineDisplay: BASELINE_DISPLAY,
+    baselineDescription: BASELINE_DESCRIPTION,
+    baselineAgeDays: ageDays,
+    baselineReviewAfterDays: BASELINE_REVIEW_AFTER_DAYS,
+    baselineIsStale: ageDays > BASELINE_REVIEW_AFTER_DAYS,
+    baselineRolloverPolicy: BASELINE_ROLLOVER_POLICY,
+    comparisonMode: 'live_spot_vs_latest_baseline' as const,
+  }
+}
 
 const INR_TO_USD = 1 / 83.5
 const CONCURRENCY = 3              // halved from 6 — keeps peak QPS under Mouser's burst threshold
@@ -309,7 +339,7 @@ app.get('/api/prices', async (c) => {
     const cached = await cache.match(CACHE_KEY)
     if (cached) {
       const data = await cached.json()
-      return c.json({ source: 'cache', cachedAt: data._cachedAt, fetchedCount: data._fetchedCount, totalCount: data._totalCount, data: data._results, nextRefreshMs: data._nextRefreshMs })
+      return c.json({ source: 'cache', cachedAt: data._cachedAt, fetchedCount: data._fetchedCount, totalCount: data._totalCount, data: data._results, nextRefreshMs: data._nextRefreshMs, ...getBaselineMeta() })
     }
   }
 
@@ -347,7 +377,8 @@ app.get('/api/prices', async (c) => {
     retryAfterSeconds: rateLimited ? Math.ceil(retryAfterMs / 1000) : 0,
     retryAt: rateLimited ? new Date(Date.now() + retryAfterMs).toISOString() : null,
     failedCategories: failedCategories.length > 0 ? failedCategories : undefined,
-    data: results
+    data: results,
+    ...getBaselineMeta(),
   })
 })
 
@@ -397,11 +428,18 @@ app.get('/api/diag', async (c) => {
 app.get('/api/status', async (c) => {
   const cache = caches.default
   const cached = await cache.match(CACHE_KEY)
+  const meta = getBaselineMeta()
   return c.json({
     cached: !!cached,
     categories: Object.keys(PART_MAP).length,
     cacheTtlHours: CACHE_TTL_SECONDS / 3600,
-    hint: cached ? 'Cache hit — serving from CF edge cache' : 'No cache — next /api/prices will fetch live'
+    hint: cached ? 'Cache hit — serving from CF edge cache' : 'No cache — next /api/prices will fetch live',
+    baselineDate: meta.baselineDate,
+    baselinePeriodLabel: meta.baselinePeriodLabel,
+    baselineDisplay: meta.baselineDisplay,
+    baselineAgeDays: meta.baselineAgeDays,
+    baselineIsStale: meta.baselineIsStale,
+    comparisonMode: meta.comparisonMode,
   })
 })
 

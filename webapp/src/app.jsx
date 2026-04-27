@@ -203,16 +203,17 @@ function computeSignal(liveData) {
   };
 }
 
-function SignalSummary({ liveData }) {
+function SignalSummary({ liveData, baselineMeta }) {
   const sig = useMemo(() => computeSignal(liveData), [liveData]);
   const fmt = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
   const wrap = { padding: '14px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const label = { fontSize: '0.6rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
+  const headerLabel = '▼ Live signal — spot vs latest baseline';
 
   if (sig.state === 'waiting') {
     return (
       <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={label}>Signal Summary</span>
+        <span style={label}>{headerLabel}</span>
         <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>· Waiting for live Mouser data…</span>
       </div>
     );
@@ -220,7 +221,7 @@ function SignalSummary({ liveData }) {
   if (sig.state === 'no-live') {
     return (
       <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={label}>Signal Summary</span>
+        <span style={label}>{headerLabel}</span>
         <span style={{ fontSize: '0.7rem', color: '#f0a84e' }}>· No live categories available — waiting for live Mouser data.</span>
       </div>
     );
@@ -267,11 +268,11 @@ function SignalSummary({ liveData }) {
 
   return (
     <div style={wrap}>
-      {/* Headline: tone + signal sentence + live count */}
+      {/* Headline: tone + signal sentence + baseline freshness */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
         <div style={{ flex: '1 1 auto', minWidth: 0 }}>
           <div style={label}>
-            ▼ Signal Summary{sig.partial && <span style={{ color: '#f0a84e', marginLeft: 6 }}>· partial coverage</span>}
+            {headerLabel}{sig.partial && <span style={{ color: '#f0a84e', marginLeft: 6 }}>· partial coverage</span>}
           </div>
           <div style={{ fontSize: '1.15rem', fontWeight: 'bold', color: sig.toneColor, fontFamily: 'monospace', marginTop: 5, lineHeight: 1.1 }}>
             {sig.tone}
@@ -279,9 +280,27 @@ function SignalSummary({ liveData }) {
           <div style={{ marginTop: 8, fontSize: '0.78rem', color: '#c4d4e8', lineHeight: 1.5, maxWidth: 880 }}>
             <span style={{ color: '#ffd700', fontWeight: 'bold' }}>Signal:</span> {sig.interp}
           </div>
+          <div style={{ marginTop: 4, fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic' }}>
+            Early-warning live monitor; not a finalized quarterly row.
+          </div>
         </div>
-        <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace', whiteSpace: 'nowrap', paddingTop: 18 }}>
-          {sig.liveCount}/{sig.total} categories live
+        <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontFamily: 'monospace', textAlign: 'right', minWidth: 220 }}>
+          <div style={{ ...label, color: '#6b8aa8', textAlign: 'right' }}>Latest baseline</div>
+          <div style={{ marginTop: 3, color: '#c4d4e8', fontSize: '0.74rem' }}>
+            {baselineMeta?.baselinePeriodLabel || 'Q1-26 snapshot'}
+          </div>
+          <div style={{ marginTop: 1 }}>
+            captured {baselineMeta?.baselineDate || '2026-02-27'}
+            {baselineMeta?.baselineAgeDays != null && <span> · {baselineMeta.baselineAgeDays}d ago</span>}
+          </div>
+          <div style={{ marginTop: 1 }}>
+            {sig.liveCount}/{sig.total} categories live · CF cache 6h
+          </div>
+          {baselineMeta?.baselineIsStale && (
+            <div style={{ marginTop: 4, color: '#f0a84e' }}>
+              Baseline review due — capture next quarterly baseline.
+            </div>
+          )}
         </div>
       </div>
 
@@ -329,9 +348,12 @@ function App(){
   const [vis,setVis]=useState(new Set(Object.keys(GC)));
   const [tooltip,setTooltip]=useState(null);
   const [rateLimitedUntil,setRateLimitedUntil]=useState(null);
+  const [baselineMeta,setBaselineMeta]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
+  const loadingRef = useRef(false);
+  useEffect(() => { loadingRef.current = loading; }, [loading]);
 
   const visCats=CATS.filter(c=>vis.has(c.g));
   const grps=[];
@@ -362,6 +384,20 @@ function App(){
       setFetchedAt(json.fetchedAt || json.cachedAt);
       setSrc(json.source);
       setFetchCount({ got: json.fetchedCount, total: json.totalCount });
+      if (json.baselineDate) {
+        setBaselineMeta({
+          baselineDate: json.baselineDate,
+          baselinePeriodLabel: json.baselinePeriodLabel,
+          baselineLabel: json.baselineLabel,
+          baselineDisplay: json.baselineDisplay,
+          baselineDescription: json.baselineDescription,
+          baselineAgeDays: json.baselineAgeDays,
+          baselineReviewAfterDays: json.baselineReviewAfterDays,
+          baselineIsStale: json.baselineIsStale,
+          baselineRolloverPolicy: json.baselineRolloverPolicy,
+          comparisonMode: json.comparisonMode,
+        });
+      }
 
       if (json.rateLimited) {
         // Rate limited — may be 0/28 (hit on first call) or partial
@@ -381,8 +417,10 @@ function App(){
           : `Got ${got}/${json.totalCount} categories before rate limit. Partial data shown.`;
         push(msg, 'warn', 9000);
       } else if (json.source === 'cache') {
-        const age = json.cachedAt ? Math.round((Date.now() - new Date(json.cachedAt)) / 60000) : '?';
-        push(`Showing cached data from ${age} min ago — next auto-refresh in ${Math.round((json.nextRefreshMs||0)/60000)} min`, 'info', 5000);
+        if (!silent) {
+          const age = json.cachedAt ? Math.round((Date.now() - new Date(json.cachedAt)) / 60000) : '?';
+          push(`Showing cached data from ${age} min ago — next auto-refresh in ${Math.round((json.nextRefreshMs||0)/60000)} min`, 'info', 5000);
+        }
       } else if ((json.fetchedCount ?? 0) === 0 && json.source === 'live') {
         // Fetched 0 categories but no rateLimited flag — likely all parts returned no pricing
         setRateLimitedUntil(new Date(Date.now() + 65_000).toISOString());
@@ -396,9 +434,11 @@ function App(){
         scheduleRetry(retryAt2);
         push('Mouser API returned no pricing data — possibly rate limited. Auto-retry in ~1 min.', 'warn', 9000);
       } else {
-        const got = json.fetchedCount ?? '?';
-        const total = json.totalCount ?? 28;
-        push(`Live prices loaded — ${got}/${total} categories fetched from Mouser`, 'success', 5000);
+        if (!silent) {
+          const got = json.fetchedCount ?? '?';
+          const total = json.totalCount ?? 28;
+          push(`Live prices loaded — ${got}/${total} categories fetched from Mouser`, 'success', 5000);
+        }
         setRateLimitedUntil(null);
         if (retryTimer.current) clearTimeout(retryTimer.current);
       }
@@ -410,10 +450,30 @@ function App(){
 
   useEffect(() => { fetchLive(false); return () => { if(retryTimer.current) clearTimeout(retryTimer.current); }; }, []);
 
+  // 30-min auto-check while tab is visible. Cached path only (no refresh=true) —
+  // respects the CF edge cache and never burns Mouser quota. Skipped when the
+  // tab is hidden, and skipped when a fetch is already in flight. On
+  // visibilitychange→visible we trigger one safe cached check if not loading.
+  useEffect(() => {
+    const AUTO_CHECK_MS = 30 * 60 * 1000;
+    const safeCachedCheck = () => {
+      if (document.visibilityState === 'visible' && !loadingRef.current) {
+        fetchLive(false, true);
+      }
+    };
+    const timer = setInterval(safeCachedCheck, AUTO_CHECK_MS);
+    const onVis = () => { if (document.visibilityState === 'visible') safeCachedCheck(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [fetchLive]);
+
   function exportCSV(){
     const rows=[['Period',...visCats.map(c=>c.l)]];
     HP.forEach(p=>rows.push([p,...visCats.map(c=>HIST[p]?.[c.id]??'')]));
-    if(liveData)rows.push(['Live vs 27-Feb-26 anchor',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
+    if(liveData)rows.push(['Live vs latest baseline (Q1-26 snapshot 27-Feb-26)',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'}));
     a.download=`ti_prices_${new Date().toISOString().slice(0,10)}.csv`;a.click();
@@ -423,7 +483,7 @@ function App(){
     const d=liveData?.[catId];if(!d)return null;
     const cat=CATS.find(c=>c.id===catId);
     return <>
-      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs 27-Feb-26 anchor</div>
+      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs latest baseline (27-Feb-26)</div>
       {d.parts?.length>0?d.parts.map((p,i)=>(
         <div key={i} style={{fontSize:'0.6rem',marginBottom:3,display:'flex',justifyContent:'space-between',gap:14}}>
           <span style={{color:'#c4d4e8',fontFamily:'monospace'}}>{p.part}</span>
@@ -432,7 +492,7 @@ function App(){
         </div>
       )):<div style={{fontSize:'0.58rem',color:'#f05c5c'}}>{d.error||'No live data'}</div>}
       <div style={{marginTop:5,paddingTop:4,borderTop:'1px solid #1a2740',fontSize:'0.52rem',color:'#2d4a6b'}}>
-        Live ${d.avgPriceUSD?.toFixed(4)} · Anchor ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser
+        Live ${d.avgPriceUSD?.toFixed(4)} · Baseline ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser
       </div>
     </>;
   }
@@ -490,12 +550,12 @@ function App(){
       <div style={{display:'flex',gap:10,padding:'3px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.57rem',color:'#2d4a6b',flexWrap:'wrap',background:'#050810'}}>
         <span style={{color:'#00c9a7'}}>■ positive</span><span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ bold ≥5%</span><span>·</span>
-        <span style={{color:'#ffd700'}}>★ Live = Mouser qty=1 spot price vs 27-Feb-26 anchor · same SKU &amp; qty break · L superscript = live Mouser datapoint · price monitor, not a reported financial quarter · hover for detail</span>
+        <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
         <span style={{color:'#f0a84e',marginLeft:6}}>· → Mar-26 hist = partial est. (captured 27-Feb-26) · LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
       </div>
 
       {/* ── Signal Summary ── */}
-      <SignalSummary liveData={liveData}/>
+      <SignalSummary liveData={liveData} baselineMeta={baselineMeta}/>
 
       {/* ── Table ── */}
       <div style={{overflowX:'auto',position:'relative',zIndex:1}}>
@@ -531,7 +591,7 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'3px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center'}}>
-                  <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs 27-FEB-26 ANCHOR {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
+                  <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs LATEST BASELINE · Q1-26 SNAPSHOT CAPTURED 27-FEB-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
                   {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
                 </div>
               </td>
@@ -583,7 +643,7 @@ function App(){
       </div>
 
       <div style={{padding:'8px 16px 16px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
-        <span>Historical rows: verified QoQ % Jun-22→Mar-26 · Live row (★): Mouser qty=1 spot price vs 27-Feb-26 anchor · L = live datapoint · same SKU &amp; qty break · USD · INR→USD ₹83.5/$ · Live row is a price monitor, not a reported financial quarter</span>
+        <span>Historical rows: QoQ product price changes (Jun-22→Mar-26) · Live row (★): current Mouser qty=1 spot vs latest baseline · Latest baseline: Q1-26 snapshot captured 27-Feb-26 · L = live datapoint · same SKU &amp; qty break · USD · INR→USD ₹83.5/$ · Early-warning monitor, not a finalized quarterly row</span>
         <span>TI Product Price Intelligence · Professional use only</span>
       </div>
     </div>

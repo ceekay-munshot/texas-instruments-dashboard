@@ -53,12 +53,25 @@
 
 ## Methodology
 
-- **Historical rows (Jun-22 → Mar-26)** are verified QoQ percentage changes for each category. The Mar-26 row is marked with a small `est` superscript because it was captured mid-quarter (27-Feb-26) and may be revised once the quarter closes.
-- **Live row (★)** is a **live price monitor**, not a reported financial-quarter metric. It is computed as: current Mouser qty=1 spot price ÷ baseline price captured 27-Feb-2026, expressed as a percentage. Same part number, same quantity break in both ends of the comparison.
-- **Live row label** in the UI is "★ Live" / "Live vs 27-Feb-26 anchor" — wording chosen to avoid confusion with formal company-reported QTD/quarter metrics.
-- **Default pricing basis** is qty=1 unit price for all parts. One exception: **LMG3650 (TOLL)** has no unit pricing on Mouser and is tracked at its reel/2000 price. The tooltip on that category shows a `⚠ reel/2000 price — no unit break` note.
+The dashboard is primarily a **quarter-over-quarter (QoQ) product price monitor** for TI semiconductor categories, with a live row used as an early-warning leading indicator.
+
+- **Historical rows (Jun-22 → Mar-26)** show **QoQ price change vs the previous quarter / prior comparable captured period**. They are pre-computed and hardcoded in `webapp/src/app.jsx` (`HIST` constant). Adding a new quarter requires a code change. The Mar-26 row carries a small `est` superscript because it was captured mid-quarter (27-Feb-26) and may be revised when a finalized snapshot is taken.
+- **Live row (★)** is a **live price monitor — not a finalized quarterly row**. It is computed as: current Mouser qty=1 spot price vs the **latest baseline**, expressed as a percentage. Same part number, same quantity break on both ends of the comparison.
+- **Latest baseline** is currently the **Q1-26 snapshot captured 2026-02-27**. Baseline values are hardcoded in `webapp/src/index.ts` (`BASELINES`). Comparison framing is exposed under the constant set `BASELINE_DATE`, `BASELINE_PERIOD_LABEL`, `BASELINE_LABEL`, `BASELINE_DISPLAY`, `BASELINE_DESCRIPTION`, `BASELINE_ROLLOVER_POLICY`, `BASELINE_REVIEW_AFTER_DAYS`.
+- **Live row is not formal company guidance.** It is an early-warning monitor used to spot abnormal up/down moves before the next finalized quarterly baseline is captured.
+- **Baseline rollover is manual.** It is *not* automatic. To roll forward (e.g. capture Q2-26):
+  1. Run a controlled live fetch at the chosen end-of-quarter cutoff (`/api/prices?refresh=true`).
+  2. Update `BASELINES` in `src/index.ts` with the new prices.
+  3. Update `BASELINE_DATE`, `BASELINE_PERIOD_LABEL`, and `BASELINE_DISPLAY` in the same file.
+  4. Add a new column to `HIST` in `src/app.jsx` reflecting the QoQ change for the closing quarter.
+  5. Commit and deploy.
+- **Default pricing basis** is qty=1 unit price for all parts. One documented exception: **LMG3650 (TOLL)** has no unit pricing on Mouser and is tracked at its reel/2000 price. The tooltip on that category surfaces a `⚠ reel/2000 price — no unit break` note.
 - **Currency**: USD throughout. Mouser India (INR) responses are converted at ₹83.5 / USD before comparison.
 - **`L` superscript** on a live cell means the value came from a successful live Mouser fetch in the current request. A cell without `L` (showing `—` or `…`) means that category did not return live data this fetch (rate-limit, no parts, etc.).
+- **Live data update cadence**: prices update through the Cloudflare cached API (6 h TTL) — there is no continuous tick-by-tick streaming.
+  - The frontend runs a **30-minute auto-check while the tab is visible**, using the cached path only (`/api/prices`, no `refresh=true`). It also performs one cached check whenever the tab becomes visible after being hidden. This never burns Mouser quota.
+  - The manual **⟳ Refresh Live** button still bypasses cache (`/api/prices?refresh=true`) and fetches fresh from Mouser.
+- **Baseline staleness watch**: the API returns `baselineAgeDays` (computed at request time) and `baselineIsStale = baselineAgeDays > BASELINE_REVIEW_AFTER_DAYS` (default 90 days). When stale, the UI shows a subtle amber "Baseline review due" note. This is informational only — the baseline values do not auto-roll.
 
 ### Signal Summary (above the table)
 
