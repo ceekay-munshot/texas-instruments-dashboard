@@ -206,93 +206,114 @@ function computeSignal(liveData) {
 function SignalSummary({ liveData }) {
   const sig = useMemo(() => computeSignal(liveData), [liveData]);
   const fmt = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
-  const baseRow = { padding: '7px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+  const wrap = { padding: '14px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+  const label = { fontSize: '0.6rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
 
   if (sig.state === 'waiting') {
     return (
-      <div style={{ ...baseRow, fontSize: '0.6rem', color: '#2d4a6b', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ letterSpacing: '0.12em' }}>▼ SIGNAL SUMMARY</span>
-        <span style={{ color: '#4a6a8a' }}>· Waiting for live Mouser data…</span>
+      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={label}>Signal Summary</span>
+        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>· Waiting for live Mouser data…</span>
       </div>
     );
   }
   if (sig.state === 'no-live') {
     return (
-      <div style={{ ...baseRow, fontSize: '0.6rem', color: '#f0a84e', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ letterSpacing: '0.12em' }}>▼ SIGNAL SUMMARY</span>
-        <span>· No live categories available — waiting for live Mouser data.</span>
+      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={label}>Signal Summary</span>
+        <span style={{ fontSize: '0.7rem', color: '#f0a84e' }}>· No live categories available — waiting for live Mouser data.</span>
       </div>
     );
   }
 
-  const Tile = ({ label, value, color }) => (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-      <div style={{ fontSize: '0.5rem', color: '#2d4a6b', letterSpacing: '0.12em', textTransform: 'uppercase' }}>{label}</div>
-      <div style={{ fontSize: '0.72rem', fontFamily: 'monospace', color: color || '#c4d4e8' }}>{value}</div>
+  const Tile = ({ name, value, sub, color }) => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 110 }}>
+      <div style={label}>{name}</div>
+      <div style={{ fontSize: '0.92rem', fontFamily: 'monospace', color: color || '#e0eaf8', lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: '0.65rem', color: '#7a96b8', fontFamily: 'monospace' }}>{sub}</div>}
     </div>
   );
 
+  const moverColor = (v, up) => up
+    ? (Math.abs(v) >= 5 ? '#4dffc3' : '#00c9a7')
+    : (Math.abs(v) >= 5 ? '#ff7575' : '#f05c5c');
+  const moverWeight = v => Math.abs(v) >= 5 ? 'bold' : 'normal';
+
+  const MoverList = ({ rows, up }) => (
+    rows.length === 0
+      ? <div style={{ fontSize: '0.72rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 6 }}>none</div>
+      : <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 3, fontFamily: 'monospace', fontSize: '0.74rem' }}>
+          {rows.map(d => (
+            <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, maxWidth: 340 }}>
+              <span style={{ color: '#c4d4e8' }}>{d.l}</span>
+              <span style={{ color: moverColor(d.qoqPct, up), fontWeight: moverWeight(d.qoqPct) }}>{fmt(d.qoqPct)}</span>
+            </div>
+          ))}
+        </div>
+  );
+
+  const FlagRow = ({ icon, name, count, items, activeColor }) => {
+    const active = count > 0;
+    const dim = '#7a96b8';
+    return (
+      <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', fontFamily: 'monospace', fontSize: '0.72rem', flexWrap: 'wrap' }}>
+        <span style={{ width: 18, color: active ? activeColor : dim, fontSize: '0.85rem' }}>{icon}</span>
+        <span style={{ minWidth: 170, color: active ? '#c4d4e8' : dim }}>{name}</span>
+        <span style={{ minWidth: 28, color: active ? activeColor : dim, fontWeight: 'bold', fontSize: '0.85rem' }}>{count}</span>
+        {active && <span style={{ color: '#a0b8d0', flex: 1 }}>{items.map(d => d.l).join(' · ')}</span>}
+      </div>
+    );
+  };
+
   return (
-    <div style={baseRow}>
-      <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-          <div style={{ fontSize: '0.5rem', color: '#2d4a6b', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
-            ▼ Signal Summary{sig.partial && <span style={{ color: '#f0a84e' }}> · partial coverage</span>}
+    <div style={wrap}>
+      {/* Headline: tone + signal sentence + live count */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
+        <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+          <div style={label}>
+            ▼ Signal Summary{sig.partial && <span style={{ color: '#f0a84e', marginLeft: 6 }}>· partial coverage</span>}
           </div>
-          <div style={{ fontSize: '0.85rem', fontWeight: 'bold', color: sig.toneColor, fontFamily: 'monospace' }}>{sig.tone}</div>
+          <div style={{ fontSize: '1.15rem', fontWeight: 'bold', color: sig.toneColor, fontFamily: 'monospace', marginTop: 5, lineHeight: 1.1 }}>
+            {sig.tone}
+          </div>
+          <div style={{ marginTop: 8, fontSize: '0.78rem', color: '#c4d4e8', lineHeight: 1.5, maxWidth: 880 }}>
+            <span style={{ color: '#ffd700', fontWeight: 'bold' }}>Signal:</span> {sig.interp}
+          </div>
         </div>
-        <Tile label="Breadth" value={`${sig.upCount}/${sig.liveCount} ↑ ${(sig.breadthUp * 100).toFixed(0)}%`} />
-        <Tile label="Median" value={fmt(sig.median)} color={sig.median >= 0 ? '#00c9a7' : '#f05c5c'} />
-        <Tile label="Average" value={fmt(sig.mean)} color={sig.mean >= 0 ? '#00c9a7' : '#f05c5c'} />
-        <Tile label="Strongest group" value={`${sig.strongestGroup.g} ${fmt(sig.strongestGroup.avg)}`} color={GC[sig.strongestGroup.g]} />
-        <Tile label="Weakest group" value={`${sig.weakestGroup.g} ${fmt(sig.weakestGroup.avg)}`} color={GC[sig.weakestGroup.g]} />
-      </div>
-
-      <div style={{ marginTop: 6, display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: '0.6rem', fontFamily: 'monospace', alignItems: 'baseline' }}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
-          <span style={{ color: '#2d4a6b', fontSize: '0.5rem', letterSpacing: '0.12em' }}>TOP UP</span>
-          {sig.topUp.length === 0
-            ? <span style={{ color: '#4a6a8a' }}>none</span>
-            : sig.topUp.map((d, i) => (
-                <span key={d.id}>
-                  <span style={{ color: '#c4d4e8' }}>{d.l}</span>{' '}
-                  <span style={{ color: Math.abs(d.qoqPct) >= 5 ? '#4dffc3' : '#00c9a7', fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
-                  {i < sig.topUp.length - 1 && <span style={{ color: '#2d4a6b' }}>{' · '}</span>}
-                </span>
-              ))}
+        <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace', whiteSpace: 'nowrap', paddingTop: 18 }}>
+          {sig.liveCount}/{sig.total} categories live
         </div>
       </div>
 
-      <div style={{ marginTop: 3, display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: '0.6rem', fontFamily: 'monospace', alignItems: 'baseline' }}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
-          <span style={{ color: '#2d4a6b', fontSize: '0.5rem', letterSpacing: '0.12em' }}>TOP DOWN</span>
-          {sig.topDown.length === 0
-            ? <span style={{ color: '#4a6a8a' }}>none</span>
-            : sig.topDown.map((d, i) => (
-                <span key={d.id}>
-                  <span style={{ color: '#c4d4e8' }}>{d.l}</span>{' '}
-                  <span style={{ color: Math.abs(d.qoqPct) >= 5 ? '#ff7575' : '#f05c5c', fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
-                  {i < sig.topDown.length - 1 && <span style={{ color: '#2d4a6b' }}>{' · '}</span>}
-                </span>
-              ))}
+      {/* Metric tiles */}
+      <div style={{ marginTop: 14, display: 'flex', gap: 28, flexWrap: 'wrap', alignItems: 'flex-start', paddingTop: 12, borderTop: '1px solid #0d1520' }}>
+        <Tile name="Breadth" value={`${sig.upCount} / ${sig.liveCount}`} sub={`${(sig.breadthUp * 100).toFixed(0)}% positive`} />
+        <Tile name="Median" value={fmt(sig.median)} color={sig.median >= 0 ? '#00c9a7' : '#f05c5c'} />
+        <Tile name="Average" value={fmt(sig.mean)} color={sig.mean >= 0 ? '#00c9a7' : '#f05c5c'} />
+        <Tile name="Strongest group" value={sig.strongestGroup.g} sub={fmt(sig.strongestGroup.avg)} color={GC[sig.strongestGroup.g]} />
+        <Tile name="Weakest group" value={sig.weakestGroup.g} sub={fmt(sig.weakestGroup.avg)} color={GC[sig.weakestGroup.g]} />
+      </div>
+
+      {/* Top movers — two clean columns */}
+      <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'minmax(280px, 1fr) minmax(280px, 1fr)', gap: 32, paddingTop: 12, borderTop: '1px solid #0d1520' }}>
+        <div>
+          <div style={label}>▲ Top up</div>
+          <MoverList rows={sig.topUp} up={true} />
+        </div>
+        <div>
+          <div style={label}>▼ Top down</div>
+          <MoverList rows={sig.topDown} up={false} />
         </div>
       </div>
 
-      <div style={{ marginTop: 6, display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: '0.58rem', fontFamily: 'monospace', alignItems: 'baseline' }}>
-        <span style={{ color: '#2d4a6b', fontSize: '0.5rem', letterSpacing: '0.12em' }}>FLAGS</span>
-        <span style={{ color: sig.inflationFlags.length > 0 ? '#4dffc3' : '#4a6a8a' }}>
-          ⚡ inflation ≥ +5%: {sig.inflationFlags.length}{sig.inflationFlags.length > 0 ? ` (${sig.inflationFlags.map(d => d.l).join(', ')})` : ''}
-        </span>
-        <span style={{ color: sig.deflationFlags.length > 0 ? '#ff7575' : '#4a6a8a' }}>
-          ⬇ deflation ≤ −5%: {sig.deflationFlags.length}{sig.deflationFlags.length > 0 ? ` (${sig.deflationFlags.map(d => d.l).join(', ')})` : ''}
-        </span>
-        <span style={{ color: sig.outliers.length > 0 ? '#f0a84e' : '#4a6a8a' }}>
-          ◆ |Δ| ≥ 10%: {sig.outliers.length}{sig.outliers.length > 0 ? ` (${sig.outliers.map(d => d.l).join(', ')})` : ''}
-        </span>
-      </div>
-
-      <div style={{ marginTop: 8, fontSize: '0.62rem', color: '#c4d4e8', fontStyle: 'italic' }}>
-        <span style={{ color: '#ffd700', fontWeight: 'bold', fontStyle: 'normal' }}>Signal:</span> {sig.interp}
+      {/* Anomaly flags — one per row, aligned columns */}
+      <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid #0d1520' }}>
+        <div style={{ ...label, marginBottom: 6 }}>Anomaly flags</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <FlagRow icon="⚡" name="Inflation ≥ +5%" count={sig.inflationFlags.length} items={sig.inflationFlags} activeColor="#4dffc3" />
+          <FlagRow icon="⬇" name="Deflation ≤ −5%" count={sig.deflationFlags.length} items={sig.deflationFlags} activeColor="#ff7575" />
+          <FlagRow icon="◆" name="Major outlier |Δ| ≥ 10%" count={sig.outliers.length} items={sig.outliers} activeColor="#f0a84e" />
+        </div>
       </div>
     </div>
   );
