@@ -224,6 +224,36 @@ The `warnings: string[]` array is methodology-explicit and meant to be surfaced 
 - It does not feed Nexar prices into the live row, the Signal Summary, or the CSV. The existing Mouser flow is unchanged.
 - It does not blend broker prices into the trusted average.
 
+### Phase 8 — tiny basket preview
+
+`GET /api/nexar/basket-preview` is a **quota-bounded multi-SKU validation endpoint**. It is **not** the full production multi-SKU system. It exists to prove that category-level averaging works end-to-end against real Nexar data without burning the Evaluation app's limited supply quota.
+
+**Bounded behavior:**
+
+- **Max 4 Nexar MPN calls per invocation**, enforced by `BASKET_PREVIEW_MAX_CALLS` in `webapp/src/data/tiBasket.ts`. The endpoint refuses to run if the configured basket exceeds that cap.
+- **Tiny preview basket**: 2 categories × 2 SKUs = 4 MPNs total. All 4 SKUs already exist as primary/fallback parts in `PART_MAP`; we are not introducing new SKUs.
+- **No daily jobs.** No cron, no background timers, no long-term cache. The endpoint runs only on direct request.
+- **Quota errors isolated** via `Promise.allSettled`. A failure on one SKU returns a sanitized error stub for that SKU without blocking the others; the top-level `status` reports `ok` / `partial` / `error` accordingly.
+- The response always includes `remainingEvaluationQuotaNote: "Evaluation app is limited; do not run full basket until paid/approved plan."` and `basketStatus: "needs_expansion"` to keep the constraint visible.
+
+**Category-average methodology:**
+
+- Per-category `avgBestTrustedAvailableUnitPrice` and `medianBestTrustedAvailableUnitPrice` are computed **only from the SKUs in that category whose `bestTrustedAvailableUnitPrice` is non-null** — i.e. they had at least one in-stock trusted offer with usable unit pricing.
+- If every SKU in a category has null `bestTrustedAvailableUnitPrice` (e.g. all out of stock at trusted distributors), the average **falls back** to `bestTrustedQuotedUnitPrice` and the category emits the `category_average_uses_quoted_fallback` warning.
+- Broker prices are **never blended** into category averages. Broker inventory is reported separately as `totalBrokerAvailableInventory` per SKU and per category.
+- `sampleCoverage: "limited"` is always returned in this phase — 2 SKUs per category is below the threshold for production confidence.
+
+**SKUs in the current preview basket:**
+
+| Category | Group | SKU | Role |
+|---|---|---|---|
+| LDO Regulators | Power Management | `TPS7A8300RGWR` | primary |
+| LDO Regulators | Power Management | `TPS7A4501DCQR` | legacy_fallback |
+| Battery Management | Power Management | `BQ25896RTWT` | primary |
+| Battery Management | Power Management | `BQ76952PFBR` | legacy_fallback |
+
+**Full daily capture against the full 28-category basket requires a paid/approved Nexar supply plan.** Once that plan is in place, raise `BASKET_PREVIEW_MAX_CALLS` and expand `PHASE_8_BASKET_PREVIEW` (or replace it with a fuller config) — but do not change either constant under the Evaluation app.
+
 ## Local Development
 ```bash
 npm install

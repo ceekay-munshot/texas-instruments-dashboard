@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse, errorResponse } from './sources/octopartNexar'
 import { TRUSTED_DISTRIBUTOR_LIST } from './data/sourceTypes'
+import { PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS, BASKET_PREVIEW_QUOTA_NOTE, BASKET_STATUS, type BasketCategory } from './data/tiBasket'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -480,6 +481,227 @@ app.get('/api/sources/status', (c) => {
 // secrets are missing, returns { configured: false, status: 'not_configured' }.
 // Errors are sanitized — credentials, raw GraphQL bodies, and stack traces are
 // never echoed to the client.
+// ── Phase 8 — tiny multi-SKU basket preview ──────────────────────────────────
+// Hard-bounded to BASKET_PREVIEW_MAX_CALLS (=4) MPN fetches because the Nexar
+// Evaluation app has limited supply quota. Quota errors on individual SKUs
+// are isolated via Promise.allSettled — partial successes still return.
+app.get('/api/nexar/basket-preview', async (c) => {
+  const fetchedAt = new Date().toISOString()
+  const clientId = c.env.NEXAR_CLIENT_ID
+  const clientSecret = c.env.NEXAR_CLIENT_SECRET
+  const allSkus = PHASE_8_BASKET_PREVIEW.flatMap(cat =>
+    cat.skus.map(sku => ({ category: cat, sku }))
+  )
+
+  // Hard guard against accidental basket expansion.
+  if (allSkus.length > BASKET_PREVIEW_MAX_CALLS) {
+    return c.json({
+      configured: true,
+      status: 'error' as const,
+      source: 'octopart_nexar',
+      mode: 'tiny_basket_preview',
+      fetchedAt,
+      categoryCount: PHASE_8_BASKET_PREVIEW.length,
+      skuCount: allSkus.length,
+      quotedSkuCount: 0,
+      maxCalls: BASKET_PREVIEW_MAX_CALLS,
+      callsUsed: 0,
+      basketStatus: BASKET_STATUS,
+      remainingEvaluationQuotaNote: BASKET_PREVIEW_QUOTA_NOTE,
+      categories: [],
+      message: `Refusing to run: basket has ${allSkus.length} SKUs > maxCalls=${BASKET_PREVIEW_MAX_CALLS}.`,
+    }, 500)
+  }
+
+  if (!clientId || !clientSecret) {
+    return c.json({
+      configured: false,
+      status: 'not_configured' as const,
+      source: 'octopart_nexar',
+      mode: 'tiny_basket_preview',
+      fetchedAt,
+      categoryCount: PHASE_8_BASKET_PREVIEW.length,
+      skuCount: allSkus.length,
+      quotedSkuCount: 0,
+      maxCalls: BASKET_PREVIEW_MAX_CALLS,
+      callsUsed: 0,
+      basketStatus: BASKET_STATUS,
+      remainingEvaluationQuotaNote: BASKET_PREVIEW_QUOTA_NOTE,
+      categories: PHASE_8_BASKET_PREVIEW.map(cat => ({
+        categoryId: cat.categoryId,
+        categoryLabel: cat.categoryLabel,
+        groupId: cat.groupId,
+        groupLabel: cat.groupLabel,
+        skuCount: cat.skus.length,
+        quotedSkuCount: 0,
+        avgBestTrustedAvailableUnitPrice: null,
+        medianBestTrustedAvailableUnitPrice: null,
+        totalTrustedAvailableInventory: 0,
+        totalBrokerAvailableInventory: 0,
+        trustedDistributorCoverage: [],
+        warnings: [],
+        sampleCoverage: 'limited' as const,
+        skus: cat.skus.map(sku => ({
+          mpn: sku.mpn,
+          role: sku.role,
+          categoryId: cat.categoryId,
+          categoryLabel: cat.categoryLabel,
+          status: 'not_configured' as const,
+          trustedDistributors: [],
+          bestTrustedAvailableUnitPrice: null,
+          bestTrustedAvailableDistributor: null,
+          bestTrustedAvailableInventory: null,
+          bestTrustedQuotedUnitPrice: null,
+          bestAnyUnitPrice: null,
+          totalTrustedAvailableInventory: 0,
+          totalBrokerAvailableInventory: 0,
+          warnings: [],
+        })),
+      })),
+      message: 'Set NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET to enable.',
+    })
+  }
+
+  // Fire all (≤4) calls in parallel; a single quota failure must not kill the
+  // whole basket. Token cache inside fetchNexarPart amortizes auth across them.
+  const settled = await Promise.allSettled(
+    allSkus.map(({ sku }) => fetchNexarPart({ clientId, clientSecret, mpn: sku.mpn }))
+  )
+  const callsUsed = settled.length
+
+  // Per-SKU normalization (or sanitized error stub on rejection)
+  const perSku = settled.map((res, i) => {
+    const { category, sku } = allSkus[i]
+    if (res.status === 'fulfilled') {
+      const norm = normalizeNexarPart(res.value, sku.mpn)
+      return {
+        mpn: sku.mpn,
+        role: sku.role,
+        categoryId: category.categoryId,
+        categoryLabel: category.categoryLabel,
+        status: norm.status,
+        trustedDistributors: norm.trustedDistributors,
+        bestTrustedAvailableUnitPrice: norm.bestTrustedAvailableUnitPrice,
+        bestTrustedAvailableDistributor: norm.bestTrustedAvailableDistributor,
+        bestTrustedAvailableInventory: norm.bestTrustedAvailableInventory,
+        bestTrustedQuotedUnitPrice: norm.bestTrustedQuotedUnitPrice,
+        bestAnyUnitPrice: norm.bestAnyUnitPrice,
+        totalTrustedAvailableInventory: norm.totalTrustedAvailableInventory,
+        totalBrokerAvailableInventory: norm.totalBrokerAvailableInventory,
+        warnings: norm.warnings,
+      }
+    } else {
+      const message = String((res.reason as any)?.message || 'unknown error').slice(0, 200)
+      return {
+        mpn: sku.mpn,
+        role: sku.role,
+        categoryId: category.categoryId,
+        categoryLabel: category.categoryLabel,
+        status: 'error' as const,
+        trustedDistributors: [],
+        bestTrustedAvailableUnitPrice: null,
+        bestTrustedAvailableDistributor: null,
+        bestTrustedAvailableInventory: null,
+        bestTrustedQuotedUnitPrice: null,
+        bestAnyUnitPrice: null,
+        totalTrustedAvailableInventory: 0,
+        totalBrokerAvailableInventory: 0,
+        warnings: [],
+        message,
+      }
+    }
+  })
+
+  // Per-category aggregation
+  const categories = PHASE_8_BASKET_PREVIEW.map(cat => {
+    const skus = perSku.filter(s => s.categoryId === cat.categoryId)
+    const availablePrices = skus
+      .map(s => s.bestTrustedAvailableUnitPrice)
+      .filter((p): p is number => typeof p === 'number' && p > 0)
+    const quotedPrices = skus
+      .map(s => s.bestTrustedQuotedUnitPrice)
+      .filter((p): p is number => typeof p === 'number' && p > 0)
+
+    let avg: number | null = null
+    let median: number | null = null
+    let usedQuotedFallback = false
+
+    const computeAvgMedian = (vals: number[]) => {
+      const sorted = vals.slice().sort((a, b) => a - b)
+      const a = sorted.reduce((s, v) => s + v, 0) / sorted.length
+      const m = sorted.length % 2
+        ? sorted[(sorted.length - 1) / 2]
+        : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+      return { a, m }
+    }
+
+    if (availablePrices.length > 0) {
+      const r = computeAvgMedian(availablePrices)
+      avg = Math.round(r.a * 10000) / 10000
+      median = Math.round(r.m * 10000) / 10000
+    } else if (quotedPrices.length > 0) {
+      const r = computeAvgMedian(quotedPrices)
+      avg = Math.round(r.a * 10000) / 10000
+      median = Math.round(r.m * 10000) / 10000
+      usedQuotedFallback = true
+    }
+
+    const totalTrustedAvailableInventory = skus.reduce((s, x) => s + (x.totalTrustedAvailableInventory || 0), 0)
+    const totalBrokerAvailableInventory = skus.reduce((s, x) => s + (x.totalBrokerAvailableInventory || 0), 0)
+
+    const distSet = new Set<string>()
+    for (const s of skus) {
+      for (const d of s.trustedDistributors) distSet.add(d)
+    }
+    const trustedDistributorCoverage = Array.from(distSet)
+
+    const warnings: string[] = []
+    if (usedQuotedFallback) warnings.push('category_average_uses_quoted_fallback')
+    if (availablePrices.length === 0 && quotedPrices.length === 0) warnings.push('no_priced_skus_in_category')
+    if (skus.some(s => s.status === 'error')) warnings.push('one_or_more_skus_failed_fetch')
+    if (skus.some(s => s.status === 'no_match')) warnings.push('one_or_more_skus_returned_no_match')
+
+    return {
+      categoryId: cat.categoryId,
+      categoryLabel: cat.categoryLabel,
+      groupId: cat.groupId,
+      groupLabel: cat.groupLabel,
+      skuCount: skus.length,
+      quotedSkuCount: availablePrices.length,
+      avgBestTrustedAvailableUnitPrice: avg,
+      medianBestTrustedAvailableUnitPrice: median,
+      totalTrustedAvailableInventory,
+      totalBrokerAvailableInventory,
+      trustedDistributorCoverage,
+      warnings,
+      sampleCoverage: 'limited' as const,
+      skus,
+    }
+  })
+
+  const skuCount = perSku.length
+  const quotedSkuCount = perSku.filter(s => s.bestTrustedAvailableUnitPrice != null).length
+  const errored = perSku.filter(s => s.status === 'error').length
+  const status: 'ok' | 'partial' | 'error' =
+    errored === skuCount ? 'error' : errored > 0 ? 'partial' : 'ok'
+
+  return c.json({
+    configured: true,
+    status,
+    source: 'octopart_nexar',
+    mode: 'tiny_basket_preview',
+    fetchedAt,
+    categoryCount: PHASE_8_BASKET_PREVIEW.length,
+    skuCount,
+    quotedSkuCount,
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    callsUsed,
+    basketStatus: BASKET_STATUS,
+    remainingEvaluationQuotaNote: BASKET_PREVIEW_QUOTA_NOTE,
+    categories,
+  })
+})
+
 app.get('/api/nexar/test', async (c) => {
   const mpn = (c.req.query('mpn') || 'TPS7A8300RGWR').trim()
   const clientId = c.env.NEXAR_CLIENT_ID
