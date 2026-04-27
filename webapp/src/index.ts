@@ -1,8 +1,12 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse } from './sources/octopartNexar'
+import { TRUSTED_DISTRIBUTOR_LIST } from './data/sourceTypes'
 
 type Bindings = {
   MOUSER_API_KEY: string
+  NEXAR_CLIENT_ID?: string
+  NEXAR_CLIENT_SECRET?: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -441,6 +445,75 @@ app.get('/api/status', async (c) => {
     baselineIsStale: meta.baselineIsStale,
     comparisonMode: meta.comparisonMode,
   })
+})
+
+// ── Multi-source roadmap status — never exposes secret values ────────────────
+app.get('/api/sources/status', (c) => {
+  const env = c.env
+  const mouserConfigured = !!env.MOUSER_API_KEY
+  const nexarClientIdPresent = !!env.NEXAR_CLIENT_ID
+  const nexarClientSecretPresent = !!env.NEXAR_CLIENT_SECRET
+  const nexarConfigured = nexarClientIdPresent && nexarClientSecretPresent
+  return c.json({
+    phase: 'nexar_single_sku_test',
+    sources: {
+      mouser: {
+        configured: mouserConfigured,
+        usage: 'core-live-row (existing dashboard)',
+      },
+      octopart_nexar: {
+        configured: nexarConfigured,
+        clientIdPresent: nexarClientIdPresent,
+        clientSecretPresent: nexarClientSecretPresent,
+        testEndpoint: '/api/nexar/test?mpn=TPS7A8300RGWR',
+        defaultMpn: 'TPS7A8300RGWR',
+        trustedDistributors: TRUSTED_DISTRIBUTOR_LIST,
+        notes: 'Authorized/core distributor signal is not blended with broker/marketplace signal.',
+      },
+    },
+  })
+})
+
+// ── Single-SKU Nexar test endpoint ───────────────────────────────────────────
+// GET /api/nexar/test?mpn=TPS7A8300RGWR (mpn defaults to TPS7A8300RGWR)
+// Returns the normalized contract from src/sources/octopartNexar.ts. When
+// secrets are missing, returns { configured: false, status: 'not_configured' }.
+// Errors are sanitized — credentials, raw GraphQL bodies, and stack traces are
+// never echoed to the client.
+app.get('/api/nexar/test', async (c) => {
+  const mpn = (c.req.query('mpn') || 'TPS7A8300RGWR').trim()
+  const clientId = c.env.NEXAR_CLIENT_ID
+  const clientSecret = c.env.NEXAR_CLIENT_SECRET
+  if (!clientId || !clientSecret) {
+    return c.json(notConfiguredResponse(mpn))
+  }
+  try {
+    const raw = await fetchNexarPart({ clientId, clientSecret, mpn })
+    return c.json(normalizeNexarPart(raw, mpn))
+  } catch (e: any) {
+    const message = String(e?.message || 'unknown error').slice(0, 200)
+    return c.json({
+      configured: true,
+      status: 'error' as const,
+      source: 'octopart_nexar',
+      requestedMpn: mpn,
+      matchedMpn: null,
+      manufacturer: null,
+      description: null,
+      fetchedAt: new Date().toISOString(),
+      sellerCount: 0,
+      offerCount: 0,
+      trustedOfferCount: 0,
+      brokerOfferCount: 0,
+      totalTrustedInventory: 0,
+      totalBrokerInventory: 0,
+      bestTrustedUnitPrice: null,
+      bestAnyUnitPrice: null,
+      trustedDistributors: [],
+      allOffers: [],
+      message,
+    }, 502)
+  }
 })
 
 export default app

@@ -117,6 +117,84 @@ The `MOUSER_API_KEY` secret is set under **Settings → Variables and Secrets �
 - Never commit the key to source, never paste it into PRs/issues/chat, never include it in build artifacts.
 - The original `.tar.gz` import archive contained a copy of `.dev.vars`; the root `.gitignore` also excludes `*.tar.gz` to prevent accidental re-commit. Treat any key that has been distributed in such an archive as compromised — rotate before relying on it long-term.
 
+## Multi-source roadmap (Phase 6 — Nexar single-SKU test)
+
+The dashboard currently runs on a single source (Mouser). We are starting the work to add a second source — **Octopart / Nexar** — for cross-checking, broader distributor coverage, and inventory + price-break visibility. The current stage is **single-SKU validation only**: no full-basket fetches against Nexar yet, no UI integration of Nexar-derived numbers into the live row.
+
+### Endpoints
+
+- `GET /api/sources/status` — reports configuration state for each source (Mouser, Octopart/Nexar) without echoing secret values.
+- `GET /api/nexar/test?mpn=TPS7A8300RGWR` — single-SKU Nexar test. Defaults to `TPS7A8300RGWR` if `mpn` is omitted. Returns a normalized JSON shape (see below). When secrets are missing, returns `{ configured: false, status: "not_configured" }` cleanly with no error.
+
+### Required secrets
+
+| Secret | Where it's used |
+|---|---|
+| `NEXAR_CLIENT_ID` | Nexar OAuth2 `client_credentials` token request |
+| `NEXAR_CLIENT_SECRET` | Nexar OAuth2 `client_credentials` token request |
+
+Set both locally in `webapp/.dev.vars` (gitignored) and on Cloudflare Pages as Secret-typed environment variables. Without them, `/api/nexar/test` always returns the `not_configured` payload — it never errors.
+
+### Trusted distributor methodology
+
+Nexar returns offers from many sellers — authorized distributors, regional resellers, marketplaces, and brokers. We **do not blindly average** these into the core pricing/inventory signal. Instead each offer is classified as:
+
+- `authorized_or_core` — matches our trusted allowlist
+- `marketplace_or_broker` — named seller that does not match the allowlist
+- `unknown` — seller name is missing or empty
+
+The trusted allowlist (`webapp/src/data/sourceTypes.ts`):
+**Mouser, DigiKey, Texas Instruments, Arrow, Newark, Farnell, element14, RS, TME, Future Electronics, Avnet.**
+Matching is case-insensitive with word-boundary regex; ambiguous bare codes like "RS" alone are not matched (only "RS Components", "RS Pro", etc.) to avoid false positives.
+
+`bestTrustedUnitPrice` is computed only from the `authorized_or_core` pool. `bestAnyUnitPrice` includes everything — useful as a debug / floor-price reference but **not** suitable for core signal. Broker offers are kept in `allOffers[]` for visibility but never blended into trusted aggregates.
+
+### Normalized response (success path)
+
+```jsonc
+{
+  "configured": true,
+  "status": "ok",
+  "source": "octopart_nexar",
+  "requestedMpn": "TPS7A8300RGWR",
+  "matchedMpn": "TPS7A8300RGWR",
+  "manufacturer": "Texas Instruments",
+  "description": "…",
+  "fetchedAt": "2026-04-28T…Z",
+  "sellerCount": 12,
+  "offerCount": 18,
+  "trustedOfferCount": 4,
+  "brokerOfferCount": 14,
+  "totalTrustedInventory": 12345,
+  "totalBrokerInventory": 678,
+  "bestTrustedUnitPrice": 7.0861,
+  "bestAnyUnitPrice": 6.92,
+  "trustedDistributors": ["DigiKey", "Mouser", "Texas Instruments"],
+  "allOffers": [
+    {
+      "distributor": "DigiKey",
+      "distributorTier": "authorized_or_core",
+      "inventory": 4123,
+      "moq": 1,
+      "packaging": "Cut Tape",
+      "unitPrice": 7.12,
+      "unitPriceQty": 1,
+      "currency": "USD",
+      "priceBreaks": [{ "quantity": 1, "price": 7.12, "currency": "USD" }, /* … */],
+      "clickUrl": "https://…"
+    }
+  ]
+}
+```
+
+`unitPrice` always prefers the lowest-quantity break with `quantity ≤ 10`. If a seller only quotes higher-MOQ pricing, the lowest-available break is used and `quantityBasisWarning: true` is set on that offer.
+
+### What this does NOT do (intentionally)
+
+- It does not run a full 28-category fetch against Nexar — that's the Phase 6+ next step after we've validated the response shape on real data.
+- It does not feed Nexar prices into the live row, the Signal Summary, or the CSV. The existing Mouser flow is unchanged.
+- It does not blend broker prices into the trusted average.
+
 ## Local Development
 ```bash
 npm install
