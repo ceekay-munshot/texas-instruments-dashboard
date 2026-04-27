@@ -4,7 +4,7 @@
 // returned to callers. Token is cached in module scope (per-Worker-isolate)
 // for reuse within a single isolate's lifetime.
 
-import { classifyDistributor, type DistributorTier } from '../data/sourceTypes'
+import { classifyDistributor, canonicalDistributorName, type DistributorTier } from '../data/sourceTypes'
 
 const TOKEN_URL = 'https://identity.nexar.com/connect/token'
 const GRAPHQL_URL = 'https://api.nexar.com/graphql'
@@ -134,12 +134,54 @@ export type NexarNormalized = {
   offerCount: number
   trustedOfferCount: number
   brokerOfferCount: number
+
+  // ── Inventory aggregations ─────────────────────────────────────────────────
+  /** Sum of inventory across trusted/core offers (existing field, kept for
+   * backward compatibility). Equivalent to *Available* when no negative-stock
+   * values are reported. */
   totalTrustedInventory: number
   totalBrokerInventory: number
+  /** Sum of inventory across trusted/core offers with `inventory > 0` only.
+   * This is the intent-clear name for shortage monitoring. */
+  totalTrustedAvailableInventory: number
+  totalBrokerAvailableInventory: number
+
+  // ── Price metrics ──────────────────────────────────────────────────────────
+  /** Primary signal: lowest trusted/core unit price among offers that are
+   * actually buyable (inventory > 0), preferring qty≤10 + no qty-basis warning;
+   * falls back to any in-stock trusted offer if no preferred match exists. */
+  bestTrustedAvailableUnitPrice: number | null
+  bestTrustedAvailableDistributor: string | null
+  bestTrustedAvailableInventory: number | null
+  bestTrustedAvailableQtyBasis: number | null
+
+  /** Reference / debug: lowest trusted/core unit price across ALL trusted
+   * offers regardless of inventory or MOQ. Intentionally unfiltered so a
+   * consumer can see the floor quote even when it's a high-MOQ reel quote. */
+  bestTrustedQuotedUnitPrice: number | null
+  bestTrustedQuotedDistributor: string | null
+  bestTrustedQuotedInventory: number | null
+  bestTrustedQuotedQtyBasis: number | null
+
+  /** Backward-compatible alias. Equals bestTrustedAvailableUnitPrice if any
+   * trusted offer is buyable; otherwise falls back to bestTrustedQuotedUnitPrice
+   * (the warnings array will indicate the fallback condition). */
   bestTrustedUnitPrice: number | null
+
+  /** Lowest unit price across ALL offers including brokers — *not* an
+   * investor-grade signal. Use as a market-floor / debug reference only. */
   bestAnyUnitPrice: number | null
+
   trustedDistributors: string[]
   allOffers: NexarOffer[]
+
+  /** Top-level methodology / quality flags. Possible values:
+   *  - "best_trusted_quote_requires_high_moq"
+   *  - "best_trusted_quote_zero_inventory"
+   *  - "best_any_price_from_broker"
+   *  - "broker_inventory_excluded_from_core_signal" */
+  warnings: string[]
+
   /** Optional sanitized error message — only set when status === 'error'. */
   message?: string
 }
@@ -149,32 +191,36 @@ function asNumber(v: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+// ── Best-offer selection helpers ─────────────────────────────────────────────
+
+/** Tiered selection: prefer in-stock trusted offers with qty≤10 and no
+ * quantityBasisWarning; fall back to any in-stock trusted offer; else null. */
+function pickBestTrustedAvailable(offers: NexarOffer[]): NexarOffer | null {
+  const inStock = offers.filter(o => o.inventory > 0 && o.unitPrice != null && o.unitPrice > 0)
+  if (inStock.length === 0) return null
+  // Tier 1: qty ≤ 10 AND no quantity-basis warning
+  const tier1 = inStock.filter(o =>
+    o.unitPriceQty != null && o.unitPriceQty <= 10 && !o.quantityBasisWarning
+  )
+  const pool = tier1.length > 0 ? tier1 : inStock
+  // Lowest unit price wins
+  return pool.slice().sort((a, b) => (a.unitPrice as number) - (b.unitPrice as number))[0]
+}
+
+/** Cheapest unit price across the offer set, regardless of inventory or MOQ. */
+function pickBestQuoted(offers: NexarOffer[]): NexarOffer | null {
+  const candidates = offers.filter(o => o.unitPrice != null && o.unitPrice > 0)
+  if (candidates.length === 0) return null
+  return candidates.slice().sort((a, b) => (a.unitPrice as number) - (b.unitPrice as number))[0]
+}
+
 export function normalizeNexarPart(raw: any, requestedMpn: string): NexarNormalized {
   const fetchedAt = new Date().toISOString()
   const result = raw?.data?.supSearchMpn?.results?.[0]
   const part = result?.part
 
   if (!part) {
-    return {
-      configured: true,
-      status: 'no_match',
-      source: 'octopart_nexar',
-      requestedMpn,
-      matchedMpn: null,
-      manufacturer: null,
-      description: null,
-      fetchedAt,
-      sellerCount: 0,
-      offerCount: 0,
-      trustedOfferCount: 0,
-      brokerOfferCount: 0,
-      totalTrustedInventory: 0,
-      totalBrokerInventory: 0,
-      bestTrustedUnitPrice: null,
-      bestAnyUnitPrice: null,
-      trustedDistributors: [],
-      allOffers: [],
-    }
+    return emptyNormalized({ status: 'no_match', requestedMpn, fetchedAt })
   }
 
   const matchedMpn = part.mpn || requestedMpn
@@ -197,8 +243,8 @@ export function normalizeNexarPart(raw: any, requestedMpn: string): NexarNormali
         .filter((p: NexarPriceBreak) => p.quantity > 0 && p.price > 0)
         .sort((a: NexarPriceBreak, b: NexarPriceBreak) => a.quantity - b.quantity)
 
-      // Prefer the lowest qty break with quantity <= 10. Otherwise use the
-      // lowest available quantity and flag quantityBasisWarning.
+      // Prefer the lowest qty break with quantity ≤ 10. Otherwise use the
+      // lowest-available quantity break and flag quantityBasisWarning.
       const unitOrSmall = breaks.find(b => b.quantity <= 10) || breaks[0] || null
       const quantityBasisWarning = !!(unitOrSmall && unitOrSmall.quantity > 10)
 
@@ -222,32 +268,62 @@ export function normalizeNexarPart(raw: any, requestedMpn: string): NexarNormali
   const trustedOffers = allOffers.filter(o => o.distributorTier === 'authorized_or_core')
   const brokerOffers = allOffers.filter(o => o.distributorTier === 'marketplace_or_broker')
 
+  // Inventory aggregations
   const totalTrustedInventory = trustedOffers.reduce((s, o) => s + (o.inventory || 0), 0)
   const totalBrokerInventory = brokerOffers.reduce((s, o) => s + (o.inventory || 0), 0)
+  const totalTrustedAvailableInventory = trustedOffers
+    .filter(o => o.inventory > 0)
+    .reduce((s, o) => s + o.inventory, 0)
+  const totalBrokerAvailableInventory = brokerOffers
+    .filter(o => o.inventory > 0)
+    .reduce((s, o) => s + o.inventory, 0)
 
-  // Best unit price: lowest legit unit price > 0 from each pool.
-  // Outliers (e.g. typoed prices) are not hidden from allOffers, but we drop
-  // them from the bestTrustedUnitPrice calculation if they're 100x higher
-  // than the next-cheapest offer. Conservative: only filter when the cluster
-  // is dense enough to identify an outlier reliably.
-  const trustedPrices = trustedOffers
-    .map(o => o.unitPrice)
-    .filter((p): p is number => typeof p === 'number' && p > 0)
-    .sort((a, b) => a - b)
-  const allPrices = allOffers
-    .map(o => o.unitPrice)
-    .filter((p): p is number => typeof p === 'number' && p > 0)
-    .sort((a, b) => a - b)
+  // ── Price metrics: tiered Available + reference Quoted + market-floor Any ─
+  const bestAvailableOffer = pickBestTrustedAvailable(trustedOffers)
+  const bestQuotedTrustedOffer = pickBestQuoted(trustedOffers)
+  const bestAnyOffer = pickBestQuoted(allOffers)
 
-  const bestTrustedUnitPrice = trustedPrices[0] ?? null
-  const bestAnyUnitPrice = allPrices[0] ?? null
+  const bestTrustedAvailableUnitPrice = bestAvailableOffer?.unitPrice ?? null
+  const bestTrustedAvailableDistributor = bestAvailableOffer?.distributor ?? null
+  const bestTrustedAvailableInventory = bestAvailableOffer ? bestAvailableOffer.inventory : null
+  const bestTrustedAvailableQtyBasis = bestAvailableOffer?.unitPriceQty ?? null
 
-  // Distinct trusted distributor names (preserve original casing from Nexar)
-  const trustedDistributors = Array.from(new Set(
-    trustedOffers
-      .map(o => o.distributor)
-      .filter((n): n is string => typeof n === 'string' && n.length > 0)
-  ))
+  const bestTrustedQuotedUnitPrice = bestQuotedTrustedOffer?.unitPrice ?? null
+  const bestTrustedQuotedDistributor = bestQuotedTrustedOffer?.distributor ?? null
+  const bestTrustedQuotedInventory = bestQuotedTrustedOffer ? bestQuotedTrustedOffer.inventory : null
+  const bestTrustedQuotedQtyBasis = bestQuotedTrustedOffer?.unitPriceQty ?? null
+
+  // Backward-compatible alias: prefer Available, fall back to Quoted.
+  const bestTrustedUnitPrice = bestTrustedAvailableUnitPrice ?? bestTrustedQuotedUnitPrice
+
+  const bestAnyUnitPrice = bestAnyOffer?.unitPrice ?? null
+
+  // ── Warnings ────────────────────────────────────────────────────────────────
+  const warnings: string[] = []
+  if (bestQuotedTrustedOffer?.quantityBasisWarning) {
+    warnings.push('best_trusted_quote_requires_high_moq')
+  }
+  if (bestQuotedTrustedOffer && bestQuotedTrustedOffer.inventory <= 0) {
+    warnings.push('best_trusted_quote_zero_inventory')
+  }
+  if (bestAnyOffer && bestAnyOffer.distributorTier === 'marketplace_or_broker') {
+    warnings.push('best_any_price_from_broker')
+  }
+  if (brokerOffers.length > 0) {
+    warnings.push('broker_inventory_excluded_from_core_signal')
+  }
+
+  // Distinct trusted distributors using canonical names so DigiKey Cut Tape /
+  // Tape & Reel / Custom Reel collapse to one bucket.
+  const seen = new Set<string>()
+  const trustedDistributors: string[] = []
+  for (const o of trustedOffers) {
+    const canon = canonicalDistributorName(o.distributor)
+    if (canon && !seen.has(canon)) {
+      seen.add(canon)
+      trustedDistributors.push(canon)
+    }
+  }
 
   return {
     configured: true,
@@ -264,33 +340,81 @@ export function normalizeNexarPart(raw: any, requestedMpn: string): NexarNormali
     brokerOfferCount: brokerOffers.length,
     totalTrustedInventory,
     totalBrokerInventory,
+    totalTrustedAvailableInventory,
+    totalBrokerAvailableInventory,
+    bestTrustedAvailableUnitPrice,
+    bestTrustedAvailableDistributor,
+    bestTrustedAvailableInventory,
+    bestTrustedAvailableQtyBasis,
+    bestTrustedQuotedUnitPrice,
+    bestTrustedQuotedDistributor,
+    bestTrustedQuotedInventory,
+    bestTrustedQuotedQtyBasis,
     bestTrustedUnitPrice,
     bestAnyUnitPrice,
     trustedDistributors,
     allOffers,
+    warnings,
   }
 }
 
-export function notConfiguredResponse(requestedMpn: string): NexarNormalized {
+// Helper to keep no_match / not_configured / error responses in sync with the
+// expanded NexarNormalized shape.
+function emptyNormalized(opts: {
+  status: NexarNormalized['status']
+  requestedMpn: string
+  fetchedAt?: string
+  configured?: boolean
+  message?: string
+}): NexarNormalized {
   return {
-    configured: false,
-    status: 'not_configured',
+    configured: opts.configured ?? true,
+    status: opts.status,
     source: 'octopart_nexar',
-    requestedMpn,
+    requestedMpn: opts.requestedMpn,
     matchedMpn: null,
     manufacturer: null,
     description: null,
-    fetchedAt: new Date().toISOString(),
+    fetchedAt: opts.fetchedAt ?? new Date().toISOString(),
     sellerCount: 0,
     offerCount: 0,
     trustedOfferCount: 0,
     brokerOfferCount: 0,
     totalTrustedInventory: 0,
     totalBrokerInventory: 0,
+    totalTrustedAvailableInventory: 0,
+    totalBrokerAvailableInventory: 0,
+    bestTrustedAvailableUnitPrice: null,
+    bestTrustedAvailableDistributor: null,
+    bestTrustedAvailableInventory: null,
+    bestTrustedAvailableQtyBasis: null,
+    bestTrustedQuotedUnitPrice: null,
+    bestTrustedQuotedDistributor: null,
+    bestTrustedQuotedInventory: null,
+    bestTrustedQuotedQtyBasis: null,
     bestTrustedUnitPrice: null,
     bestAnyUnitPrice: null,
     trustedDistributors: [],
     allOffers: [],
-    message: 'Set NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET to enable.',
+    warnings: [],
+    ...(opts.message != null ? { message: opts.message } : {}),
   }
+}
+
+export function notConfiguredResponse(requestedMpn: string): NexarNormalized {
+  return emptyNormalized({
+    status: 'not_configured',
+    requestedMpn,
+    configured: false,
+    message: 'Set NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET to enable.',
+  })
+}
+
+export function errorResponse(requestedMpn: string, sanitizedMessage: string): NexarNormalized {
+  return emptyNormalized({
+    status: 'error',
+    requestedMpn,
+    configured: true,
+    message: sanitizedMessage,
+  })
 }

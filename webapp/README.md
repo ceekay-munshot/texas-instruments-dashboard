@@ -145,9 +145,38 @@ Nexar returns offers from many sellers — authorized distributors, regional res
 
 The trusted allowlist (`webapp/src/data/sourceTypes.ts`):
 **Mouser, DigiKey, Texas Instruments, Arrow, Newark, Farnell, element14, RS, TME, Future Electronics, Avnet.**
-Matching is case-insensitive with word-boundary regex; ambiguous bare codes like "RS" alone are not matched (only "RS Components", "RS Pro", etc.) to avoid false positives.
+Matching is case-insensitive with word-boundary regex; ambiguous bare codes like "RS" alone are not matched (only "RS Components", "RS Pro", etc.) to avoid false positives. Trusted distributor names are canonicalized for deduplication so the same distributor's Cut Tape / Tape & Reel / Custom Reel offers collapse into one entry in `trustedDistributors`.
 
-`bestTrustedUnitPrice` is computed only from the `authorized_or_core` pool. `bestAnyUnitPrice` includes everything — useful as a debug / floor-price reference but **not** suitable for core signal. Broker offers are kept in `allOffers[]` for visibility but never blended into trusted aggregates.
+### Price metric methodology (post-Phase 7 hardening)
+
+Trusted distributors often quote multiple offers per part — qty=1 unit pricing on Cut Tape, plus high-MOQ pricing on Tape & Reel where the per-unit number drops at quantity ≥ 1000. Naive "lowest unit price" comparison lets the high-MOQ reel price win even when **inventory is zero and you would have to buy 3000 pieces**. That is wrong for shortage monitoring. Phase 7 separates price metrics into three intent-clear fields:
+
+| Field | Definition | Use as |
+|---|---|---|
+| **`bestTrustedAvailableUnitPrice`** | Lowest trusted unit price among offers with `inventory > 0`, preferring qty ≤ 10 with no `quantityBasisWarning`; falls back to any in-stock trusted offer if no preferred match exists. | **Primary signal.** This is what to chart, what to alert on, and what to use for shortage monitoring. |
+| `bestTrustedQuotedUnitPrice` | Lowest trusted unit price across **all** trusted offers regardless of inventory or MOQ. | Reference / floor quote. May be a 3000-piece reel with zero stock — accompanying warnings make this explicit. |
+| `bestAnyUnitPrice` | Lowest unit price across **all** offers including brokers. | Market-floor / debug reference only. **Not** investor-grade. The `best_any_price_from_broker` warning flags when this came from a marketplace seller. |
+
+`bestTrustedUnitPrice` is preserved as a backward-compat alias. It equals `bestTrustedAvailableUnitPrice` whenever any trusted offer is buyable; otherwise it falls back to `bestTrustedQuotedUnitPrice`, and the `warnings` array surfaces `best_trusted_quote_zero_inventory` / `best_trusted_quote_requires_high_moq` as appropriate.
+
+Each best-* metric carries companion fields (`*Distributor`, `*Inventory`, `*QtyBasis`) so a consumer can immediately see which distributor/SKU/qty-break the price came from without re-scanning `allOffers[]`.
+
+### Top-level warnings
+
+The `warnings: string[]` array is methodology-explicit and meant to be surfaced verbatim. Possible values:
+
+- `best_trusted_quote_requires_high_moq` — the cheapest trusted-quoted offer comes from a price break with quantity > 10 (e.g. a 3000-piece reel quote).
+- `best_trusted_quote_zero_inventory` — the cheapest trusted-quoted offer is currently out of stock.
+- `best_any_price_from_broker` — the lowest unit price across all offers comes from a marketplace/broker seller, not a trusted distributor.
+- `broker_inventory_excluded_from_core_signal` — present whenever any broker offer is in the result. Reminds consumers that broker inventory and broker prices are **not** blended into trusted aggregates.
+
+### Inventory aggregations
+
+| Field | Definition |
+|---|---|
+| `totalTrustedInventory` | Sum of all trusted offer inventories (legacy field kept for backward compatibility). |
+| **`totalTrustedAvailableInventory`** | Sum of trusted inventories where `inventory > 0` only — intent-clear name for shortage monitoring. |
+| `totalBrokerInventory` / `totalBrokerAvailableInventory` | Same pair for broker / marketplace offers. Tracked separately and **never** blended into the trusted total. |
 
 ### Normalized response (success path)
 

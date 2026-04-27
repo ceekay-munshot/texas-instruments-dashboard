@@ -58,3 +58,20 @@ export function classifyDistributor(name?: string | null): DistributorTier {
   }
   return 'marketplace_or_broker'
 }
+
+/**
+ * Returns a canonical (deduplication-friendly) distributor name. For trusted
+ * matches this is the curated canonical form ("DigiKey", "Mouser", …) so that
+ * Nexar variants like "Digi-Key", "Digi-Key Electronics", "Digi Key" all
+ * collapse to a single bucket. For unrecognized names returns the trimmed
+ * original. Returns null only when the input is empty/missing.
+ */
+export function canonicalDistributorName(name?: string | null): string | null {
+  if (!name) return null
+  const n = String(name).trim()
+  if (!n) return null
+  for (const p of TRUSTED_PATTERNS) {
+    if (p.pattern.test(n)) return p.canonical
+  }
+  return n
+}

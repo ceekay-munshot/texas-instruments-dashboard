@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse } from './sources/octopartNexar'
+import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse, errorResponse } from './sources/octopartNexar'
 import { TRUSTED_DISTRIBUTOR_LIST } from './data/sourceTypes'
 
 type Bindings = {
@@ -492,27 +492,7 @@ app.get('/api/nexar/test', async (c) => {
     return c.json(normalizeNexarPart(raw, mpn))
   } catch (e: any) {
     const message = String(e?.message || 'unknown error').slice(0, 200)
-    return c.json({
-      configured: true,
-      status: 'error' as const,
-      source: 'octopart_nexar',
-      requestedMpn: mpn,
-      matchedMpn: null,
-      manufacturer: null,
-      description: null,
-      fetchedAt: new Date().toISOString(),
-      sellerCount: 0,
-      offerCount: 0,
-      trustedOfferCount: 0,
-      brokerOfferCount: 0,
-      totalTrustedInventory: 0,
-      totalBrokerInventory: 0,
-      bestTrustedUnitPrice: null,
-      bestAnyUnitPrice: null,
-      trustedDistributors: [],
-      allOffers: [],
-      message,
-    }, 502)
+    return c.json(errorResponse(mpn, message), 502)
   }
 })
 
