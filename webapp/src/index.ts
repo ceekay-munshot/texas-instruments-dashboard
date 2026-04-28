@@ -826,11 +826,19 @@ app.post('/api/snapshots/capture', async (c) => {
       ...base,
     })
   }
-  const provided =
+  // Hono's c.req.header() is case-insensitive on the lookup name, so we only
+  // need one variant. We also tolerate a trailing newline / surrounding
+  // whitespace on either side — Cloudflare Pages' env var UI silently keeps
+  // pasted trailing newlines, which would otherwise break strict equality
+  // against a cleanly-typed local value. Trim is applied to both sides; the
+  // mismatch path is unchanged so missing-vs-wrong stays indistinguishable.
+  const providedRaw =
     c.req.header('x-capture-secret') ||
-    c.req.header('X-Capture-Secret') ||
-    c.req.query('secret')
-  if (!provided || provided !== env.SNAPSHOT_CAPTURE_SECRET) {
+    c.req.query('secret') ||
+    ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
     return c.json({ success: false, status: 'unauthorized' }, 401)
   }
 
