@@ -474,6 +474,32 @@ Today the cap of 4 is consumed by the two anchor categories — `pm_ldo` and `pm
 
 **This protects against false confidence from a too-small basket.** A user looking at the dashboard sees "4 of 14 sampled" rather than "4 SKUs" — making the limit and the expansion path visible.
 
+### Quota-safe rotating sampling (Phase 15B)
+
+Phase 15A grew the catalog to 14 SKUs but the daily Nexar quota cap (`BASKET_PREVIEW_MAX_CALLS = 4`) stayed put. Without rotation, the same 4 anchor SKUs would be sampled every day and the other 10 would never accumulate observed history. Phase 15B fixes that with **anchor + rotation** — a deterministic, date-driven policy that keeps the daily call count flat:
+
+- **Daily cap stays at 4.** No new Nexar calls. Capture endpoint only — page loads never trigger capture or fan out to Nexar from the UI.
+- **Catalog vs. sampled set differ on purpose.** Catalog is 14 SKUs across 7 categories. Sampled-today is up to 4 SKUs.
+- **2 anchor continuity slots.** One primary per anchor category (`pm_ldo`, `pm_batt`) — sampled every day so price/inventory series for the most-trafficked TI franchises remain unbroken.
+- **2 rotation slots.** The remaining 5 secondary/watchlist categories (`amp_op`, `dac_adc`, `pm_dcdc`, `if_can`, `mcu_msp`) cycle through using `rotationIndex = days-since-1970-01-01-UTC`. Each day's pick is `(rotationIndex × rotationSlots + slot) mod rotationPoolSize`. Same UTC date → same SKUs everywhere (capture, basket-preview, basket-coverage). Adjacent slot indices are always distinct mod the pool size, so the same category never appears twice in one day's plan.
+- **Fallback substitution on failure.** If the most recent stored snapshot recorded an anchor primary at `status: error` or `no_match`, capture substitutes the anchor's `legacy_fallback` SKU into that slot for one day (reason: `fallback_for_failed_primary`). This consumes the same one Nexar call — the slot count is unchanged.
+- **Anchors never rotate out.** Anchors are continuity, not rotation. If you raise `BASKET_PREVIEW_MAX_CALLS`, anchors keep their slots and the rotation pool gets more concurrent slots per day (the cycle shortens).
+- **No fake history.** The system never invents a past observation for an unsampled SKU. Unsampled categories simply have no datapoint for that day; their history begins on the day they next land in a rotation slot.
+- **`nextRotationPreview` is a planned simulation, not observed data.** It re-runs the same selector against future UTC dates so the UI can answer "when will this category next be sampled?". It is not a promise — if the catalog shape changes, the plan changes with it.
+
+`estimatedFullCycleDays = ceil(rotationPoolSize / rotationSlots)`. Today: `ceil(5 / 2) = 3 days` to touch every rotation-pool category at least once. Anchors are touched daily on top of that.
+
+**Endpoint changes (Phase 15B):**
+
+| Method | Path | New behavior |
+|---|---|---|
+| `GET` | `/api/nexar/basket-coverage` | Adds `samplingPolicy`, `snapshotDate`, `rotationIndex`, `rotationPoolSize`, `rotationSlots`, `anchorSlots`, `estimatedFullCycleDays`, `nextRotationPreview[]` (next 7 UTC days). Per-category: `sampledToday`, `nextExpectedSampleDate`, plus `reason` on each `sampledSkus[]` / `unsampledSkus[]` row. Still read-only; never calls Nexar. |
+| `GET` | `/api/nexar/basket-preview` | Now selects via the rotating policy (same SKUs as capture for the day). Still hard-bounded to `BASKET_PREVIEW_MAX_CALLS`. Coverage block in the response carries the rotation metadata. |
+| `POST` | `/api/snapshots/capture` | Reads the previous snapshot (one KV `get`) to detect anchor-primary failures; passes them as `recentlyFailedMpns` to `selectSampledSkus` so the day's plan substitutes a fallback for that slot. Records `samplingPolicy`, `rotationIndex`, `estimatedFullCycleDays`, `sampledSkus` (with `reason`), `unsampledSkus`, and `nextRotationPreview` into `snapshot.metadata`. Old snapshots that pre-date these keys remain readable. |
+| `GET` | `/api/snapshots/evidence/latest` | `coverage` block now also exposes `samplingPolicy`, `rotationIndex`, `estimatedFullCycleDays`. |
+
+**UI surface.** The legend status line becomes `Basket coverage: 4 / 14 sampled today · rotating coverage · full cycle ~3 days`. Inside an NX-marked tooltip, the snapshot-evidence section gains a one-line `Sampling policy: anchor + rotation`; for cells whose category is **not** sampled today, an amber line appears: `Watchlist category — next expected sample: YYYY-MM-DD`. No redesign.
+
 ## Local Development
 ```bash
 npm install

@@ -325,9 +325,11 @@ export const BASKET_STATUS = 'needs_expansion' as const
 export const BASKET_PREVIEW_QUOTA_NOTE =
   'Evaluation app is limited; do not run full basket until paid/approved plan.'
 
-// ── Quota-safe sampling selector ─────────────────────────────────────────────
-// Deterministic sort over the catalog. Capture pulls the top `maxCalls`; the
-// rest stay catalogued as monitored watchlist. No fetches happen here.
+// ── Quota-safe sampling selector (Phase 15B — anchor + UTC-day rotation) ─────
+// Deterministic, date-driven selection. Capture pulls up to `maxCalls` SKUs:
+// anchors stay every day for continuity, and the remaining slots rotate
+// through the secondary/watchlist categories so unsampled categories build
+// observed history over time. No fetches happen in this module.
 
 const ROLE_RANK: Record<SkuRole, number> = {
   primary: 0,
@@ -341,68 +343,317 @@ const CATEGORY_ROLE_RANK: Record<BasketCategoryRole, number> = {
   watchlist: 2,
 }
 
+/** Why a given SKU was sampled today. Unsampled rows always carry `quota_limit`. */
+export type SamplingReason =
+  | 'anchor_continuity'
+  | 'rotation_slot'
+  | 'fallback_for_failed_primary'
+  | 'quota_limit'
+
+export type SamplingPolicy = 'anchor_plus_rotation' | 'priority_topn'
+
 export type BasketSkuRef = {
   category: BasketCategory
   sku: BasketSku
-  /** Composite sort key; lower = sampled first. */
+  /** Composite sort key; lower = picked earlier in the day's plan. */
   rank: number
+  /** Reason this SKU is in `sampled[]` or `unsampled[]`. */
+  reason?: SamplingReason
 }
 
 export type BasketSamplingResult = {
   sampled: BasketSkuRef[]
   unsampled: BasketSkuRef[]
+  policy: SamplingPolicy
+  /** UTC date this plan corresponds to (YYYY-MM-DD). */
+  snapshotDate: string
+  /** Days-since-1970-01-01 UTC; deterministic seed for the rotation. */
+  rotationIndex: number
+  /** How many secondary/watchlist categories sit in the rotation pool. */
+  rotationPoolSize: number
+  /** How many of `maxCalls` are spent on rotation slots today. */
+  rotationSlots: number
+  /** How many of `maxCalls` are spent on anchor continuity today. */
+  anchorSlots: number
   sampleLimit: number
   sampleLimitReason: 'nexar_quota_cap'
   basketCatalogSkuCount: number
   sampledSkuCount: number
   unsampledSkuCount: number
+  /** Approximate days under current cap to touch every rotation-pool category at least once. */
+  estimatedFullCycleDays: number | null
+}
+
+export type SelectSampledSkusOptions = {
+  /** Default: BASKET_PREVIEW_MAX_CALLS. Never exceeded. */
+  maxCalls?: number
+  /** UTC date in YYYY-MM-DD form. Default: today UTC. Drives the rotation. */
+  snapshotDate?: string
+  /** Default: 'anchor_plus_rotation'. */
+  policy?: SamplingPolicy
+  /**
+   * MPNs that recently failed (e.g. status=error or no_match in the last
+   * stored snapshot). When an anchor primary appears here and a fallback
+   * exists in the same category, the fallback substitutes for the anchor
+   * slot today. Other slots are unaffected.
+   */
+  recentlyFailedMpns?: string[]
+}
+
+function todayUtcDate(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+/** Days since 1970-01-01 UTC for a YYYY-MM-DD string. Stable across servers. */
+export function utcDayOrdinal(snapshotDate: string): number {
+  const y = parseInt(snapshotDate.slice(0, 4), 10)
+  const m = parseInt(snapshotDate.slice(5, 7), 10)
+  const d = parseInt(snapshotDate.slice(8, 10), 10)
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return 0
+  return Math.floor(Date.UTC(y, m - 1, d) / 86_400_000)
+}
+
+function categorySortKey(cat: BasketCategory): string {
+  const r = CATEGORY_ROLE_RANK[cat.categoryRole ?? 'watchlist']
+  return `${r}:${cat.categoryId}`
+}
+
+function pickPrimarySku(cat: BasketCategory): BasketSku | null {
+  let best: BasketSku | null = null
+  let bestRank = Number.POSITIVE_INFINITY
+  for (const sku of cat.skus) {
+    const sp = sku.samplingPriority ?? 99
+    const rr = ROLE_RANK[sku.role] ?? 99
+    const r = sp * 1000 + rr
+    if (r < bestRank) { bestRank = r; best = sku }
+  }
+  return best
+}
+
+function pickFallbackSku(cat: BasketCategory, primaryMpn: string): BasketSku | null {
+  for (const sku of cat.skus) {
+    if (sku.mpn !== primaryMpn && sku.role === 'legacy_fallback') return sku
+  }
+  for (const sku of cat.skus) {
+    if (sku.mpn !== primaryMpn) return sku
+  }
+  return null
 }
 
 /**
- * Rank order:
- *   1. samplingPriority  (1 → sampled first; default 99 = last)
- *   2. categoryRole      (anchor < secondary < watchlist)
- *   3. role              (primary < representative < legacy_fallback)
+ * Quota-safe selection. Default policy ('anchor_plus_rotation'):
  *
- * Stable: ties fall back on the order SKUs appear in the catalog array.
+ *   anchor slots   — one primary per anchor category, every day (continuity).
+ *                    If `recentlyFailedMpns` includes the primary, swap in
+ *                    the same category's fallback (reason: fallback_for_failed_primary).
+ *   rotation slots — remaining maxCalls; cycle through the secondary/watchlist
+ *                    categories using `rotationIndex = utcDayOrdinal(snapshotDate)`
+ *                    so the same date deterministically picks the same SKUs.
+ *
+ * Never exceeds `maxCalls`. Unsampled rows are returned with `reason:'quota_limit'`.
  */
 export function selectSampledSkus(
   catalog: BasketCategory[],
-  maxCalls: number,
+  options: SelectSampledSkusOptions = {},
 ): BasketSamplingResult {
-  const refs: BasketSkuRef[] = []
-  for (const cat of catalog) {
-    const catRoleRank = CATEGORY_ROLE_RANK[cat.categoryRole ?? 'watchlist']
-    for (const sku of cat.skus) {
-      const samplingPriority = sku.samplingPriority ?? 99
-      const roleRank = ROLE_RANK[sku.role] ?? 99
-      const rank = samplingPriority * 1000 + catRoleRank * 100 + roleRank
-      refs.push({ category: cat, sku, rank })
+  const maxCalls = Math.max(0, options.maxCalls ?? BASKET_PREVIEW_MAX_CALLS)
+  const policy = options.policy ?? 'anchor_plus_rotation'
+  const snapshotDate = options.snapshotDate ?? todayUtcDate()
+  const rotationIndex = utcDayOrdinal(snapshotDate)
+  const recentlyFailed = new Set(options.recentlyFailedMpns ?? [])
+
+  // Deterministic catalog order: anchor → secondary → watchlist; ties → categoryId.
+  const sortedCatalog = catalog.slice().sort((a, b) =>
+    categorySortKey(a).localeCompare(categorySortKey(b)),
+  )
+  const anchorCats = sortedCatalog.filter(c => (c.categoryRole ?? 'watchlist') === 'anchor')
+  const rotationCats = sortedCatalog.filter(c => (c.categoryRole ?? 'watchlist') !== 'anchor')
+
+  const sampled: BasketSkuRef[] = []
+  const sampledMpns = new Set<string>()
+
+  if (policy === 'anchor_plus_rotation') {
+    // 1) Anchor continuity slots.
+    const anchorSlotsAvail = Math.min(anchorCats.length, maxCalls)
+    for (let i = 0; i < anchorSlotsAvail; i++) {
+      const cat = anchorCats[i]
+      let pick = pickPrimarySku(cat)
+      let reason: SamplingReason = 'anchor_continuity'
+      if (pick && recentlyFailed.has(pick.mpn)) {
+        const fb = pickFallbackSku(cat, pick.mpn)
+        if (fb) { pick = fb; reason = 'fallback_for_failed_primary' }
+      }
+      if (!pick) continue
+      sampled.push({ category: cat, sku: pick, rank: i, reason })
+      sampledMpns.add(pick.mpn)
+    }
+
+    // 2) Rotation slots — one primary per rotation category, by date-driven index.
+    const rotationSlotsAvail = Math.max(0, maxCalls - sampled.length)
+    if (rotationSlotsAvail > 0 && rotationCats.length > 0) {
+      const used = new Set<string>()
+      for (let i = 0; i < rotationSlotsAvail; i++) {
+        // Adjacent slot indices are always distinct mod pool.length, so this
+        // never picks the same category twice within one day's plan.
+        const idx = ((rotationIndex * rotationSlotsAvail) + i) % rotationCats.length
+        const cat = rotationCats[idx]
+        if (used.has(cat.categoryId)) continue
+        used.add(cat.categoryId)
+        const pick = pickPrimarySku(cat)
+        if (!pick || sampledMpns.has(pick.mpn)) continue
+        sampled.push({
+          category: cat,
+          sku: pick,
+          rank: 1000 + i,
+          reason: 'rotation_slot',
+        })
+        sampledMpns.add(pick.mpn)
+      }
+    }
+  } else {
+    // 'priority_topn' — legacy fallback. Sort by (samplingPriority, categoryRole, role).
+    const refs: BasketSkuRef[] = []
+    for (const cat of sortedCatalog) {
+      const cr = CATEGORY_ROLE_RANK[cat.categoryRole ?? 'watchlist']
+      for (const sku of cat.skus) {
+        const sp = sku.samplingPriority ?? 99
+        const rr = ROLE_RANK[sku.role] ?? 99
+        refs.push({ category: cat, sku, rank: sp * 1000 + cr * 100 + rr })
+      }
+    }
+    refs.sort((a, b) => a.rank - b.rank)
+    for (const r of refs.slice(0, maxCalls)) {
+      const reason: SamplingReason =
+        (r.category.categoryRole ?? 'watchlist') === 'anchor'
+          ? 'anchor_continuity'
+          : 'rotation_slot'
+      sampled.push({ ...r, reason })
+      sampledMpns.add(r.sku.mpn)
     }
   }
-  // Stable sort by rank (preserves catalog order on ties).
-  refs.sort((a, b) => a.rank - b.rank)
 
-  const sampled = refs.slice(0, Math.max(0, maxCalls))
-  const unsampled = refs.slice(Math.max(0, maxCalls))
+  // Build unsampled list (everything in the catalog not picked today).
+  const unsampled: BasketSkuRef[] = []
+  for (const cat of sortedCatalog) {
+    const cr = CATEGORY_ROLE_RANK[cat.categoryRole ?? 'watchlist']
+    for (const sku of cat.skus) {
+      if (sampledMpns.has(sku.mpn)) continue
+      const sp = sku.samplingPriority ?? 99
+      const rr = ROLE_RANK[sku.role] ?? 99
+      unsampled.push({
+        category: cat,
+        sku,
+        rank: sp * 1000 + cr * 100 + rr,
+        reason: 'quota_limit',
+      })
+    }
+  }
+  unsampled.sort((a, b) => a.rank - b.rank)
+
+  const basketCatalogSkuCount = sortedCatalog.reduce((s, c) => s + c.skus.length, 0)
+  const anchorSlots = (policy === 'anchor_plus_rotation')
+    ? Math.min(anchorCats.length, maxCalls)
+    : sampled.filter(s => s.reason === 'anchor_continuity' || s.reason === 'fallback_for_failed_primary').length
+  const rotationSlots = (policy === 'anchor_plus_rotation')
+    ? Math.max(0, maxCalls - anchorSlots)
+    : sampled.filter(s => s.reason === 'rotation_slot').length
+  const rotationPoolSize = rotationCats.length
+  const estimatedFullCycleDays =
+    rotationSlots > 0 && rotationPoolSize > 0
+      ? Math.ceil(rotationPoolSize / rotationSlots)
+      : null
+
   return {
     sampled,
     unsampled,
+    policy,
+    snapshotDate,
+    rotationIndex,
+    rotationPoolSize,
+    rotationSlots,
+    anchorSlots,
     sampleLimit: maxCalls,
     sampleLimitReason: 'nexar_quota_cap',
-    basketCatalogSkuCount: refs.length,
+    basketCatalogSkuCount,
     sampledSkuCount: sampled.length,
     unsampledSkuCount: unsampled.length,
+    estimatedFullCycleDays,
   }
 }
 
+/**
+ * Forward-looking rotation plan (no fetches; pure simulation of the policy).
+ * Default: 7 days starting from the day AFTER `startDate` so the preview
+ * shows what will be sampled on upcoming dates, not today.
+ */
+export function previewRotation(
+  catalog: BasketCategory[],
+  options: {
+    maxCalls?: number
+    days?: number
+    policy?: SamplingPolicy
+    /** YYYY-MM-DD; preview begins the next UTC day. Default: today. */
+    startDate?: string
+  } = {},
+): Array<{
+  snapshotDate: string
+  rotationIndex: number
+  sampledSkus: Array<{
+    mpn: string
+    categoryId: string
+    categoryLabel: string
+    reason: SamplingReason
+  }>
+}> {
+  const days = Math.max(1, Math.min(31, options.days ?? 7))
+  const startDate = options.startDate ?? todayUtcDate()
+  const startMs = Date.parse(startDate + 'T00:00:00Z')
+  const out: Array<{
+    snapshotDate: string
+    rotationIndex: number
+    sampledSkus: Array<{ mpn: string; categoryId: string; categoryLabel: string; reason: SamplingReason }>
+  }> = []
+  for (let d = 1; d <= days; d++) {
+    const dayMs = startMs + d * 86_400_000
+    const ds = new Date(dayMs).toISOString().slice(0, 10)
+    const r = selectSampledSkus(catalog, {
+      maxCalls: options.maxCalls,
+      snapshotDate: ds,
+      policy: options.policy,
+    })
+    out.push({
+      snapshotDate: ds,
+      rotationIndex: r.rotationIndex,
+      sampledSkus: r.sampled.map(s => ({
+        mpn: s.sku.mpn,
+        categoryId: s.category.categoryId,
+        categoryLabel: s.category.categoryLabel,
+        reason: s.reason ?? 'rotation_slot',
+      })),
+    })
+  }
+  return out
+}
+
 /** Compact summary for inclusion in API responses (snapshot.metadata + evidence). */
-export function summarizeSampling(result: BasketSamplingResult) {
-  return {
+export function summarizeSampling(
+  result: BasketSamplingResult,
+  options: { catalog?: BasketCategory[]; previewDays?: number } = {},
+) {
+  const summary = {
+    policy: result.policy,
+    snapshotDate: result.snapshotDate,
+    rotationIndex: result.rotationIndex,
+    rotationPoolSize: result.rotationPoolSize,
+    rotationSlots: result.rotationSlots,
+    anchorSlots: result.anchorSlots,
+    estimatedFullCycleDays: result.estimatedFullCycleDays,
     basketCatalogSkuCount: result.basketCatalogSkuCount,
     sampledSkuCount: result.sampledSkuCount,
     unsampledSkuCount: result.unsampledSkuCount,
     sampleLimit: result.sampleLimit,
+    /** Spec-aligned alias for sampleLimit. */
+    currentSampleLimit: result.sampleLimit,
     sampleLimitReason: result.sampleLimitReason,
     sampledSkus: result.sampled.map(r => ({
       mpn: r.sku.mpn,
@@ -410,6 +661,7 @@ export function summarizeSampling(result: BasketSamplingResult) {
       categoryLabel: r.category.categoryLabel,
       role: r.sku.role,
       samplingPriority: r.sku.samplingPriority ?? null,
+      reason: r.reason ?? null,
     })),
     unsampledSkus: result.unsampled.map(r => ({
       mpn: r.sku.mpn,
@@ -417,6 +669,19 @@ export function summarizeSampling(result: BasketSamplingResult) {
       categoryLabel: r.category.categoryLabel,
       role: r.sku.role,
       samplingPriority: r.sku.samplingPriority ?? null,
+      reason: r.reason ?? 'quota_limit',
     })),
   }
+  if (options.catalog) {
+    return {
+      ...summary,
+      nextRotationPreview: previewRotation(options.catalog, {
+        maxCalls: result.sampleLimit,
+        days: options.previewDays ?? 7,
+        policy: result.policy,
+        startDate: result.snapshotDate,
+      }),
+    }
+  }
+  return summary
 }

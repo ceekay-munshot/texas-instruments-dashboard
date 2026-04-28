@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse, errorResponse } from './sources/octopartNexar'
 import { TRUSTED_DISTRIBUTOR_LIST } from './data/sourceTypes'
-import { PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS, BASKET_PREVIEW_QUOTA_NOTE, BASKET_STATUS, selectSampledSkus, summarizeSampling, type BasketCategory } from './data/tiBasket'
+import { PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS, BASKET_PREVIEW_QUOTA_NOTE, BASKET_STATUS, selectSampledSkus, summarizeSampling, previewRotation, type BasketCategory } from './data/tiBasket'
 import {
   captureRepresentativeBasketSnapshot,
   getLatestSnapshot,
@@ -499,11 +499,21 @@ app.get('/api/sources/status', (c) => {
 // secrets are missing, returns { configured: false, status: 'not_configured' }.
 // Errors are sanitized — credentials, raw GraphQL bodies, and stack traces are
 // never echoed to the client.
-// ── Phase 15A — basket coverage (read-only catalog reflection) ───────────────
-// Returns the full representative TI basket catalog plus current sampling
-// policy. Never calls Nexar, never triggers capture. Cheap to call.
+// ── Phase 15A/15B — basket coverage (read-only catalog reflection) ───────────
+// Returns the full representative TI basket catalog plus today's sampling
+// plan and a 7-day forward rotation preview. Never calls Nexar, never
+// triggers capture. Cheap to call; safe for page-load fetch.
 app.get('/api/nexar/basket-coverage', (c) => {
-  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, {
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    policy: 'anchor_plus_rotation',
+  })
+  const preview = previewRotation(PHASE_8_BASKET_PREVIEW, {
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    days: 7,
+    policy: 'anchor_plus_rotation',
+    startDate: sampling.snapshotDate,
+  })
   const sampledByCat = new Map<string, typeof sampling.sampled>()
   const unsampledByCat = new Map<string, typeof sampling.unsampled>()
   for (const r of sampling.sampled) {
@@ -513,6 +523,22 @@ app.get('/api/nexar/basket-coverage', (c) => {
   for (const r of sampling.unsampled) {
     const arr = unsampledByCat.get(r.category.categoryId) || []
     arr.push(r); unsampledByCat.set(r.category.categoryId, arr)
+  }
+  // For each category, find the next preview day that samples it (when known).
+  const nextSampleByCat = new Map<string, string | null>()
+  for (const cat of PHASE_8_BASKET_PREVIEW) {
+    if (sampledByCat.has(cat.categoryId)) {
+      nextSampleByCat.set(cat.categoryId, sampling.snapshotDate) // sampled today
+      continue
+    }
+    let next: string | null = null
+    for (const day of preview) {
+      if (day.sampledSkus.some(s => s.categoryId === cat.categoryId)) {
+        next = day.snapshotDate
+        break
+      }
+    }
+    nextSampleByCat.set(cat.categoryId, next)
   }
   const categories = PHASE_8_BASKET_PREVIEW.map(cat => {
     const sampled = sampledByCat.get(cat.categoryId) || []
@@ -528,6 +554,8 @@ app.get('/api/nexar/basket-coverage', (c) => {
       skuCount: cat.skus.length,
       sampledSkuCount: sampled.length,
       unsampledSkuCount: unsampled.length,
+      sampledToday: sampled.length > 0,
+      nextExpectedSampleDate: nextSampleByCat.get(cat.categoryId) ?? null,
       sampledSkus: sampled.map(r => ({
         mpn: r.sku.mpn,
         role: r.sku.role,
@@ -535,6 +563,7 @@ app.get('/api/nexar/basket-coverage', (c) => {
         samplingPriority: r.sku.samplingPriority ?? null,
         representativeReason: r.sku.representativeReason ?? null,
         fallbackFor: r.sku.fallbackFor ?? null,
+        reason: r.reason ?? null,
       })),
       unsampledSkus: unsampled.map(r => ({
         mpn: r.sku.mpn,
@@ -543,6 +572,7 @@ app.get('/api/nexar/basket-coverage', (c) => {
         samplingPriority: r.sku.samplingPriority ?? null,
         representativeReason: r.sku.representativeReason ?? null,
         fallbackFor: r.sku.fallbackFor ?? null,
+        reason: r.reason ?? 'quota_limit',
       })),
     }
   })
@@ -557,8 +587,16 @@ app.get('/api/nexar/basket-coverage', (c) => {
     sampleLimitReason: sampling.sampleLimitReason,
     sampledSkuCount: sampling.sampledSkuCount,
     unsampledSkuCount: sampling.unsampledSkuCount,
+    samplingPolicy: sampling.policy,
+    snapshotDate: sampling.snapshotDate,
+    rotationIndex: sampling.rotationIndex,
+    rotationPoolSize: sampling.rotationPoolSize,
+    rotationSlots: sampling.rotationSlots,
+    anchorSlots: sampling.anchorSlots,
+    estimatedFullCycleDays: sampling.estimatedFullCycleDays,
+    nextRotationPreview: preview,
     quotaNote: BASKET_PREVIEW_QUOTA_NOTE,
-    expansionNote: 'Full basket monitoring requires raising BASKET_PREVIEW_MAX_CALLS — gated on a paid/approved Nexar supply plan. Catalogued-but-unsampled SKUs are visible here as monitored watchlist.',
+    expansionNote: 'Daily cap stays at 4 to respect the Nexar Evaluation quota. Anchor SKUs are sampled every day for continuity; the remaining slots rotate through secondary/watchlist categories deterministically by UTC date so unsampled categories build observed history over time. nextRotationPreview is a planned simulation only — not observed data.',
     categories,
   })
 })
@@ -577,10 +615,13 @@ app.get('/api/nexar/basket-preview', async (c) => {
   const fetchedAt = new Date().toISOString()
   const clientId = c.env.NEXAR_CLIENT_ID
   const clientSecret = c.env.NEXAR_CLIENT_SECRET
-  // Phase 15A: catalog has grown beyond the maxCalls cap. Use the same
-  // sampling helper the daily capture uses, so the live preview shows
-  // exactly the SKUs that would be captured today.
-  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  // Phase 15A/15B: catalog is larger than the maxCalls cap. Use the same
+  // sampling helper the daily capture uses (anchor + UTC-day rotation), so the
+  // live preview shows exactly the SKUs that would be captured today.
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, {
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    policy: 'anchor_plus_rotation',
+  })
   const allSkus = sampling.sampled
   const sampledCatIds = new Set(allSkus.map(r => r.category.categoryId))
 
@@ -950,6 +991,7 @@ app.post('/api/snapshots/capture', async (c) => {
     result = await captureRepresentativeBasketSnapshot({
       clientId: env.NEXAR_CLIENT_ID,
       clientSecret: env.NEXAR_CLIENT_SECRET,
+      kv: env.SOURCE_SNAPSHOTS_KV,
     })
   } catch (e: any) {
     return c.json({
@@ -1075,13 +1117,19 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
   const env = c.env
   const base = snapshotMemoryBaseEnv(env)
   // Coverage is static catalog data — available regardless of KV state.
-  const earlySampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const earlySampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, {
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    policy: 'anchor_plus_rotation',
+  })
   const earlyCoverage = {
     basketCatalogSkuCount: earlySampling.basketCatalogSkuCount,
     sampledSkuCount: earlySampling.sampledSkuCount,
     unsampledSkuCount: earlySampling.unsampledSkuCount,
     sampleLimit: earlySampling.sampleLimit,
     sampleLimitReason: earlySampling.sampleLimitReason,
+    samplingPolicy: earlySampling.policy,
+    rotationIndex: earlySampling.rotationIndex,
+    estimatedFullCycleDays: earlySampling.estimatedFullCycleDays,
   }
   if (!env.SOURCE_SNAPSHOTS_KV) {
     return c.json({
@@ -1108,15 +1156,21 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
     latestDate: dates[dates.length - 1] ?? null,
   }
 
-  // Phase 15A — basket-coverage is a static catalog reflection. Compute it
+  // Phase 15A/15B — basket-coverage is a static catalog reflection. Compute it
   // upfront so it's available on every branch (no_snapshots and ok alike).
-  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, {
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    policy: 'anchor_plus_rotation',
+  })
   const coverage = {
     basketCatalogSkuCount: sampling.basketCatalogSkuCount,
     sampledSkuCount: sampling.sampledSkuCount,
     unsampledSkuCount: sampling.unsampledSkuCount,
     sampleLimit: sampling.sampleLimit,
     sampleLimitReason: sampling.sampleLimitReason,
+    samplingPolicy: sampling.policy,
+    rotationIndex: sampling.rotationIndex,
+    estimatedFullCycleDays: sampling.estimatedFullCycleDays,
   }
 
   const snap = await getLatestSnapshot(env.SOURCE_SNAPSHOTS_KV)

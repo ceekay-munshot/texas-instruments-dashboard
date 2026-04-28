@@ -237,16 +237,53 @@ function round4(n: number): number {
   return Math.round(n * 10_000) / 10_000
 }
 
+/**
+ * Anchor primaries that failed in the most recent stored snapshot. Used by
+ * capture to enable fallback substitution under the rotating sampling policy
+ * — never to add Nexar calls beyond the maxCalls cap.
+ */
+export async function getRecentlyFailedAnchorMpns(kv: SnapshotKV | undefined): Promise<string[]> {
+  if (!kv) return []
+  const latest = await getLatestSnapshot(kv)
+  if (!latest) return []
+  const anchorIds = new Set(
+    PHASE_8_BASKET_PREVIEW
+      .filter(c => c.categoryRole === 'anchor')
+      .map(c => c.categoryId),
+  )
+  const failed: string[] = []
+  for (const cat of latest.categories) {
+    if (!anchorIds.has(cat.categoryId)) continue
+    for (const sku of cat.skus) {
+      if (sku.status === 'error' || sku.status === 'no_match') failed.push(sku.mpn)
+    }
+  }
+  return failed
+}
+
 export async function captureRepresentativeBasketSnapshot(opts: {
   clientId: string
   clientSecret: string
+  /** Optional: when provided, capture reads the latest snapshot to detect anchor
+   *  failures so the rotation policy can substitute a fallback for that slot. */
+  kv?: SnapshotKV
+  /** Optional override for snapshotDate (UTC YYYY-MM-DD); defaults to today. */
+  snapshotDate?: string
 }): Promise<CaptureResult> {
   const capturedAt = new Date().toISOString()
+  const snapshotDate = opts.snapshotDate ?? todayUtc()
 
-  // Quota-safe SKU selection: take the top-N from the basket catalog under the
-  // existing maxCalls cap. Catalog can grow without changing the cap; the
-  // unsampled overflow is recorded in snapshot.metadata for visibility.
-  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  // Quota-safe SKU selection: anchor continuity + UTC-day rotation. Catalog can
+  // grow without changing the cap; rotation cycles through the unsampled
+  // categories so they build observed history over time. The unsampled
+  // overflow is recorded in snapshot.metadata for visibility.
+  const recentlyFailedMpns = await getRecentlyFailedAnchorMpns(opts.kv)
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, {
+    maxCalls: BASKET_PREVIEW_MAX_CALLS,
+    snapshotDate,
+    policy: 'anchor_plus_rotation',
+    recentlyFailedMpns,
+  })
   const allSkus = sampling.sampled // already capped at BASKET_PREVIEW_MAX_CALLS
 
   const settled = await Promise.allSettled(
@@ -309,9 +346,15 @@ export async function captureRepresentativeBasketSnapshot(opts: {
     .map(cat => aggregateCategory(cat, perSkuByCat[cat.categoryId] || []))
 
   const skuCount = categories.reduce((s, c) => s + c.skus.length, 0)
-  const coverage = summarizeSampling(sampling)
+  // Phase 15B — store the full sampling plan (with rotation metadata and
+  // forward-looking nextRotationPreview) so historical snapshots remember
+  // exactly which subset was sampled and what was planned next.
+  const coverage = summarizeSampling(sampling, {
+    catalog: PHASE_8_BASKET_PREVIEW,
+    previewDays: 7,
+  })
   const snapshot: Snapshot = {
-    snapshotDate: todayUtc(),
+    snapshotDate,
     capturedAt,
     dashboard: 'texas_instruments',
     source: PRIMARY_SOURCE,
@@ -325,8 +368,11 @@ export async function captureRepresentativeBasketSnapshot(opts: {
       cacheTtlHours: 24,
       quotaNote: BASKET_PREVIEW_QUOTA_NOTE,
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-      // Phase 15A — basket coverage (which SKUs were sampled vs unsampled).
-      // Optional fields; consumers that don't know about them ignore safely.
+      // Phase 15A/15B — coverage + rotation metadata. Optional fields; older
+      // snapshots that pre-date these keys ignore safely.
+      samplingPolicy: sampling.policy,
+      rotationIndex: sampling.rotationIndex,
+      estimatedFullCycleDays: sampling.estimatedFullCycleDays,
       ...coverage,
     } as any,
   }
