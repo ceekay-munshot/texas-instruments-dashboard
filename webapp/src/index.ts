@@ -13,6 +13,7 @@ import {
   type SnapshotKV,
 } from './sources/snapshotStore'
 import { computeTrends } from './sources/snapshotTrends'
+import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
 import { SNAPSHOT_SCHEMA_VERSION } from './data/snapshotSchema'
 
 type Bindings = {
@@ -988,6 +989,60 @@ app.get('/api/snapshots/trends', async (c) => {
     firstDate: trends.firstDate,
     latestDate: trends.latestDate,
     categoryTrends: trends.categoryTrends,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/evidence/latest — current-source evidence layer (Phase 14A).
+// Reads the latest snapshot only. Never calls Nexar, never triggers capture.
+// Pairs with /api/snapshots/trends so the UI can show evidence today AND keep
+// shortage/easing labels gated behind the 2-snapshot trend readiness signal.
+app.get('/api/snapshots/evidence/latest', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      latestSnapshotDate: null,
+      evidence: null,
+      trendReadiness: {
+        status: 'pending_until_two_snapshots',
+        observationCount: 0,
+        firstDate: null,
+        latestDate: null,
+      },
+      ...base,
+    })
+  }
+
+  const dates = await listSnapshotDates(env.SOURCE_SNAPSHOTS_KV)
+  const trendReadiness = {
+    status: dates.length >= 2 ? 'ready' as const : 'pending_until_two_snapshots' as const,
+    observationCount: dates.length,
+    firstDate: dates[0] ?? null,
+    latestDate: dates[dates.length - 1] ?? null,
+  }
+
+  const snap = await getLatestSnapshot(env.SOURCE_SNAPSHOTS_KV)
+  if (!snap) {
+    return c.json({
+      configured: true,
+      status: 'no_snapshots',
+      latestSnapshotDate: null,
+      evidence: null,
+      trendReadiness,
+      ...base,
+    })
+  }
+
+  const evidence = deriveSnapshotEvidence(snap)
+  return c.json({
+    configured: true,
+    status: 'ok',
+    latestSnapshotDate: snap.snapshotDate,
+    evidence,
+    trendReadiness,
     ...base,
   })
 })

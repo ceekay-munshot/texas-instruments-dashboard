@@ -369,6 +369,88 @@ Set the GitHub Actions secret under: **Settings → Secrets and variables → Ac
 
 **Logs are sanitized.** The workflow only prints the response fields `success`, `status`, `message`, `snapshotDate`, `key`, `overwritten`, `categoryCount`, `skuCount`, `callsUsed`, `maxCalls`, `storageConfigured`, `captureSecretConfigured`, `nexarConfigured`, `schemaVersion`. The secret is sent as a request header, never written to logs; GitHub Actions also auto-masks the value if it ever leaks.
 
+### Current source evidence layer (Phase 14A)
+
+The customer asked: *"is this category move real?"* That answer needs price + inventory + multi-distributor evidence over time. The trend engine in [`snapshotTrends.ts`](webapp/src/sources/snapshotTrends.ts) is the long-term answer, but it's gated on ≥2 daily snapshots. To bridge the wait, the **latest** snapshot can already support source-confidence and distributor-transparency labels today — without faking history.
+
+**Endpoint:** `GET /api/snapshots/evidence/latest`. Read-only, never calls Nexar, never triggers capture. Reads the latest snapshot from KV, derives evidence in [`snapshotEvidence.ts`](webapp/src/sources/snapshotEvidence.ts), returns:
+
+```jsonc
+{
+  "configured": true,
+  "status": "ok",
+  "latestSnapshotDate": "2026-04-28",
+  "evidence": {
+    "snapshotDate": "2026-04-28",
+    "capturedAt": "…",
+    "source": "octopart_nexar",
+    "mode": "representative_basket_preview",
+    "overallEvidenceStatus": "moderate_current_evidence",
+    "overallSourceConfidenceScore": 72,
+    "categoryCount": 2,
+    "skuCount": 4,
+    "categories": [
+      {
+        "categoryId": "pm_ldo",
+        "categoryLabel": "LDO Regulators",
+        "snapshotDate": "2026-04-28",
+        "representativeSkuCount": 2,
+        "quotedSkuCount": 2,
+        "validSkuCount": 2,
+        "failedSkuCount": 0,
+        "trustedDistributorCount": 5,
+        "trustedDistributors": ["DigiKey","Texas Instruments","Mouser","Arrow","TME"],
+        "avgTrustedPrice": 4.7405,
+        "medianTrustedPrice": 4.7405,
+        "totalTrustedInventory": 191911,
+        "totalBrokerInventory": 907256,
+        "brokerInventoryRatio": 0.825,
+        "sourceConfidenceScore": 100,
+        "evidenceStatus": "strong_current_evidence",
+        "warnings": [],
+        "skus": [/* per-SKU evidence — see SkuEvidence type */]
+      }
+    ]
+  },
+  "trendReadiness": {
+    "status": "pending_until_two_snapshots",
+    "observationCount": 1,
+    "firstDate": "2026-04-28",
+    "latestDate": "2026-04-28"
+  }
+}
+```
+
+**Source-confidence scoring (0-100, additive, clamped).** Documented in code:
+
+| +pts | Rule |
+|---|---|
+| +25 | At least one trusted/core distributor has a price (`avgTrustedPrice != null`) |
+| +25 | At least one trusted/core distributor has inventory > 0 |
+| +20 | 3+ trusted/core distributors are present in the category |
+| +15 | The primary SKU has valid data (status `ok`) |
+| +10 | Broker inventory is separately tracked and excluded from core signal (always true in our schema) |
+| +5  | No failed-SKU warnings |
+
+| Score | Status |
+|---|---|
+| 80-100 | `strong_current_evidence` |
+| 60-79  | `moderate_current_evidence` |
+| 40-59  | `weak_current_evidence` |
+| <40    | `insufficient_current_evidence` |
+
+The same scoring shape is applied per-SKU; the top-level `overallEvidenceStatus` is the **worst** category status (conservative — if any category is weak, the dashboard says weak).
+
+**This is current evidence quality — NOT a shortage signal.** Shortage / easing labels stay gated behind the trend endpoint and require ≥2 dated snapshots.
+
+**Dedup rule.** Snapshot capture stores raw `sourceObservations[]` exactly as Nexar returned them. The evidence layer dedupes only the *derived* output:
+
+> Same `source + canonical(distributor) + currency + unitPrice + availableInventory` → keep one.
+
+Canonical names (e.g. "Digi-Key" → "DigiKey", "Arrow Electronics" → "Arrow") come from [`sourceTypes.ts`](webapp/src/data/sourceTypes.ts). Distinct prices or distinct stock counts from the same distributor are **not** collapsed — they are real, separately-informative observations (e.g. Cut Tape qty=1 vs Tape & Reel qty=3000 from the same distributor at different price breaks). The duplicate count removed is reported as `duplicateObservationCount` per SKU; the kept count is `cleanedObservationCount`.
+
+**UI surface.** The legend status line gains a `Source evidence: <status> (<score>/100)` segment and a `Trend signal: pending until 2 daily snapshots` segment when the trends endpoint reports insufficient history. Inside each NX-marked cell's tooltip, a "Snapshot evidence" section appears with confidence score, trusted distributors, trusted vs broker inventory, failed-SKU count, and the same trend-pending caveat — so a user can hover and see the underlying evidence behind the latest values without leaving the table.
+
 ## Local Development
 ```bash
 npm install

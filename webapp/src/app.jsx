@@ -354,6 +354,8 @@ function App(){
   // Phase 10: source-memory status (read-only, no capture trigger from UI).
   const [snapshotMeta,setSnapshotMeta]=useState(null);
   const [trendMeta,setTrendMeta]=useState(null);
+  // Phase 14A: derived evidence from the latest snapshot (read-only).
+  const [evidenceData,setEvidenceData]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -488,13 +490,15 @@ function App(){
 
   // Phase 10: pull snapshot-memory status on mount. Read-only, never triggers
   // a capture. Failures are silent — they only suppress the small status line.
+  // Phase 14A adds /api/snapshots/evidence/latest to the same mount-time batch.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [latestRes, trendsRes] = await Promise.allSettled([
+        const [latestRes, trendsRes, evidenceRes] = await Promise.allSettled([
           fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
+          fetch('/api/snapshots/evidence/latest').then(r => r.ok ? r.json() : null),
         ]);
         if (cancelled) return;
         if (latestRes.status === 'fulfilled' && latestRes.value) {
@@ -513,10 +517,21 @@ function App(){
             latestDate: trendsRes.value.latestDate,
           });
         }
+        if (evidenceRes.status === 'fulfilled' && evidenceRes.value) {
+          setEvidenceData(evidenceRes.value);
+        }
       } catch (_) { /* silent */ }
     })();
     return () => { cancelled = true; };
   }, []);
+
+  // Lookup helper: resolve a category id to its evidence record from the
+  // latest snapshot, or null if not present (e.g. cell isn't in the basket).
+  function evidenceCatFor(catId) {
+    const cats = evidenceData?.evidence?.categories;
+    if (!cats) return null;
+    return cats.find(c => c.categoryId === catId) || null;
+  }
 
   // Quick lookup: returns the basket category record only when it has at
   // least one quoted SKU. Used to gate the NX marker and tooltip section.
@@ -559,7 +574,8 @@ function App(){
   function TT({catId}){
     const d=liveData?.[catId];
     const basket=basketCatFor(catId);
-    if(!d&&!basket)return null; // nothing to show
+    const evid=evidenceCatFor(catId);
+    if(!d&&!basket&&!evid)return null; // nothing to show
     const cat=CATS.find(c=>c.id===catId);
     // Source confidence (coverage, not direction confirmation):
     //   multi-source → ≥2 trusted distributors with quoted available offers
@@ -600,6 +616,30 @@ function App(){
           <div>Source coverage confidence: <span style={{color:confColor,fontWeight:'bold'}}>{confidence}</span></div>
         </div>
       </div>}
+      {evid&&(()=>{
+        const evColor = evid.evidenceStatus==='strong_current_evidence'?'#4dffc3'
+                      : evid.evidenceStatus==='moderate_current_evidence'?'#00c9a7'
+                      : evid.evidenceStatus==='weak_current_evidence'?'#f0a84e'
+                      : '#f05c5c';
+        const trendStr = trendMeta?.status==='ok' ? `available (${trendMeta.observationCount} obs)` : 'pending until 2 daily snapshots';
+        const dupTotal = (evid.skus||[]).reduce((s,x)=>s+(x.duplicateObservationCount||0),0);
+        return (
+          <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
+            <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
+              Snapshot evidence <span style={{color:'#4a6a8a',fontWeight:'normal'}}>· {evid.snapshotDate}</span>
+            </div>
+            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
+              <div>Confidence: <span style={{color:evColor,fontWeight:'bold'}}>{evid.sourceConfidenceScore}/100 · {evid.evidenceStatus.replace(/_current_evidence$/,'').replace(/_/g,' ')}</span></div>
+              <div>Trusted distributors ({evid.trustedDistributorCount}): <span style={{color:'#c4d4e8'}}>{(evid.trustedDistributors||[]).join(', ')||'—'}</span></div>
+              <div>Trusted inventory: {(evid.totalTrustedInventory||0).toLocaleString()}</div>
+              <div>Broker inventory: {(evid.totalBrokerInventory||0).toLocaleString()} <span style={{color:'#7a96b8'}}>(excluded from core signal)</span></div>
+              {evid.failedSkuCount>0&&<div style={{color:'#f0a84e'}}>Failed SKUs: {evid.failedSkuCount} of {evid.representativeSkuCount}</div>}
+              {dupTotal>0&&<div style={{color:'#7a96b8'}}>Deduped observations: {dupTotal}</div>}
+              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Current source evidence only — trend signal {trendStr}.</div>
+            </div>
+          </div>
+        );
+      })()}
     </>;
   }
 
@@ -659,7 +699,7 @@ function App(){
         <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
         <span style={{color:'#f0a84e',marginLeft:6}}>· LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
         <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
-        <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{trendMeta?` · Trend engine: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'insufficient history':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
+        <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{evidenceData?.evidence?` · Source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`:''}{trendMeta?` · Trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
       </div>
 
       {/* ── Signal Summary ── */}
@@ -754,7 +794,7 @@ function App(){
       </div>
 
       {/* Tooltip */}
-      {tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId))&&(
+      {tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId))&&(
         <div className="tt" style={{top:tooltip.y+14,left:Math.min(tooltip.x+14,window.innerWidth-360)}}>
           <TT catId={tooltip.catId}/>
         </div>
