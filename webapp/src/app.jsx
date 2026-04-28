@@ -349,6 +349,8 @@ function App(){
   const [tooltip,setTooltip]=useState(null);
   const [rateLimitedUntil,setRateLimitedUntil]=useState(null);
   const [baselineMeta,setBaselineMeta]=useState(null);
+  const [basketPreviewData,setBasketPreviewData]=useState(null);
+  const [basketLoading,setBasketLoading]=useState(false);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -450,6 +452,46 @@ function App(){
 
   useEffect(() => { fetchLive(false); return () => { if(retryTimer.current) clearTimeout(retryTimer.current); }; }, []);
 
+  // Phase 9: fetch the Nexar basket preview to enrich preview-covered cells.
+  // Initial mount uses the cached path only — never sends ?refresh=true. The
+  // worker keeps a 24h CF cache so page loads do not burn Nexar evaluation
+  // quota. Manual refresh button is the only path that sends ?refresh=true.
+  const fetchBasketPreview = useCallback(async (force = false) => {
+    setBasketLoading(true);
+    try {
+      const res = await fetch(force ? '/api/nexar/basket-preview?refresh=true' : '/api/nexar/basket-preview');
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      const json = await res.json();
+      setBasketPreviewData(json);
+      if (force) {
+        const got = json.quotedSkuCount ?? 0;
+        const total = json.skuCount ?? 0;
+        if (json.status === 'ok' || json.status === 'partial') {
+          push(`Nexar basket refreshed — ${got}/${total} SKUs quoted across ${json.categoryCount} categories`, 'success', 4000);
+        } else if (json.status === 'not_configured') {
+          push('Nexar not configured — basket source check unavailable', 'warn', 5000);
+        } else {
+          push(`Nexar basket refresh: ${json.status}`, 'warn', 5000);
+        }
+      }
+    } catch (e) {
+      // Don't break the table — just no NX markers.
+      if (force) push(`Basket source check failed: ${e.message}`, 'error', 6000);
+    }
+    setBasketLoading(false);
+  }, [push]);
+
+  useEffect(() => { fetchBasketPreview(false); }, []);
+
+  // Quick lookup: returns the basket category record only when it has at
+  // least one quoted SKU. Used to gate the NX marker and tooltip section.
+  function basketCatFor(catId) {
+    const cat = basketPreviewData?.categories?.find(c => c.categoryId === catId);
+    if (!cat) return null;
+    if ((cat.quotedSkuCount ?? 0) <= 0) return null;
+    return cat;
+  }
+
   // 30-min auto-check while tab is visible. Cached path only (no refresh=true) —
   // respects the CF edge cache and never burns Mouser quota. Skipped when the
   // tab is hidden, and skipped when a fetch is already in flight. On
@@ -482,6 +524,19 @@ function App(){
   function TT({catId}){
     const d=liveData?.[catId];if(!d)return null;
     const cat=CATS.find(c=>c.id===catId);
+    const basket=basketCatFor(catId);
+    // Source confidence (coverage, not direction confirmation):
+    //   multi-source → ≥2 trusted distributors with quoted available offers
+    //   single-source → exactly 1 trusted distributor
+    //   insufficient → no trusted available price
+    let confidence='insufficient';
+    if(basket){
+      const dist=basket.trustedDistributorCoverage?.length||0;
+      if(basket.avgBestTrustedAvailableUnitPrice==null) confidence='insufficient';
+      else if(dist>=2) confidence='multi-source';
+      else if(dist===1) confidence='single-source';
+    }
+    const confColor=confidence==='multi-source'?'#00c9a7':confidence==='single-source'?'#f0a84e':'#f05c5c';
     return <>
       <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs latest baseline (27-Feb-26)</div>
       {d.parts?.length>0?d.parts.map((p,i)=>(
@@ -494,6 +549,21 @@ function App(){
       <div style={{marginTop:5,paddingTop:4,borderTop:'1px solid #1a2740',fontSize:'0.52rem',color:'#2d4a6b'}}>
         Live ${d.avgPriceUSD?.toFixed(4)} · Baseline ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser
       </div>
+      {basket&&<div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
+        <div style={{fontSize:'0.6rem',color:'#3d8ef0',fontWeight:'bold',marginBottom:3}}>
+          Nexar trusted basket check
+          <span style={{color:'#f0a84e',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· tiny basket preview, not full coverage</span>
+        </div>
+        <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
+          <div>Coverage: {basket.skuCount} SKUs / {basket.quotedSkuCount} quoted ({basket.sampleCoverage})</div>
+          <div>Avg trusted available: <span style={{color:'#00c9a7'}}>${basket.avgBestTrustedAvailableUnitPrice?.toFixed(4) ?? '—'}</span></div>
+          <div>Median trusted available: <span style={{color:'#00c9a7'}}>${basket.medianBestTrustedAvailableUnitPrice?.toFixed(4) ?? '—'}</span></div>
+          <div>Trusted inventory: {(basket.totalTrustedAvailableInventory||0).toLocaleString()}</div>
+          <div>Broker inventory: {(basket.totalBrokerAvailableInventory||0).toLocaleString()} <span style={{color:'#7a96b8'}}>(separate, excluded from core signal)</span></div>
+          <div style={{whiteSpace:'normal'}}>Trusted distributors: {(basket.trustedDistributorCoverage||[]).join(', ')||'—'}</div>
+          <div>Source coverage confidence: <span style={{color:confColor,fontWeight:'bold'}}>{confidence}</span></div>
+        </div>
+      </div>}
     </>;
   }
 
@@ -552,6 +622,7 @@ function App(){
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ bold ≥5%</span><span>·</span>
         <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
         <span style={{color:'#f0a84e',marginLeft:6}}>· → Mar-26 hist = partial est. (captured 27-Feb-26) · LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
+        <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
       </div>
 
       {/* ── Signal Summary ── */}
@@ -590,9 +661,19 @@ function App(){
             {/* Divider */}
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
-                <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'3px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center'}}>
+                <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'3px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
                   <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs LATEST BASELINE · Q1-26 SNAPSHOT CAPTURED 27-FEB-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
                   {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
+                  <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8}}>
+                    {basketPreviewData&&<span style={{color:'#3d8ef0'}}>NX: {(basketPreviewData.categories||[]).filter(c=>(c.quotedSkuCount||0)>0).length} cats · {basketPreviewData.cached?'cached':'fresh'} · TTL {basketPreviewData.cacheTtlHours||24}h</span>}
+                    <button
+                      onClick={()=>fetchBasketPreview(true)}
+                      disabled={basketLoading}
+                      title={basketLoading?'Refreshing…':'Manually refresh Nexar basket source check — uses Nexar eval quota'}
+                      style={{background:'none',border:`1px solid ${B}`,borderRadius:3,padding:'2px 7px',fontSize:'0.5rem',color:basketLoading?'#4a6480':'#3d8ef0',cursor:basketLoading?'not-allowed':'pointer',letterSpacing:'0.08em',textTransform:'uppercase',fontFamily:'inherit'}}>
+                      ⟳ {basketLoading?'REFRESHING':'REFRESH BASKET SOURCE CHECK'}
+                    </button>
+                  </span>
                 </div>
               </td>
             </tr>
@@ -621,7 +702,7 @@ function App(){
                     onMouseLeave={isLive?()=>setTooltip(null):undefined}
                     title={isRLCell?'Rate limited — will retry automatically':undefined}
                     style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:isLive?'crosshair':'default'}}>
-                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}
+                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{basketCatFor(c.id)&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}
                   </td>
                 );
               })}

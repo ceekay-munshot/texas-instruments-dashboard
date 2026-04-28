@@ -481,17 +481,33 @@ app.get('/api/sources/status', (c) => {
 // secrets are missing, returns { configured: false, status: 'not_configured' }.
 // Errors are sanitized — credentials, raw GraphQL bodies, and stack traces are
 // never echoed to the client.
-// ── Phase 8 — tiny multi-SKU basket preview ──────────────────────────────────
-// Hard-bounded to BASKET_PREVIEW_MAX_CALLS (=4) MPN fetches because the Nexar
-// Evaluation app has limited supply quota. Quota errors on individual SKUs
-// are isolated via Promise.allSettled — partial successes still return.
+// ── Phase 8/9 — tiny multi-SKU basket preview (24h CF-cached) ────────────────
+// Hard-bounded to BASKET_PREVIEW_MAX_CALLS (=4) MPN fetches. Cache key is
+// shared across CF edge instances; only ok/partial responses are cached.
+// not_configured / error responses are NEVER cached so the next request
+// re-attempts cleanly. Use ?refresh=true to bypass cache (manual operation).
+const BASKET_CACHE_KEY = 'https://ti-price-dashboard-cache/nexar-basket-preview'
+const BASKET_CACHE_TTL_HOURS = 24
+const BASKET_CACHE_TTL_SECONDS = BASKET_CACHE_TTL_HOURS * 60 * 60
+
 app.get('/api/nexar/basket-preview', async (c) => {
+  const force = c.req.query('refresh') === 'true'
   const fetchedAt = new Date().toISOString()
   const clientId = c.env.NEXAR_CLIENT_ID
   const clientSecret = c.env.NEXAR_CLIENT_SECRET
   const allSkus = PHASE_8_BASKET_PREVIEW.flatMap(cat =>
     cat.skus.map(sku => ({ category: cat, sku }))
   )
+
+  // Serve from cache when available and not forcing refresh.
+  if (!force) {
+    const cache = caches.default
+    const cached = await cache.match(BASKET_CACHE_KEY)
+    if (cached) {
+      const data: any = await cached.json()
+      return c.json({ ...data, cached: true })
+    }
+  }
 
   // Hard guard against accidental basket expansion.
   if (allSkus.length > BASKET_PREVIEW_MAX_CALLS) {
@@ -501,6 +517,8 @@ app.get('/api/nexar/basket-preview', async (c) => {
       source: 'octopart_nexar',
       mode: 'tiny_basket_preview',
       fetchedAt,
+      cached: false,
+      cacheTtlHours: BASKET_CACHE_TTL_HOURS,
       categoryCount: PHASE_8_BASKET_PREVIEW.length,
       skuCount: allSkus.length,
       quotedSkuCount: 0,
@@ -520,6 +538,8 @@ app.get('/api/nexar/basket-preview', async (c) => {
       source: 'octopart_nexar',
       mode: 'tiny_basket_preview',
       fetchedAt,
+      cached: false,
+      cacheTtlHours: BASKET_CACHE_TTL_HOURS,
       categoryCount: PHASE_8_BASKET_PREVIEW.length,
       skuCount: allSkus.length,
       quotedSkuCount: 0,
@@ -685,12 +705,14 @@ app.get('/api/nexar/basket-preview', async (c) => {
   const status: 'ok' | 'partial' | 'error' =
     errored === skuCount ? 'error' : errored > 0 ? 'partial' : 'ok'
 
-  return c.json({
+  const payload = {
     configured: true,
     status,
-    source: 'octopart_nexar',
-    mode: 'tiny_basket_preview',
+    source: 'octopart_nexar' as const,
+    mode: 'tiny_basket_preview' as const,
     fetchedAt,
+    cached: false,
+    cacheTtlHours: BASKET_CACHE_TTL_HOURS,
     categoryCount: PHASE_8_BASKET_PREVIEW.length,
     skuCount,
     quotedSkuCount,
@@ -699,7 +721,22 @@ app.get('/api/nexar/basket-preview', async (c) => {
     basketStatus: BASKET_STATUS,
     remainingEvaluationQuotaNote: BASKET_PREVIEW_QUOTA_NOTE,
     categories,
-  })
+  }
+
+  // Cache only ok/partial. Never cache not_configured or error states so the
+  // next request gets a fresh attempt instead of being trapped on stale failure.
+  if (status === 'ok' || status === 'partial') {
+    const cache = caches.default
+    const cacheResponse = new Response(JSON.stringify(payload), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': `public, max-age=${BASKET_CACHE_TTL_SECONDS}`,
+      },
+    })
+    await cache.put(BASKET_CACHE_KEY, cacheResponse)
+  }
+
+  return c.json(payload)
 })
 
 app.get('/api/nexar/test', async (c) => {

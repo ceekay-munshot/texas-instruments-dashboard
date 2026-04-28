@@ -254,6 +254,44 @@ The `warnings: string[]` array is methodology-explicit and meant to be surfaced 
 
 **Full daily capture against the full 28-category basket requires a paid/approved Nexar supply plan.** Once that plan is in place, raise `BASKET_PREVIEW_MAX_CALLS` and expand `PHASE_8_BASKET_PREVIEW` (or replace it with a fuller config) — but do not change either constant under the Evaluation app.
 
+### Phase 9 — Table-level source enrichment
+
+The main pricing table remains the source-of-truth UI. Rather than building a separate Nexar panel as a destination, Nexar preview data **enriches the existing live cells** for the categories it covers. The customer asks "is this category move real?" — the answer is composed by reading the live cell, hovering for the historical Mouser context, and then reading the Nexar trusted-basket section in the same tooltip.
+
+**What it adds visually:**
+
+- **`NX` superscript marker** next to the existing `L` marker on live cells **only for categories covered by the Nexar basket preview** (currently `pm_ldo` and `pm_batt`). Other cells are unchanged. The marker is small and uses the blue accent (`#3d8ef0`); it does not redesign the cell.
+- **A "Nexar trusted basket check" section** at the bottom of the tooltip, only for covered categories. It surfaces: SKU coverage (`skuCount / quotedSkuCount`), avg / median trusted-available unit price, total trusted available inventory, broker inventory shown separately and labelled "(separate, excluded from core signal)", trusted distributor list, and a **source-coverage confidence** label.
+- **A compact "REFRESH BASKET SOURCE CHECK" button** next to the live-row divider. Title attribute reads "uses Nexar eval quota". This is the only path that ever sends `?refresh=true`.
+- **A small status chip** next to that button: `NX: <n> cats · cached/fresh · TTL 24h`.
+- **One-line legend addition**: "NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)".
+
+**Source-coverage confidence (NOT direction confirmation).** Per category the tooltip reports one of three labels:
+
+| Label | Condition |
+|---|---|
+| `multi-source` | At least 2 trusted distributors in `trustedDistributorCoverage` AND at least one quoted available price |
+| `single-source` | Exactly 1 trusted distributor with quoted available price |
+| `insufficient` | No trusted available price |
+
+This is intentionally **coverage confidence, not price-move confirmation**. We do not yet have daily Nexar snapshots, so we cannot say "the move is confirmed" — only "we have multi-distributor coverage to corroborate the spot price". Direction-confirmation requires a daily basket snapshot and a basket-level baseline (separate phase).
+
+**Quota safety on the page-load path:**
+
+- **Backend cache**: `/api/nexar/basket-preview` is wrapped in a 24 h Cloudflare edge cache. Only `ok` and `partial` responses are cached. `not_configured` and `error` responses are intentionally NOT cached — the next request retries cleanly.
+- **Frontend initial mount**: `fetchBasketPreview(force=false)` only — never sends `?refresh=true` automatically. So 1000 page loads in a 24 h window cost at most one chain of 4 Nexar calls (the first one after the cache expires); everything else is a CF cache hit.
+- **Manual refresh button**: only path that ever sends `?refresh=true`. The button title warns "uses Nexar eval quota".
+- **Hard cap retained**: `BASKET_PREVIEW_MAX_CALLS = 4` is unchanged.
+
+**What this does NOT do (intentionally):**
+
+- It does not replace the historical QoQ rows.
+- It does not change how the Mouser live row's `qoqPct` is calculated. The main `⟳ REFRESH LIVE` button still only refreshes Mouser.
+- It does not blend Nexar data into `bestTrustedAvailableUnitPrice` for a cross-source category average yet — for that we need a Nexar daily snapshot history.
+- It does not add an NX marker to non-preview categories. Other 26 categories render exactly as before.
+
+Full replacement of historical QoQ rows by a Nexar daily-snapshot basket index is the next major step, gated on a paid/approved Nexar supply plan and a basket-level baseline capture.
+
 ## Local Development
 ```bash
 npm install
