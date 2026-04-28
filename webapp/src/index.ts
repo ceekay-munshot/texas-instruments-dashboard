@@ -46,41 +46,43 @@ const PART_MAP: Record<string, { label: string; parts: string[] }> = {
   dc_tps:    { label: 'TPS536xx (AI Power)',   parts: ['TPS53622RSLR','TPS53681RSBT'] },
 }
 
-// ── BASELINES — Mouser qty=1 unit prices, clean anchor set 27-Feb-2026 (USD) ───
-// Methodology: qty=1 price break, INR→USD at ₹83.5, verified via direct API call
-// Anchor: 27-Feb-2026 (mid-Q1 2026). Label = "QTD vs 27-Feb-26"
-// QoQ % = (live_price - baseline) / baseline * 100
-// When Mar-26 quarter ends (31-Mar-2026), replace these with Mar-31 closing prices
-// to compute a true QoQ for the Jun-26 column.
+// ── BASELINES — Mouser qty=1 unit prices, post-Q1-26-close snapshot (USD) ─────
+// Methodology: qty=1 price break, INR→USD at ₹83.5, verified via direct API call.
+// Captured: 28-Apr-2026 — closest practical proxy for Q1-26 close (Q1 ended
+// 31-Mar-2026; capture window ~28 days post-close).
+// Live-row math: QoQ % = (live_price - baseline) / baseline * 100
+// Rollover policy: at the next end-of-quarter cutoff, replace these with the
+// next-quarter close prices and advance BASELINE_DATE / BASELINE_PERIOD_LABEL.
+// Previous baseline (replaced 2026-04-28): 27-Feb-2026 mid-Q1 partial snapshot.
 const BASELINES: Record<string, number> = {
-  pm_ldo:    6.8752,   // TPS7A8300RGWR   qty=1  ₹574.08
-  pm_acdc:   1.9582,   // UCC28180D        qty=1  ₹163.51
-  pm_dcdc:   5.7562,   // TPS54360BDDA     qty=1  ₹480.64
-  pm_super:  0.8177,   // TPS3839G33DQNR   qty=1  ₹68.28
-  pm_batt:   5.2398,   // BQ25896RTWT      qty=1  ₹437.52
-  amp_op:    2.1303,   // OPA376AIDBVR     qty=1  ₹177.88
-  amp_instr: 3.6366,   // INA826AIDR       qty=1  ₹303.66
-  amp_audio: 1.9366,   // TPA3118D2DAPR    qty=1  ₹161.71
-  dac_adc:   5.5087,   // ADS1115IRUGR     qty=1  ₹459.98
-  dac_dac:   21.4540,  // DAC60508ZCRTET   qty=1  ₹1791.41
-  if_can:    2.6898,   // TCAN1042DRBTQ1   qty=1  ₹224.60
-  if_lin:    1.6784,   // TLIN1021DRBRQ1   qty=1  ₹140.14
-  if_eth:    7.7789,   // DP83867IRRGZR    qty=1  ₹649.54
-  iso_dig:   3.2816,   // ISO7742DWR       qty=1  ₹274.01
-  iso_rein:  7.2625,   // ISO5852SQDWRQ1   qty=1  ₹606.42
-  mcu_msp:   4.7879,   // MSP430FR2355TRHAT qty=1  ₹399.89
-  mcu_c2k:   15.6117,  // TMS320F28035PNT  qty=1  ₹1303.58
-  mcu_m0:    2.5392,   // MSPM0G3507SPTR   qty=1  ₹212.02
-  mcu_cc:    7.2841,   // CC2652R1FRGZR    qty=1  ₹608.22
-  mcu_sit:   17.6667,  // AM3352BZCZD80    qty=1  ₹1475.17
-  gan_342:   29.1792,  // LMG3422R030RQZT  qty=1  ₹2436.47
-  gan_365:   9.5758,   // LMG3650R070KLAR  qty=2000 ₹799.58 (reel; no unit break)
-  gan_520:   18.2692,  // LMG5200MOFT      qty=1  ₹1525.48
-  dc_48v:    4.8740,   // LM5180NGUR       qty=1  ₹406.98
-  dc_sps:    14.2990,  // TPS53688RSBT     qty=1  ₹1193.97
-  dc_efuse:  2.6898,   // TPS25940ARVCR    qty=1  ₹224.60
-  dc_hswap:  4.9492,   // TPS23861PW       qty=1  ₹413.26
-  dc_tps:    12.9327,  // TPS53681RSBT     qty=1  ₹1079.88
+  pm_ldo:    7.0861,   // TPS7A8300RGWR    qty=1
+  pm_acdc:   2.0086,   // UCC28180D        qty=1
+  pm_dcdc:   5.9368,   // TPS54360BDDA     qty=1
+  pm_super:  0.8704,   // TPS3839G33DQNR   qty=1
+  pm_batt:   5.4346,   // BQ25896RTWT      qty=1
+  amp_op:    2.1983,   // OPA376AIDBVR     qty=1
+  amp_instr: 3.7607,   // INA826AIDR       qty=1
+  amp_audio: 1.9305,   // TPA3118D2DAPR    qty=1
+  dac_adc:   5.7135,   // ADS1115IRUGR     qty=1
+  dac_dac:   22.2963,  // DAC60508ZCRTET   qty=1
+  if_can:    2.7898,   // TCAN1042DRBTQ1   qty=1
+  if_lin:    1.7966,   // TLIN1021DRBRQ1   qty=1
+  if_eth:    8.0459,   // DP83867IRRGZR    qty=1
+  iso_dig:   3.4036,   // ISO7742DWR       qty=1
+  iso_rein:  7.5326,   // ISO5852SQDWRQ1   qty=1
+  mcu_msp:   4.9770,   // MSP430FR2355TRHAT qty=1
+  mcu_c2k:   16.1921,  // TMS320F28035PNT  qty=1
+  mcu_m0:    2.7451,   // MSPM0G3507SPTR   qty=1
+  mcu_cc:    10.0545,  // CC2652R1FRGZR    qty=1
+  mcu_sit:   14.8976,  // AM3352BZCZD80    qty=1
+  gan_342:   30.2640,  // LMG3422R030RQZT  qty=1
+  gan_365:   9.4743,   // LMG3650R070KLAR  qty=2000 (reel; no unit break)
+  gan_520:   18.9485,  // LMG5200MOFT      qty=1
+  dc_48v:    5.0552,   // LM5180NGUR       qty=1
+  dc_sps:    14.8307,  // TPS53688RSBT     qty=1
+  dc_efuse:  2.7898,   // TPS25940ARVCR    qty=1
+  dc_hswap:  5.1222,   // TPS23861PW       qty=1
+  dc_tps:    13.4134,  // TPS53681RSBT     qty=1
 }
 
 // ── Baseline metadata ────────────────────────────────────────────────────────
@@ -89,11 +91,11 @@ const BASELINES: Record<string, number> = {
 // recent controlled snapshot. Rolling the baseline forward at the end of a
 // quarter is a manual operation: capture new prices, update BASELINES + the
 // constants below in a single PR.
-const BASELINE_DATE = '2026-02-27'
-const BASELINE_PERIOD_LABEL = 'Q1-26 snapshot'
+const BASELINE_DATE = '2026-04-28'
+const BASELINE_PERIOD_LABEL = 'Q1-26 close'
 const BASELINE_LABEL = 'Latest baseline'
-const BASELINE_DISPLAY = 'Q1-26 snapshot · captured 27-Feb-26'
-const BASELINE_DESCRIPTION = 'Pre-quarter-close baseline used for live spot-price comparison'
+const BASELINE_DISPLAY = 'Q1-26 close · captured 28-Apr-26'
+const BASELINE_DESCRIPTION = 'Q1-26 close baseline used for live spot-price comparison; live row tracks Q2-26 movement vs this anchor'
 const BASELINE_ROLLOVER_POLICY = 'Manual rollover after controlled quarterly baseline capture'
 const BASELINE_REVIEW_AFTER_DAYS = 90
 

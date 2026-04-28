@@ -32,7 +32,7 @@ const HIST = {
   "Jun-25":{pm_ldo:0.6,pm_acdc:0.8,pm_dcdc:0.2,pm_super:1.3,pm_batt:1.1,amp_op:0.1,amp_instr:0.3,amp_audio:1.2,dac_adc:-0.5,dac_dac:-0.3,if_can:0.3,if_lin:-0.3,if_eth:-2.5,iso_dig:1.3,iso_rein:0.2,mcu_msp:-1.2,mcu_c2k:-2.4,mcu_m0:-0.5,mcu_cc:-1.5,mcu_sit:0.5,gan_342:1.9,gan_365:2.4,gan_520:-0.9,dc_48v:1.3,dc_sps:2.6,dc_efuse:0.1,dc_hswap:-0.1,dc_tps:2.3},
   "Sep-25":{pm_ldo:2.3,pm_acdc:3.1,pm_dcdc:2.9,pm_super:1.8,pm_batt:2.5,amp_op:2.9,amp_instr:2.5,amp_audio:2.8,dac_adc:5.5,dac_dac:2.5,if_can:5.2,if_lin:4.9,if_eth:3.0,iso_dig:2.4,iso_rein:2.6,mcu_msp:2.7,mcu_c2k:1.9,mcu_m0:2.5,mcu_cc:1.8,mcu_sit:1.7,gan_342:3.9,gan_365:5.1,gan_520:4.2,dc_48v:6.8,dc_sps:5.5,dc_efuse:1.7,dc_hswap:2.9,dc_tps:5.2},
   "Dec-25":{pm_ldo:7.9,pm_acdc:8.6,pm_dcdc:9.0,pm_super:8.4,pm_batt:8.4,amp_op:9.8,amp_instr:8.5,amp_audio:8.7,dac_adc:13.7,dac_dac:10.9,if_can:12.0,if_lin:12.0,if_eth:11.3,iso_dig:9.6,iso_rein:8.0,mcu_msp:8.9,mcu_c2k:8.8,mcu_m0:7.8,mcu_cc:8.4,mcu_sit:7.6,gan_342:10.6,gan_365:12.0,gan_520:12.0,dc_48v:12.0,dc_sps:12.0,dc_efuse:9.1,dc_hswap:7.9,dc_tps:12.0},
-  "Mar-26":{pm_ldo:-0.2,pm_acdc:-0.7,pm_dcdc:-0.1,pm_super:-0.9,pm_batt:0.2,amp_op:0.0,amp_instr:-0.7,amp_audio:-0.4,dac_adc:1.5,dac_dac:0.0,if_can:2.1,if_lin:1.7,if_eth:-0.6,iso_dig:0.1,iso_rein:1.0,mcu_msp:0.9,mcu_c2k:-0.4,mcu_m0:0.4,mcu_cc:0.4,mcu_sit:0.1,gan_342:1.1,gan_365:1.5,gan_520:0.8,dc_48v:4.9,dc_sps:1.6,dc_efuse:-0.2,dc_hswap:0.9,dc_tps:4.0},
+  "Mar-26":{pm_ldo:2.9,pm_acdc:1.9,pm_dcdc:3.0,pm_super:5.5,pm_batt:3.9,amp_op:3.2,amp_instr:2.7,amp_audio:-0.7,dac_adc:5.3,dac_dac:3.9,if_can:5.9,if_lin:8.9,if_eth:2.8,iso_dig:3.8,iso_rein:4.8,mcu_msp:4.9,mcu_c2k:3.3,mcu_m0:8.5,mcu_cc:38.6,mcu_sit:-15.6,gan_342:4.9,gan_365:0.4,gan_520:4.5,dc_48v:8.8,dc_sps:5.4,dc_efuse:3.5,dc_hswap:4.4,dc_tps:7.9},
 };
 const HP=["Jun-22","Sep-22","Dec-22","Mar-23","Jun-23","Sep-23","Dec-23","Mar-24","Jun-24","Sep-24","Dec-24","Mar-25","Jun-25","Sep-25","Dec-25","Mar-26"];
 
@@ -515,7 +515,7 @@ function App(){
   function exportCSV(){
     const rows=[['Period',...visCats.map(c=>c.l)]];
     HP.forEach(p=>rows.push([p,...visCats.map(c=>HIST[p]?.[c.id]??'')]));
-    if(liveData)rows.push(['Live vs latest baseline (Q1-26 snapshot 27-Feb-26)',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
+    if(liveData)rows.push(['Live vs latest baseline (Q1-26 close 28-Apr-26)',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'}));
     a.download=`ti_prices_${new Date().toISOString().slice(0,10)}.csv`;a.click();
@@ -539,7 +539,7 @@ function App(){
     }
     const confColor=confidence==='multi-source'?'#00c9a7':confidence==='single-source'?'#f0a84e':'#f05c5c';
     return <>
-      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs latest baseline (27-Feb-26)</div>
+      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs latest baseline (28-Apr-26)</div>
       {d?(d.parts?.length>0?d.parts.map((p,i)=>(
         <div key={i} style={{fontSize:'0.6rem',marginBottom:3,display:'flex',justifyContent:'space-between',gap:14}}>
           <span style={{color:'#c4d4e8',fontFamily:'monospace'}}>{p.part}</span>
@@ -622,7 +622,7 @@ function App(){
         <span style={{color:'#00c9a7'}}>■ positive</span><span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ bold ≥5%</span><span>·</span>
         <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
-        <span style={{color:'#f0a84e',marginLeft:6}}>· → Mar-26 hist = partial est. (captured 27-Feb-26) · LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
+        <span style={{color:'#f0a84e',marginLeft:6}}>· LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
         <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
       </div>
 
@@ -645,12 +645,12 @@ function App(){
           </thead>
           <tbody>
             {HP.map((p,pi)=>{
-              const isLast=p==="Mar-26",isRecent=["Dec-25","Mar-26"].includes(p),isEstimate=p==="Mar-26";
+              const isLast=p==="Mar-26",isRecent=["Dec-25","Mar-26"].includes(p);
               const bg=isLast?"rgba(61,142,240,0.07)":isRecent?"rgba(61,142,240,0.03)":pi%2===0?"#080c14":"#06080f";
               return(
                 <tr key={p} style={{background:bg}}>
                   <td style={{padding:'4px 12px 4px 16px',borderRight:`1px solid ${B}`,borderBottom:`1px solid #0d1520`,fontFamily:'monospace',fontSize:'0.7rem',position:'sticky',left:0,background:bg,zIndex:2,color:isLast?'#3d8ef0':isRecent?'#7aaee8':'#4a6a8a',fontWeight:isRecent?'600':'normal'}}>
-                    {isRecent?'→ ':'   '}{p}{isEstimate&&<sup style={{fontSize:'0.42rem',color:'#f0a84e',marginLeft:2}} title='Partial estimate — captured 27-Feb-2026 (mid-Q1)'>est</sup>}
+                    {isRecent?'→ ':'   '}{p}
                   </td>
                   {visCats.map((c,i)=>{const iF=i===0||visCats[i-1].g!==c.g;const{txt,col,bold}=fmt(HIST[p]?.[c.id]);return(
                     <td key={c.id} style={{padding:'4px 6px',textAlign:'right',borderBottom:`1px solid #0d1520`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.74rem':'0.7rem',color:col,fontWeight:bold?'bold':'normal'}}>{txt}</td>
@@ -663,7 +663,7 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'3px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs LATEST BASELINE · Q1-26 SNAPSHOT CAPTURED 27-FEB-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
+                  <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs LATEST BASELINE · Q1-26 CLOSE CAPTURED 28-APR-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
                   {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
                   <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8}}>
                     {basketPreviewData&&<span style={{color:'#3d8ef0'}}>NX: {(basketPreviewData.categories||[]).filter(c=>(c.quotedSkuCount||0)>0).length} cats · {basketPreviewData.cached?'cached':'fresh'} · TTL {basketPreviewData.cacheTtlHours||24}h</span>}
@@ -730,7 +730,7 @@ function App(){
       </div>
 
       <div style={{padding:'8px 16px 16px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
-        <span>Historical rows: QoQ product price changes (Jun-22→Mar-26) · Live row (★): current Mouser qty=1 spot vs latest baseline · Latest baseline: Q1-26 snapshot captured 27-Feb-26 · L = live datapoint · same SKU &amp; qty break · USD · INR→USD ₹83.5/$ · Early-warning monitor, not a finalized quarterly row</span>
+        <span>Historical rows: QoQ product price changes (Jun-22→Mar-26) · Live row (★): current Mouser qty=1 spot vs latest baseline · Latest baseline: Q1-26 close captured 28-Apr-26 · L = live datapoint · same SKU &amp; qty break · USD · INR→USD ₹83.5/$ · Early-warning monitor, not a finalized quarterly row</span>
         <span>TI Product Price Intelligence · Professional use only</span>
       </div>
     </div>
