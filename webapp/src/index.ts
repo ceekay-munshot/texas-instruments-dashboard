@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse, errorResponse } from './sources/octopartNexar'
 import { TRUSTED_DISTRIBUTOR_LIST } from './data/sourceTypes'
-import { PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS, BASKET_PREVIEW_QUOTA_NOTE, BASKET_STATUS, type BasketCategory } from './data/tiBasket'
+import { PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS, BASKET_PREVIEW_QUOTA_NOTE, BASKET_STATUS, selectSampledSkus, summarizeSampling, type BasketCategory } from './data/tiBasket'
 import {
   captureRepresentativeBasketSnapshot,
   getLatestSnapshot,
@@ -499,6 +499,70 @@ app.get('/api/sources/status', (c) => {
 // secrets are missing, returns { configured: false, status: 'not_configured' }.
 // Errors are sanitized — credentials, raw GraphQL bodies, and stack traces are
 // never echoed to the client.
+// ── Phase 15A — basket coverage (read-only catalog reflection) ───────────────
+// Returns the full representative TI basket catalog plus current sampling
+// policy. Never calls Nexar, never triggers capture. Cheap to call.
+app.get('/api/nexar/basket-coverage', (c) => {
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const sampledByCat = new Map<string, typeof sampling.sampled>()
+  const unsampledByCat = new Map<string, typeof sampling.unsampled>()
+  for (const r of sampling.sampled) {
+    const arr = sampledByCat.get(r.category.categoryId) || []
+    arr.push(r); sampledByCat.set(r.category.categoryId, arr)
+  }
+  for (const r of sampling.unsampled) {
+    const arr = unsampledByCat.get(r.category.categoryId) || []
+    arr.push(r); unsampledByCat.set(r.category.categoryId, arr)
+  }
+  const categories = PHASE_8_BASKET_PREVIEW.map(cat => {
+    const sampled = sampledByCat.get(cat.categoryId) || []
+    const unsampled = unsampledByCat.get(cat.categoryId) || []
+    return {
+      categoryId: cat.categoryId,
+      categoryLabel: cat.categoryLabel,
+      groupId: cat.groupId,
+      groupLabel: cat.groupLabel,
+      categoryRole: cat.categoryRole ?? null,
+      whyItMatters: cat.whyItMatters ?? null,
+      sourceCoverageTarget: cat.sourceCoverageTarget ?? [],
+      skuCount: cat.skus.length,
+      sampledSkuCount: sampled.length,
+      unsampledSkuCount: unsampled.length,
+      sampledSkus: sampled.map(r => ({
+        mpn: r.sku.mpn,
+        role: r.sku.role,
+        importanceTier: r.sku.importanceTier ?? null,
+        samplingPriority: r.sku.samplingPriority ?? null,
+        representativeReason: r.sku.representativeReason ?? null,
+        fallbackFor: r.sku.fallbackFor ?? null,
+      })),
+      unsampledSkus: unsampled.map(r => ({
+        mpn: r.sku.mpn,
+        role: r.sku.role,
+        importanceTier: r.sku.importanceTier ?? null,
+        samplingPriority: r.sku.samplingPriority ?? null,
+        representativeReason: r.sku.representativeReason ?? null,
+        fallbackFor: r.sku.fallbackFor ?? null,
+      })),
+    }
+  })
+  return c.json({
+    configured: true,
+    status: 'ok' as const,
+    source: 'octopart_nexar',
+    mode: 'representative_basket_preview',
+    categoryCount: categories.length,
+    basketCatalogSkuCount: sampling.basketCatalogSkuCount,
+    currentSampleLimit: sampling.sampleLimit,
+    sampleLimitReason: sampling.sampleLimitReason,
+    sampledSkuCount: sampling.sampledSkuCount,
+    unsampledSkuCount: sampling.unsampledSkuCount,
+    quotaNote: BASKET_PREVIEW_QUOTA_NOTE,
+    expansionNote: 'Full basket monitoring requires raising BASKET_PREVIEW_MAX_CALLS — gated on a paid/approved Nexar supply plan. Catalogued-but-unsampled SKUs are visible here as monitored watchlist.',
+    categories,
+  })
+})
+
 // ── Phase 8/9 — tiny multi-SKU basket preview (24h CF-cached) ────────────────
 // Hard-bounded to BASKET_PREVIEW_MAX_CALLS (=4) MPN fetches. Cache key is
 // shared across CF edge instances; only ok/partial responses are cached.
@@ -513,9 +577,12 @@ app.get('/api/nexar/basket-preview', async (c) => {
   const fetchedAt = new Date().toISOString()
   const clientId = c.env.NEXAR_CLIENT_ID
   const clientSecret = c.env.NEXAR_CLIENT_SECRET
-  const allSkus = PHASE_8_BASKET_PREVIEW.flatMap(cat =>
-    cat.skus.map(sku => ({ category: cat, sku }))
-  )
+  // Phase 15A: catalog has grown beyond the maxCalls cap. Use the same
+  // sampling helper the daily capture uses, so the live preview shows
+  // exactly the SKUs that would be captured today.
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const allSkus = sampling.sampled
+  const sampledCatIds = new Set(allSkus.map(r => r.category.categoryId))
 
   // Serve from cache when available and not forcing refresh.
   if (!force) {
@@ -527,7 +594,8 @@ app.get('/api/nexar/basket-preview', async (c) => {
     }
   }
 
-  // Hard guard against accidental basket expansion.
+  // Defensive guard — should never trip with the sampling helper, but kept as
+  // a belt-and-braces check in case someone bypasses the helper later.
   if (allSkus.length > BASKET_PREVIEW_MAX_CALLS) {
     return c.json({
       configured: true,
@@ -556,6 +624,7 @@ app.get('/api/nexar/basket-preview', async (c) => {
       source: 'octopart_nexar',
       mode: 'tiny_basket_preview',
       fetchedAt,
+      coverage: summarizeSampling(sampling),
       cached: false,
       cacheTtlHours: BASKET_CACHE_TTL_HOURS,
       categoryCount: PHASE_8_BASKET_PREVIEW.length,
@@ -650,8 +719,12 @@ app.get('/api/nexar/basket-preview', async (c) => {
     }
   })
 
-  // Per-category aggregation
-  const categories = PHASE_8_BASKET_PREVIEW.map(cat => {
+  // Per-category aggregation — only categories that had at least one SKU
+  // sampled this run get a record. Catalogued-but-unsampled categories live
+  // separately in /api/nexar/basket-coverage.
+  const categories = PHASE_8_BASKET_PREVIEW
+    .filter(cat => sampledCatIds.has(cat.categoryId))
+    .map(cat => {
     const skus = perSku.filter(s => s.categoryId === cat.categoryId)
     const availablePrices = skus
       .map(s => s.bestTrustedAvailableUnitPrice)
@@ -729,6 +802,7 @@ app.get('/api/nexar/basket-preview', async (c) => {
     source: 'octopart_nexar' as const,
     mode: 'tiny_basket_preview' as const,
     fetchedAt,
+    coverage: summarizeSampling(sampling),
     cached: false,
     cacheTtlHours: BASKET_CACHE_TTL_HOURS,
     categoryCount: PHASE_8_BASKET_PREVIEW.length,
@@ -1000,12 +1074,22 @@ app.get('/api/snapshots/trends', async (c) => {
 app.get('/api/snapshots/evidence/latest', async (c) => {
   const env = c.env
   const base = snapshotMemoryBaseEnv(env)
+  // Coverage is static catalog data — available regardless of KV state.
+  const earlySampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const earlyCoverage = {
+    basketCatalogSkuCount: earlySampling.basketCatalogSkuCount,
+    sampledSkuCount: earlySampling.sampledSkuCount,
+    unsampledSkuCount: earlySampling.unsampledSkuCount,
+    sampleLimit: earlySampling.sampleLimit,
+    sampleLimitReason: earlySampling.sampleLimitReason,
+  }
   if (!env.SOURCE_SNAPSHOTS_KV) {
     return c.json({
       configured: false,
       status: 'snapshot_storage_not_configured',
       latestSnapshotDate: null,
       evidence: null,
+      coverage: earlyCoverage,
       trendReadiness: {
         status: 'pending_until_two_snapshots',
         observationCount: 0,
@@ -1024,6 +1108,17 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
     latestDate: dates[dates.length - 1] ?? null,
   }
 
+  // Phase 15A — basket-coverage is a static catalog reflection. Compute it
+  // upfront so it's available on every branch (no_snapshots and ok alike).
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const coverage = {
+    basketCatalogSkuCount: sampling.basketCatalogSkuCount,
+    sampledSkuCount: sampling.sampledSkuCount,
+    unsampledSkuCount: sampling.unsampledSkuCount,
+    sampleLimit: sampling.sampleLimit,
+    sampleLimitReason: sampling.sampleLimitReason,
+  }
+
   const snap = await getLatestSnapshot(env.SOURCE_SNAPSHOTS_KV)
   if (!snap) {
     return c.json({
@@ -1031,6 +1126,7 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
       status: 'no_snapshots',
       latestSnapshotDate: null,
       evidence: null,
+      coverage,
       trendReadiness,
       ...base,
     })
@@ -1042,6 +1138,7 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
     status: 'ok',
     latestSnapshotDate: snap.snapshotDate,
     evidence,
+    coverage,
     trendReadiness,
     ...base,
   })

@@ -356,6 +356,8 @@ function App(){
   const [trendMeta,setTrendMeta]=useState(null);
   // Phase 14A: derived evidence from the latest snapshot (read-only).
   const [evidenceData,setEvidenceData]=useState(null);
+  // Phase 15A: full basket-coverage catalog (read-only, no Nexar calls).
+  const [coverageData,setCoverageData]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -495,10 +497,11 @@ function App(){
     let cancelled = false;
     (async () => {
       try {
-        const [latestRes, trendsRes, evidenceRes] = await Promise.allSettled([
+        const [latestRes, trendsRes, evidenceRes, coverageRes] = await Promise.allSettled([
           fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/latest').then(r => r.ok ? r.json() : null),
+          fetch('/api/nexar/basket-coverage').then(r => r.ok ? r.json() : null),
         ]);
         if (cancelled) return;
         if (latestRes.status === 'fulfilled' && latestRes.value) {
@@ -520,6 +523,9 @@ function App(){
         if (evidenceRes.status === 'fulfilled' && evidenceRes.value) {
           setEvidenceData(evidenceRes.value);
         }
+        if (coverageRes.status === 'fulfilled' && coverageRes.value) {
+          setCoverageData(coverageRes.value);
+        }
       } catch (_) { /* silent */ }
     })();
     return () => { cancelled = true; };
@@ -529,6 +535,13 @@ function App(){
   // latest snapshot, or null if not present (e.g. cell isn't in the basket).
   function evidenceCatFor(catId) {
     const cats = evidenceData?.evidence?.categories;
+    if (!cats) return null;
+    return cats.find(c => c.categoryId === catId) || null;
+  }
+
+  // Phase 15A: per-category basket-coverage record (sampled vs unsampled SKUs).
+  function coverageCatFor(catId) {
+    const cats = coverageData?.categories;
     if (!cats) return null;
     return cats.find(c => c.categoryId === catId) || null;
   }
@@ -623,6 +636,7 @@ function App(){
                       : '#f05c5c';
         const trendStr = trendMeta?.status==='ok' ? `available (${trendMeta.observationCount} obs)` : 'pending until 2 daily snapshots';
         const dupTotal = (evid.skus||[]).reduce((s,x)=>s+(x.duplicateObservationCount||0),0);
+        const cov = coverageCatFor(catId);
         return (
           <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
             <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
@@ -635,6 +649,7 @@ function App(){
               <div>Broker inventory: {(evid.totalBrokerInventory||0).toLocaleString()} <span style={{color:'#7a96b8'}}>(excluded from core signal)</span></div>
               {evid.failedSkuCount>0&&<div style={{color:'#f0a84e'}}>Failed SKUs: {evid.failedSkuCount} of {evid.representativeSkuCount}</div>}
               {dupTotal>0&&<div style={{color:'#7a96b8'}}>Deduped observations: {dupTotal}</div>}
+              {cov&&<div style={{color:'#7a96b8'}}>Representative coverage: sampled {cov.sampledSkuCount} of {cov.skuCount} monitored SKUs{cov.unsampledSkuCount>0?<span style={{color:'#f0a84e'}}> · {cov.unsampledSkuCount} watchlist pending higher quota</span>:null}</div>}
               <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Current source evidence only — trend signal {trendStr}.</div>
             </div>
           </div>
@@ -699,7 +714,7 @@ function App(){
         <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
         <span style={{color:'#f0a84e',marginLeft:6}}>· LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
         <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
-        <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{evidenceData?.evidence?` · Source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`:''}{trendMeta?` · Trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
+        <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{evidenceData?.evidence?` · Source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`:''}{evidenceData?.coverage?` · Basket coverage: ${evidenceData.coverage.sampledSkuCount} / ${evidenceData.coverage.basketCatalogSkuCount} sampled (quota-limited)`:''}{trendMeta?` · Trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
       </div>
 
       {/* ── Signal Summary ── */}

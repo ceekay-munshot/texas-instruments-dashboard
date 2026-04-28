@@ -451,6 +451,29 @@ Canonical names (e.g. "Digi-Key" → "DigiKey", "Arrow Electronics" → "Arrow")
 
 **UI surface.** The legend status line gains a `Source evidence: <status> (<score>/100)` segment and a `Trend signal: pending until 2 daily snapshots` segment when the trends endpoint reports insufficient history. Inside each NX-marked cell's tooltip, a "Snapshot evidence" section appears with confidence score, trusted distributors, trusted vs broker inventory, failed-SKU count, and the same trend-pending caveat — so a user can hover and see the underlying evidence behind the latest values without leaving the table.
 
+### Representative basket coverage (Phase 15A)
+
+The customer needs more than the original 4-SKU tiny preview to feel confident the table is a real source-of-truth view. Phase 15A expands the **monitored catalog** while keeping the **daily-sampled** set within the existing Nexar Evaluation quota cap. The two are now distinct:
+
+- **Monitored catalog** — what the dashboard *recognizes* as representative TI categories (7 categories, 14 SKUs as of this phase). Lives in [`tiBasket.ts`](webapp/src/data/tiBasket.ts).
+- **Daily-sampled set** — what `POST /api/snapshots/capture` actually fetches each day. Hard-capped at `BASKET_PREVIEW_MAX_CALLS` (= 4). The sampling helper `selectSampledSkus()` deterministically picks the top-N by `(samplingPriority, categoryRole, role)`.
+
+Today the cap of 4 is consumed by the two anchor categories — `pm_ldo` and `pm_batt`, both at `samplingPriority: 1`. The five additional categories (`pm_dcdc`, `amp_op`, `dac_adc`, `if_can`, `mcu_msp`, all at `samplingPriority: 2-3`) sit in the **monitored watchlist** and only start daily-sampling once `BASKET_PREVIEW_MAX_CALLS` is raised — gated on a paid Nexar supply plan. **Capture call count does not change in this phase.**
+
+**Catalog metadata.** Per-category: `categoryRole` (`anchor` / `secondary` / `watchlist`), `whyItMatters` (investor-facing one-liner explaining why the category is a meaningful price-signal proxy), `sourceCoverageTarget` (which sources we want to cover for this category). Per-SKU: `samplingPriority` (1 → sampled first, 3 → watchlist), `fallbackFor` (when this SKU is a fallback for a primary, the primary's mpn), plus the existing `representativeReason` / `importanceTier` / `sourceCoverageTarget` from Phase 10.
+
+**Endpoints:**
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/nexar/basket-coverage` | **NEW.** Read-only catalog reflection. No Nexar calls. Returns full monitored catalog with `sampledSkus` / `unsampledSkus` arrays per category, plus `currentSampleLimit` and `sampleLimitReason`. Cheap; safe for page-load fetch. |
+| `GET` | `/api/snapshots/evidence/latest` | Now includes a top-level `coverage` block: `{ basketCatalogSkuCount, sampledSkuCount, unsampledSkuCount, sampleLimit, sampleLimitReason }`. |
+| `POST` | `/api/snapshots/capture` | Internally uses `selectSampledSkus` instead of taking all SKUs. Records coverage detail in `snapshot.metadata` (`sampledSkus`, `unsampledSkus`, `sampleLimit`, `sampleLimitReason`) so historical snapshots remember which subset was sampled. |
+
+**UI surface.** The legend gains a `Basket coverage: <sampled> / <total> sampled (quota-limited)` segment. Each NX-marked tooltip's "Snapshot evidence" section gains a `Representative coverage: sampled N of M monitored SKUs` line, and (when applicable) `· N watchlist pending higher quota` in amber. Subtle, no redesign.
+
+**This protects against false confidence from a too-small basket.** A user looking at the dashboard sees "4 of 14 sampled" rather than "4 SKUs" — making the limit and the expansion path visible.
+
 ## Local Development
 ```bash
 npm install

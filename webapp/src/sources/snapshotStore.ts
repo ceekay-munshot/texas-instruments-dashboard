@@ -15,6 +15,8 @@ import {
   PHASE_8_BASKET_PREVIEW,
   BASKET_PREVIEW_MAX_CALLS,
   BASKET_PREVIEW_QUOTA_NOTE,
+  selectSampledSkus,
+  summarizeSampling,
   type BasketCategory,
   type BasketSku,
 } from '../data/tiBasket'
@@ -240,15 +242,12 @@ export async function captureRepresentativeBasketSnapshot(opts: {
   clientSecret: string
 }): Promise<CaptureResult> {
   const capturedAt = new Date().toISOString()
-  const allSkus = PHASE_8_BASKET_PREVIEW.flatMap(cat =>
-    cat.skus.map(sku => ({ category: cat, sku })),
-  )
 
-  if (allSkus.length > BASKET_PREVIEW_MAX_CALLS) {
-    throw new Error(
-      `Refusing to capture: basket has ${allSkus.length} SKUs > maxCalls=${BASKET_PREVIEW_MAX_CALLS}`,
-    )
-  }
+  // Quota-safe SKU selection: take the top-N from the basket catalog under the
+  // existing maxCalls cap. Catalog can grow without changing the cap; the
+  // unsampled overflow is recorded in snapshot.metadata for visibility.
+  const sampling = selectSampledSkus(PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS)
+  const allSkus = sampling.sampled // already capped at BASKET_PREVIEW_MAX_CALLS
 
   const settled = await Promise.allSettled(
     allSkus.map(({ sku }) =>
@@ -302,11 +301,15 @@ export async function captureRepresentativeBasketSnapshot(opts: {
     ;(perSkuByCat[category.categoryId] ??= []).push(skuRec)
   }
 
-  const categories: SnapshotCategory[] = PHASE_8_BASKET_PREVIEW.map(cat =>
-    aggregateCategory(cat, perSkuByCat[cat.categoryId] || []),
-  )
+  // Only categories that actually had at least one SKU sampled get aggregated.
+  // Catalogued-but-unsampled categories live in snapshot.metadata.coverage.
+  const sampledCatIds = new Set(allSkus.map(r => r.category.categoryId))
+  const categories: SnapshotCategory[] = PHASE_8_BASKET_PREVIEW
+    .filter(cat => sampledCatIds.has(cat.categoryId))
+    .map(cat => aggregateCategory(cat, perSkuByCat[cat.categoryId] || []))
 
   const skuCount = categories.reduce((s, c) => s + c.skus.length, 0)
+  const coverage = summarizeSampling(sampling)
   const snapshot: Snapshot = {
     snapshotDate: todayUtc(),
     capturedAt,
@@ -322,7 +325,10 @@ export async function captureRepresentativeBasketSnapshot(opts: {
       cacheTtlHours: 24,
       quotaNote: BASKET_PREVIEW_QUOTA_NOTE,
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-    },
+      // Phase 15A — basket coverage (which SKUs were sampled vs unsampled).
+      // Optional fields; consumers that don't know about them ignore safely.
+      ...coverage,
+    } as any,
   }
 
   return { snapshot, callsUsed }
