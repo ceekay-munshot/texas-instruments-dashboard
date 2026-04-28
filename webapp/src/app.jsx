@@ -522,9 +522,10 @@ function App(){
   }
 
   function TT({catId}){
-    const d=liveData?.[catId];if(!d)return null;
-    const cat=CATS.find(c=>c.id===catId);
+    const d=liveData?.[catId];
     const basket=basketCatFor(catId);
+    if(!d&&!basket)return null; // nothing to show
+    const cat=CATS.find(c=>c.id===catId);
     // Source confidence (coverage, not direction confirmation):
     //   multi-source → ≥2 trusted distributors with quoted available offers
     //   single-source → exactly 1 trusted distributor
@@ -539,16 +540,16 @@ function App(){
     const confColor=confidence==='multi-source'?'#00c9a7':confidence==='single-source'?'#f0a84e':'#f05c5c';
     return <>
       <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs latest baseline (27-Feb-26)</div>
-      {d.parts?.length>0?d.parts.map((p,i)=>(
+      {d?(d.parts?.length>0?d.parts.map((p,i)=>(
         <div key={i} style={{fontSize:'0.6rem',marginBottom:3,display:'flex',justifyContent:'space-between',gap:14}}>
           <span style={{color:'#c4d4e8',fontFamily:'monospace'}}>{p.part}</span>
           <span style={{color:'#00c9a7',fontFamily:'monospace'}}>${p.price?.toFixed(4)}</span>
           <span style={{color:p.availability?.includes('In Stock')?'#00c9a7':'#f05c5c',fontSize:'0.52rem'}}>{p.availability||'—'}</span>
         </div>
-      )):<div style={{fontSize:'0.58rem',color:'#f05c5c'}}>{d.error||'No live data'}</div>}
-      <div style={{marginTop:5,paddingTop:4,borderTop:'1px solid #1a2740',fontSize:'0.52rem',color:'#2d4a6b'}}>
+      )):<div style={{fontSize:'0.58rem',color:'#f05c5c'}}>{d.error||'No live data'}</div>):<div style={{fontSize:'0.58rem',color:'#7a96b8'}}>No Mouser live data yet</div>}
+      {d&&<div style={{marginTop:5,paddingTop:4,borderTop:'1px solid #1a2740',fontSize:'0.52rem',color:'#2d4a6b'}}>
         Live ${d.avgPriceUSD?.toFixed(4)} · Baseline ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser
-      </div>
+      </div>}
       {basket&&<div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
         <div style={{fontSize:'0.6rem',color:'#3d8ef0',fontWeight:'bold',marginBottom:3}}>
           Nexar trusted basket check
@@ -694,15 +695,20 @@ function App(){
                 const v=d?.qoqPct;
                 const isLive=d&&!d.error&&d.parts?.length>0;
                 const isRLCell = d?.error?.includes('Rate limit');
+                const hasBasket=!!basketCatFor(c.id);
+                // Hover fires when Mouser is live OR Nexar basket has cross-source
+                // data — so a Mouser rate-limited cell still surfaces the Nexar
+                // section (Phase 9: cross-source enrichment must be reachable).
+                const hasTooltip = isLive || hasBasket;
                 const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':isRLCell?'⚡':'—',col:isRLCell?'#3a2800':'#2a4060',bold:false};
                 return(
                   <td key={c.id}
-                    onMouseEnter={isLive?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
-                    onMouseMove={isLive?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
-                    onMouseLeave={isLive?()=>setTooltip(null):undefined}
+                    onMouseEnter={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
+                    onMouseMove={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
+                    onMouseLeave={hasTooltip?()=>setTooltip(null):undefined}
                     title={isRLCell?'Rate limited — will retry automatically':undefined}
-                    style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:isLive?'crosshair':'default'}}>
-                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{basketCatFor(c.id)&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}
+                    style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:hasTooltip?'crosshair':'default'}}>
+                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}
                   </td>
                 );
               })}
@@ -712,7 +718,7 @@ function App(){
       </div>
 
       {/* Tooltip */}
-      {tooltip&&liveData?.[tooltip.catId]&&(
+      {tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId))&&(
         <div className="tt" style={{top:tooltip.y+14,left:Math.min(tooltip.x+14,window.innerWidth-360)}}>
           <TT catId={tooltip.catId}/>
         </div>
