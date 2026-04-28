@@ -1,0 +1,132 @@
+name: TI Source Snapshot Capture
+
+# Daily scheduled capture of the TI representative-basket source snapshot.
+# Runs once a day at 07:30 UTC. Can also be invoked manually.
+#
+# What it does:
+#   POST https://texas-instruments-dashboard-final.pages.dev/api/snapshots/capture
+#   with header `X-Capture-Secret: <repo secret SNAPSHOT_CAPTURE_SECRET>`.
+#
+# Required GitHub Actions secret:
+#   SNAPSHOT_CAPTURE_SECRET — must match the same-named secret stored on the
+#   Cloudflare Pages project (Settings → Variables and Secrets → Production).
+#
+# Failure modes (workflow exits non-zero):
+#   - HTTP non-200 with a non-JSON body
+#   - response status: unauthorized
+#   - response status: snapshot_storage_not_configured
+#   - response status: capture_secret_not_configured
+#   - response status: nexar_not_configured
+#   - response.success !== true and status not recognized
+#
+# Treated as success:
+#   - response.success === true
+#   - response.status === "already_exists_for_today" (manual capture earlier
+#     today is fine — the worker is idempotent without ?overwrite=true)
+
+on:
+  schedule:
+    - cron: '30 7 * * *'   # 07:30 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ti-snapshot-capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    name: POST /api/snapshots/capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate SNAPSHOT_CAPTURE_SECRET is configured
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+        run: |
+          if [ -z "${CAPTURE_SECRET:-}" ]; then
+            echo "::error::Repository secret SNAPSHOT_CAPTURE_SECRET is not set."
+            echo "Add it under: Settings → Secrets and variables → Actions → New repository secret."
+            echo "It must match the same-named secret on the Cloudflare Pages project."
+            exit 1
+          fi
+          echo "Secret is configured (value not printed)."
+
+      - name: Capture snapshot
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          CAPTURE_URL: https://texas-instruments-dashboard-final.pages.dev/api/snapshots/capture
+        run: |
+          set -uo pipefail
+
+          response_file="$(mktemp)"
+
+          # Single POST. The secret is passed as a request header — never echoed
+          # by this workflow. GitHub Actions also auto-masks any secret if it
+          # somehow leaks into stdout/stderr, but this script does not log it.
+          http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            "${CAPTURE_URL}")"
+
+          echo "HTTP status: ${http_status}"
+
+          # Validate response is JSON before continuing.
+          if ! jq -e . < "$response_file" > /dev/null 2>&1; then
+            echo "::error::Capture response was not valid JSON (HTTP ${http_status})."
+            head -c 500 "$response_file" || true
+            exit 1
+          fi
+
+          # Print only safe, non-secret fields from the response.
+          echo "Response (sanitized):"
+          jq -c '{
+            success, status, message,
+            snapshotDate, key, overwritten,
+            categoryCount, skuCount,
+            callsUsed, maxCalls,
+            storageConfigured, captureSecretConfigured, nexarConfigured,
+            schemaVersion
+          }' < "$response_file"
+
+          status="$(jq -r '.status // empty' < "$response_file")"
+          success="$(jq -r '.success // empty' < "$response_file")"
+
+          # Benign — manual capture already ran today; don't fail the workflow.
+          if [ "${status}" = "already_exists_for_today" ]; then
+            echo "ℹ︎ Snapshot already captured for today (idempotent skip). Treating as success."
+            exit 0
+          fi
+
+          # Hard-fail statuses with descriptive operator hints.
+          case "${status}" in
+            unauthorized)
+              echo "::error::Capture refused (unauthorized) — verify SNAPSHOT_CAPTURE_SECRET in GitHub Actions matches the value stored in Cloudflare Pages."
+              exit 1
+              ;;
+            snapshot_storage_not_configured)
+              echo "::error::SOURCE_SNAPSHOTS_KV namespace is not bound on the Cloudflare Pages project."
+              exit 1
+              ;;
+            capture_secret_not_configured)
+              echo "::error::SNAPSHOT_CAPTURE_SECRET is not set on the Cloudflare Pages project."
+              exit 1
+              ;;
+            nexar_not_configured)
+              echo "::error::NEXAR_CLIENT_ID / NEXAR_CLIENT_SECRET are not set on the Cloudflare Pages project."
+              exit 1
+              ;;
+          esac
+
+          # Generic success path — server reported success: true with a fresh
+          # snapshot stored.
+          if [ "${success}" = "true" ]; then
+            echo "Snapshot captured successfully."
+            exit 0
+          fi
+
+          echo "::error::Unexpected response — success=${success} status=${status} http=${http_status}"
+          exit 1

@@ -338,9 +338,36 @@ Thresholds are conservative on purpose so a single noisy observation doesn't fli
 **Future sources** that the schema is already shaped to absorb without breakage: DigiKey direct, Arrow direct, TI.com (representative-SKU sampling if scraping is blocked), expanded Octopart/Nexar coverage once a paid Nexar supply plan is in place.
 
 **What this phase does NOT do:**
-- It does not auto-capture. Capture is manual: `curl -X POST -H "X-Capture-Secret: <secret>" https://.../api/snapshots/capture`.
 - It does not replace the live row. Mouser flow and Phase 9 NX enrichment are unchanged.
 - It does not show shortage flags in the main table yet — the trend engine is ready, but it needs ≥2 snapshots before any classification appears, and the customer-facing surface for trend signals is a later phase.
+
+### Scheduled source snapshot capture
+
+Daily snapshots are captured by a GitHub Actions workflow at `.github/workflows/ti-snapshot-capture.yml` so the dashboard accumulates source memory automatically without any page-load fetches and without a long-running worker.
+
+**Schedule:** runs once per UTC day at **07:30 UTC** (`cron: 30 7 * * *`). Also exposes `workflow_dispatch` for ad-hoc manual runs from the GitHub Actions UI or `gh workflow run`.
+
+**What it calls:**
+```
+POST https://texas-instruments-dashboard-final.pages.dev/api/snapshots/capture
+Header: X-Capture-Secret: <repo secret SNAPSHOT_CAPTURE_SECRET>
+```
+
+**Required GitHub Actions repository secret:** `SNAPSHOT_CAPTURE_SECRET`. It **must match** the same-named secret stored on the Cloudflare Pages project (**Settings → Variables and Secrets → Production**). The Pages secret is what the worker compares against; the Actions secret is what the workflow sends. If these two values diverge, every scheduled run will return `unauthorized` and fail.
+
+Set the GitHub Actions secret under: **Settings → Secrets and variables → Actions → New repository secret**. Never commit it, never echo it, never paste it into commit messages.
+
+**Idempotent skip:** the worker refuses to overwrite an existing same-day snapshot unless the request includes `?overwrite=true`. The workflow does **not** pass `overwrite=true`, so if a manual capture has already run for the day, the worker returns `status: "already_exists_for_today"` and the workflow treats that as a success — not a failure. This means it is safe to run the workflow manually before or after the scheduled time.
+
+**Hard-fail statuses (workflow fails red):**
+- HTTP non-200 with a non-JSON response body
+- `unauthorized` — secret mismatch between GitHub and Cloudflare
+- `snapshot_storage_not_configured` — KV namespace not bound on Pages
+- `capture_secret_not_configured` — secret not set on Pages
+- `nexar_not_configured` — Nexar OAuth credentials not set on Pages
+- any other shape where `success !== true`
+
+**Logs are sanitized.** The workflow only prints the response fields `success`, `status`, `message`, `snapshotDate`, `key`, `overwritten`, `categoryCount`, `skuCount`, `callsUsed`, `maxCalls`, `storageConfigured`, `captureSecretConfigured`, `nexarConfigured`, `schemaVersion`. The secret is sent as a request header, never written to logs; GitHub Actions also auto-masks the value if it ever leaks.
 
 ## Local Development
 ```bash
