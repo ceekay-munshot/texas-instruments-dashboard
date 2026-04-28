@@ -292,6 +292,56 @@ This is intentionally **coverage confidence, not price-move confirmation**. We d
 
 Full replacement of historical QoQ rows by a Nexar daily-snapshot basket index is the next major step, gated on a paid/approved Nexar supply plan and a basket-level baseline capture.
 
+### Phase 10 — Persistent source memory for TI
+
+The customer's actual ask is **price + inventory + distributor evidence over time**, not just "show more rows." The 24 h CF cache (Phase 6/9) protects API quota for page loads but is ephemeral — it overwrites itself, so no trend can be computed from it alone. Phase 10 adds a durable snapshot layer that sits *next to* the cache, not inside it.
+
+**Architecture:** `API sources → hot cache (24h) → daily normalized snapshots (KV) → trend analytics → enriched table`
+
+**Why representative SKU baskets:** full TI.com coverage may be blocked or too expensive initially. Each category in `webapp/src/data/tiBasket.ts` carries its own `representativeReason`, `importanceTier`, and `sourceCoverageTarget` so the basket is a deliberate, documented investor reference rather than "every SKU we could find." Phase 10 only persists snapshots for the existing tiny preview basket (4 SKUs, 2 categories) — expansion is gated on Nexar quota.
+
+**Required Cloudflare bindings/secrets** (configured in CF Pages → Settings, **not** in `wrangler.jsonc` so a missing binding never fails a deploy):
+
+| Binding | Purpose |
+|---|---|
+| `SOURCE_SNAPSHOTS_KV` (KV namespace) | Durable storage for one snapshot per UTC date |
+| `SNAPSHOT_CAPTURE_SECRET` (env var) | Shared secret required for `POST /api/snapshots/capture` |
+
+When either is missing, every snapshot endpoint returns `configured: false, status: "snapshot_storage_not_configured"` (or `capture_secret_not_configured`) with HTTP 200 — never crashes the page.
+
+**Endpoints:**
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/api/snapshots/capture` | Header `X-Capture-Secret` or `?secret=` | Capture today's snapshot (4 fresh Nexar calls, hard-capped). Refuses if today already captured unless `?overwrite=true`. |
+| `GET` | `/api/snapshots/latest` | none | Most recent snapshot. |
+| `GET` | `/api/snapshots/history?days=30` | none | Up to 90 days of snapshots. |
+| `GET` | `/api/snapshots/trends?days=30` | none | Per-category and per-SKU trend signal computed from earliest vs latest snapshot in the window. |
+
+Capture is **never** triggered from page load. The frontend reads `latest` and `trends` only — that's enough to surface a tiny "Snapshot memory: configured · latest snapshot: YYYY-MM-DD · Trend engine: ready" status line in the legend without any quota cost.
+
+**KV key format:** `source-snapshots/texas_instruments/octopart_nexar/representative_basket_preview/YYYY-MM-DD`. The path is intentionally hierarchical so future sources (mouser_direct, digikey_direct, arrow_direct, ti_direct) and modes (full_basket) slot in alongside without collision.
+
+**Trend signal classification.** With ≥ 2 snapshots in the window, per category (and per SKU when computable) we compute `priceChangePct` and `inventoryChangePct` between the earliest and latest snapshot's `bestTrustedAvailableUnitPrice` and `totalTrustedAvailableInventory`, then label:
+
+| Signal | Rule |
+|---|---|
+| `possible_shortage` | price up (>+1%) AND trusted inventory down (<−5%) |
+| `easing_supply` | price down (<−1%) AND trusted inventory up (>+5%) |
+| `tight_but_unpriced` | price flat-or-down AND trusted inventory down materially (<−10%) |
+| `price_pressure_without_stock_signal` | price up AND inventory flat-or-up |
+| `mixed` | any other combination, or one side is null |
+| `insufficient_history` | <2 distinct dates in the window, or SKU only present in latest |
+
+Thresholds are conservative on purpose so a single noisy observation doesn't flip the signal. These are **coverage-based observations of what the data shows**, not predictions.
+
+**Future sources** that the schema is already shaped to absorb without breakage: DigiKey direct, Arrow direct, TI.com (representative-SKU sampling if scraping is blocked), expanded Octopart/Nexar coverage once a paid Nexar supply plan is in place.
+
+**What this phase does NOT do:**
+- It does not auto-capture. Capture is manual: `curl -X POST -H "X-Capture-Secret: <secret>" https://.../api/snapshots/capture`.
+- It does not replace the live row. Mouser flow and Phase 9 NX enrichment are unchanged.
+- It does not show shortage flags in the main table yet — the trend engine is ready, but it needs ≥2 snapshots before any classification appears, and the customer-facing surface for trend signals is a later phase.
+
 ## Local Development
 ```bash
 npm install

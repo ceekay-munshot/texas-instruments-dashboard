@@ -3,11 +3,26 @@ import { cors } from 'hono/cors'
 import { fetchNexarPart, normalizeNexarPart, notConfiguredResponse, errorResponse } from './sources/octopartNexar'
 import { TRUSTED_DISTRIBUTOR_LIST } from './data/sourceTypes'
 import { PHASE_8_BASKET_PREVIEW, BASKET_PREVIEW_MAX_CALLS, BASKET_PREVIEW_QUOTA_NOTE, BASKET_STATUS, type BasketCategory } from './data/tiBasket'
+import {
+  captureRepresentativeBasketSnapshot,
+  getLatestSnapshot,
+  getRecentSnapshots,
+  listSnapshotDates,
+  snapshotKey,
+  todayUtc,
+  type SnapshotKV,
+} from './sources/snapshotStore'
+import { computeTrends } from './sources/snapshotTrends'
+import { SNAPSHOT_SCHEMA_VERSION } from './data/snapshotSchema'
 
 type Bindings = {
   MOUSER_API_KEY: string
   NEXAR_CLIENT_ID?: string
   NEXAR_CLIENT_SECRET?: string
+  /** Shared secret for POST /api/snapshots/capture. */
+  SNAPSHOT_CAPTURE_SECRET?: string
+  /** Cloudflare KV binding for durable source-memory snapshots. */
+  SOURCE_SNAPSHOTS_KV?: SnapshotKV
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -755,6 +770,218 @@ app.get('/api/nexar/test', async (c) => {
     const message = String(e?.message || 'unknown error').slice(0, 200)
     return c.json(errorResponse(mpn, message), 502)
   }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 10 — persistent source-memory endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+// All four endpoints degrade gracefully when KV is not bound and never crash
+// the page. Read endpoints never trigger Nexar/Mouser fetches. Capture is
+// auth-gated and is the *only* path that calls Nexar fresh for a snapshot.
+
+const SNAPSHOT_HISTORY_MAX_DAYS = 90
+const SNAPSHOT_HISTORY_DEFAULT_DAYS = 30
+
+function clampHistoryDays(raw: string | undefined): number {
+  const parsed = parseInt(raw || `${SNAPSHOT_HISTORY_DEFAULT_DAYS}`, 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return SNAPSHOT_HISTORY_DEFAULT_DAYS
+  return Math.min(SNAPSHOT_HISTORY_MAX_DAYS, parsed)
+}
+
+function snapshotMemoryBaseEnv(env: Bindings) {
+  return {
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+    storageConfigured: !!env.SOURCE_SNAPSHOTS_KV,
+    captureSecretConfigured: !!env.SNAPSHOT_CAPTURE_SECRET,
+    nexarConfigured: !!(env.NEXAR_CLIENT_ID && env.NEXAR_CLIENT_SECRET),
+  }
+}
+
+// POST /api/snapshots/capture — gated by SNAPSHOT_CAPTURE_SECRET header or query.
+// One snapshot per UTC date by default. ?overwrite=true allows replacement.
+app.post('/api/snapshots/capture', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const overwrite = c.req.query('overwrite') === 'true'
+
+  // Storage missing → graceful not_configured (no auth check yet — there's
+  // nothing to write into).
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      success: false,
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      message: 'Bind SOURCE_SNAPSHOTS_KV in Cloudflare Pages → Settings → Functions → KV namespace bindings.',
+      ...base,
+    })
+  }
+
+  // Capture secret must be configured AND must match the request.
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      configured: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking capture.',
+      ...base,
+    })
+  }
+  const provided =
+    c.req.header('x-capture-secret') ||
+    c.req.header('X-Capture-Secret') ||
+    c.req.query('secret')
+  if (!provided || provided !== env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+
+  if (!env.NEXAR_CLIENT_ID || !env.NEXAR_CLIENT_SECRET) {
+    return c.json({
+      success: false,
+      configured: true,
+      status: 'nexar_not_configured',
+      message: 'Capture requires NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET to be set.',
+      ...base,
+    }, 502)
+  }
+
+  const date = todayUtc()
+  const key = snapshotKey(date)
+
+  if (!overwrite) {
+    const existing = await env.SOURCE_SNAPSHOTS_KV.get(key)
+    if (existing) {
+      return c.json({
+        success: false,
+        configured: true,
+        status: 'already_exists_for_today',
+        message: 'A snapshot already exists for today; pass ?overwrite=true to replace.',
+        snapshotDate: date,
+        key,
+        ...base,
+      })
+    }
+  }
+
+  let result
+  try {
+    result = await captureRepresentativeBasketSnapshot({
+      clientId: env.NEXAR_CLIENT_ID,
+      clientSecret: env.NEXAR_CLIENT_SECRET,
+    })
+  } catch (e: any) {
+    return c.json({
+      success: false,
+      configured: true,
+      status: 'capture_failed',
+      message: String(e?.message || 'unknown error').slice(0, 200),
+      ...base,
+    }, 502)
+  }
+
+  const { snapshot, callsUsed } = result
+  await env.SOURCE_SNAPSHOTS_KV.put(key, JSON.stringify(snapshot))
+
+  return c.json({
+    success: true,
+    configured: true,
+    status: 'stored',
+    snapshotDate: snapshot.snapshotDate,
+    stored: true,
+    overwritten: overwrite,
+    key,
+    categoryCount: snapshot.categoryCount,
+    skuCount: snapshot.skuCount,
+    callsUsed,
+    maxCalls: snapshot.maxCalls,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/latest
+app.get('/api/snapshots/latest', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      latestSnapshotDate: null,
+      snapshot: null,
+      ...base,
+    })
+  }
+  const snap = await getLatestSnapshot(env.SOURCE_SNAPSHOTS_KV)
+  if (!snap) {
+    return c.json({
+      configured: true,
+      status: 'no_snapshots',
+      latestSnapshotDate: null,
+      snapshot: null,
+      ...base,
+    })
+  }
+  return c.json({
+    configured: true,
+    status: 'ok',
+    latestSnapshotDate: snap.snapshotDate,
+    snapshot: snap,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/history?days=30  (max 90)
+app.get('/api/snapshots/history', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const days = clampHistoryDays(c.req.query('days'))
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      windowDays: days,
+      snapshotCount: 0,
+      snapshots: [],
+      ...base,
+    })
+  }
+  const snaps = await getRecentSnapshots(env.SOURCE_SNAPSHOTS_KV, days)
+  return c.json({
+    configured: true,
+    status: snaps.length > 0 ? 'ok' : 'no_snapshots',
+    windowDays: days,
+    snapshotCount: snaps.length,
+    snapshots: snaps,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/trends?days=30
+app.get('/api/snapshots/trends', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const days = clampHistoryDays(c.req.query('days'))
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      windowDays: days,
+      observationCount: 0,
+      categoryTrends: [],
+      ...base,
+    })
+  }
+  const snaps = await getRecentSnapshots(env.SOURCE_SNAPSHOTS_KV, days)
+  const trends = computeTrends(snaps, days)
+  return c.json({
+    configured: true,
+    status: trends.status,
+    windowDays: days,
+    observationCount: trends.observationCount,
+    firstDate: trends.firstDate,
+    latestDate: trends.latestDate,
+    categoryTrends: trends.categoryTrends,
+    ...base,
+  })
 })
 
 export default app

@@ -351,6 +351,9 @@ function App(){
   const [baselineMeta,setBaselineMeta]=useState(null);
   const [basketPreviewData,setBasketPreviewData]=useState(null);
   const [basketLoading,setBasketLoading]=useState(false);
+  // Phase 10: source-memory status (read-only, no capture trigger from UI).
+  const [snapshotMeta,setSnapshotMeta]=useState(null);
+  const [trendMeta,setTrendMeta]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -482,6 +485,38 @@ function App(){
   }, [push]);
 
   useEffect(() => { fetchBasketPreview(false); }, []);
+
+  // Phase 10: pull snapshot-memory status on mount. Read-only, never triggers
+  // a capture. Failures are silent — they only suppress the small status line.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [latestRes, trendsRes] = await Promise.allSettled([
+          fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
+          fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
+        ]);
+        if (cancelled) return;
+        if (latestRes.status === 'fulfilled' && latestRes.value) {
+          setSnapshotMeta({
+            configured: !!latestRes.value.configured,
+            status: latestRes.value.status,
+            latestSnapshotDate: latestRes.value.latestSnapshotDate || null,
+            schemaVersion: latestRes.value.schemaVersion,
+          });
+        }
+        if (trendsRes.status === 'fulfilled' && trendsRes.value) {
+          setTrendMeta({
+            status: trendsRes.value.status,
+            observationCount: trendsRes.value.observationCount,
+            firstDate: trendsRes.value.firstDate,
+            latestDate: trendsRes.value.latestDate,
+          });
+        }
+      } catch (_) { /* silent */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Quick lookup: returns the basket category record only when it has at
   // least one quoted SKU. Used to gate the NX marker and tooltip section.
@@ -624,6 +659,7 @@ function App(){
         <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
         <span style={{color:'#f0a84e',marginLeft:6}}>· LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
         <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
+        <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{trendMeta?` · Trend engine: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'insufficient history':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
       </div>
 
       {/* ── Signal Summary ── */}
