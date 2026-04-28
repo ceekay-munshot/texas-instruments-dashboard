@@ -500,6 +500,57 @@ Phase 15A grew the catalog to 14 SKUs but the daily Nexar quota cap (`BASKET_PRE
 
 **UI surface.** The legend status line becomes `Basket coverage: 4 / 14 sampled today · rotating coverage · full cycle ~3 days`. Inside an NX-marked tooltip, the snapshot-evidence section gains a one-line `Sampling policy: anchor + rotation`; for cells whose category is **not** sampled today, an amber line appears: `Watchlist category — next expected sample: YYYY-MM-DD`. No redesign.
 
+### Canonical TI taxonomy and free-source strategy (Phase 16A)
+
+A Nexar evaluation cap of 4 calls/day is the permanent ceiling — there is no paid-quota plan being pursued. To keep the dashboard honest about coverage, Phase 16A separates the **canonical TI taxonomy** (what the dashboard *claims* to monitor) from the **per-source coverage** (what each source actually fills in).
+
+**The 8 major groups and their 28 customer-facing subcategories** live in [`tiTaxonomy.ts`](webapp/src/data/tiTaxonomy.ts):
+
+| Group | Subcategories |
+|---|---|
+| Power Management (5) | LDO Regulators · AC/DC Switching · DC/DC Switching · Supervisor & Reset · Battery Mgmt |
+| Amplifiers (3) | Op-Amps · Instrumentation · Audio Amps |
+| Data Converters (2) | ADC · DAC |
+| Interface ICs (3) | CAN Transceivers · LIN Transceivers · Ethernet PHYs |
+| Isolation (2) | Digital Isolators · Reinforced Isolators |
+| Microcontrollers (5) | MSP430 · C2000 Real-Time · MSPM0 · SimpleLink · Sitara MPU |
+| GaN Power (3) | LMG342x (600V) · LMG3650 (TOLL) · LMG5200 (80V) |
+| Data Center Power (5) | 48V Bus Converters · Smart Power Stages · eFuses · Hot-Swap Controllers · TPS536xx (AI Power) |
+
+Each subcategory has a stable canonical id (e.g. `power_ldo`, `mcu_msp430`, `dc_tps536xx_ai_power`). Existing legacy ids (`pm_ldo`, `mcu_msp`, `dc_tps`, …) keep working — they map to the canonical id via `LEGACY_TO_CANONICAL` in `tiTaxonomy.ts`. New records carry both ids so historical snapshots remain readable.
+
+**Per-source coverage today:**
+
+| Source | Role | Coverage | Cost |
+|---|---|---|---|
+| Mouser | **Free full backbone** | All 28 subcategories daily; price + AvailabilityInStock + lead-time when Mouser exposes them | Free |
+| Nexar (Octopart) | **Sparse rotating corroboration** | 4 SKUs/day, anchor + UTC-day rotation across 7 categories | Evaluation quota only |
+| TI Direct | future | — | — |
+| DigiKey Direct | future | — | — |
+| Arrow Direct | future | — | — |
+
+**Source agreement is what the customer cares about — not raw coverage count.** A canonical subcategory is most trustworthy when both Mouser and Nexar return prices that agree within 5%; that is `strong_agreement`. 5–15% delta is `moderate_agreement`; >15% is `divergent`. When only one source has data, `single_source_only`. When neither has data yet, `insufficient_data`.
+
+**No fake history.** Mouser and Nexar snapshots are stored as raw observed data — never synthesized. Trends (shortage / easing) still require ≥2 dated snapshots and are gated behind the trends endpoint as before.
+
+**Endpoints (Phase 16A):**
+
+| Method | Path | Behavior |
+|---|---|---|
+| `GET` | `/api/ti/taxonomy` | **NEW.** The canonical taxonomy + a coverage rollup. Read-only; no external calls. |
+| `GET` | `/api/nexar/basket-coverage` | Adds a `taxonomyCoverage` block (which canonical subcategories the rep basket covers vs not) and a top-level `taxonomyVersion`. Still read-only. |
+| `POST` | `/api/snapshots/mouser/capture` | **NEW.** Free full Mouser backbone capture. Same `SNAPSHOT_CAPTURE_SECRET`. Stores under `source-snapshots/texas_instruments/mouser_direct/full_mouser_category_snapshot/YYYY-MM-DD`. Idempotent per UTC date; `?overwrite=true` replaces. |
+| `GET` | `/api/snapshots/mouser/latest` | **NEW.** Read-only; latest stored Mouser snapshot. |
+| `GET` | `/api/snapshots/mouser/history?days=30` | **NEW.** Window of stored Mouser snapshots (max 90 days). |
+| `GET` | `/api/snapshots/mouser/trends?days=30` | **NEW.** Reuses the existing trend engine over Mouser snapshots — `insufficient_history` until ≥2 dated snapshots. |
+| `GET` | `/api/snapshots/evidence/combined` | **NEW.** Combines latest Mouser + latest Nexar snapshots. Emits `sourceAgreement[]` per canonical subcategory with price delta, inventory delta, and `agreementStatus`. Includes `legacyToCanonical` so the UI can map cell ids to canonical ids without shipping the taxonomy module to the browser. |
+
+**Snapshot schema additions.** `Snapshot.mode` now accepts `'full_mouser_category_snapshot'`. Each `SnapshotCategory` carries an optional `canonicalCategoryId`. Older snapshots remain readable.
+
+**UI surface.** The legend gains a subtle line: `Taxonomy: 28 TI subcategories · Mouser backbone · Nexar rotating corroboration · Mouser snapshot YYYY-MM-DD · Nexar snapshot YYYY-MM-DD`. Inside the per-cell tooltip, when both sources have observed today, a "Combined source evidence" block appears with Mouser price, Nexar price, price delta %, inventory comparison, and the agreement status. Shortage/easing labels still require ≥2 dated snapshots — Phase 16A surfaces *agreement*, not direction.
+
+**GitHub Actions workflow.** [`.github/workflows/ti-snapshot-capture.yml`](.github/workflows/ti-snapshot-capture.yml) now runs Mouser capture *first*, then Nexar capture, in a single daily run (07:30 UTC). Mouser-first ordering means the dashboard always gets a complete daily backbone even if Nexar fails. Both treat `already_exists_for_today` as success. Total Nexar calls per day remains ≤ 4.
+
 ## Local Development
 ```bash
 npm install

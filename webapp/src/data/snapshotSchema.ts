@@ -44,6 +44,9 @@ export type SnapshotSku = {
 
 export type SnapshotCategory = {
   categoryId: string
+  /** Canonical TI taxonomy id (Phase 16A). Optional for backward compat with
+   *  pre-16A snapshots; resolve via canonicalCategoryId() in tiTaxonomy.ts. */
+  canonicalCategoryId?: string
   categoryLabel: string
   representativeSkuCount: number
   quotedSkuCount: number
@@ -66,7 +69,7 @@ export type Snapshot = {
   /** Source family for this row of snapshots. Today only octopart_nexar is
    * populated; future sources land as separate KV key prefixes. */
   source: 'octopart_nexar' | 'mouser_direct' | 'digikey_direct' | 'arrow_direct' | 'ti_direct'
-  mode: 'representative_basket_preview' | 'full_basket'
+  mode: 'representative_basket_preview' | 'full_basket' | 'full_mouser_category_snapshot'
   categoryCount: number
   skuCount: number
   callsUsed: number

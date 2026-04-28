@@ -40,17 +40,37 @@ export type SnapshotKV = {
 }
 
 // ── Key utilities ───────────────────────────────────────────────────────────
+// Phase 16A: keys are now parameterized by (source, mode). The Nexar
+// representative basket lives at:
+//     source-snapshots/texas_instruments/octopart_nexar/representative_basket_preview/YYYY-MM-DD
+// The Mouser full-category backbone lives at:
+//     source-snapshots/texas_instruments/mouser_direct/full_mouser_category_snapshot/YYYY-MM-DD
 
 const KEY_PREFIX = 'source-snapshots/texas_instruments/'
 const PRIMARY_SOURCE = 'octopart_nexar'
 const PRIMARY_MODE = 'representative_basket_preview'
 
+export const MOUSER_SOURCE = 'mouser_direct'
+export const MOUSER_MODE = 'full_mouser_category_snapshot'
+
 export function snapshotKey(date: string): string {
-  return `${KEY_PREFIX}${PRIMARY_SOURCE}/${PRIMARY_MODE}/${date}`
+  return snapshotKeyFor(PRIMARY_SOURCE, PRIMARY_MODE, date)
 }
 
 export function snapshotPrefix(): string {
-  return `${KEY_PREFIX}${PRIMARY_SOURCE}/${PRIMARY_MODE}/`
+  return snapshotPrefixFor(PRIMARY_SOURCE, PRIMARY_MODE)
+}
+
+export function snapshotKeyFor(source: string, mode: string, date: string): string {
+  return `${KEY_PREFIX}${source}/${mode}/${date}`
+}
+
+export function snapshotPrefixFor(source: string, mode: string): string {
+  return `${KEY_PREFIX}${source}/${mode}/`
+}
+
+export function mouserSnapshotKey(date: string): string {
+  return snapshotKeyFor(MOUSER_SOURCE, MOUSER_MODE, date)
 }
 
 /** UTC date in YYYY-MM-DD form. */
@@ -58,13 +78,16 @@ export function todayUtc(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
-// ── Read helpers ────────────────────────────────────────────────────────────
+// ── Generic read helpers (Phase 16A) ────────────────────────────────────────
 
-export async function listSnapshotDates(kv: SnapshotKV): Promise<string[]> {
-  const prefix = snapshotPrefix()
+export async function listSnapshotDatesFor(
+  kv: SnapshotKV,
+  source: string,
+  mode: string,
+): Promise<string[]> {
+  const prefix = snapshotPrefixFor(source, mode)
   const all: string[] = []
   let cursor: string | undefined = undefined
-  // Defensive paging cap; we'll never legitimately exceed a few hundred keys.
   for (let i = 0; i < 10; i++) {
     const page = await kv.list({ prefix, cursor })
     for (const k of page.keys) {
@@ -77,8 +100,13 @@ export async function listSnapshotDates(kv: SnapshotKV): Promise<string[]> {
   return all.sort()
 }
 
-export async function getSnapshot(kv: SnapshotKV, date: string): Promise<Snapshot | null> {
-  const raw = await kv.get(snapshotKey(date))
+export async function getSnapshotFor(
+  kv: SnapshotKV,
+  source: string,
+  mode: string,
+  date: string,
+): Promise<Snapshot | null> {
+  const raw = await kv.get(snapshotKeyFor(source, mode, date))
   if (!raw) return null
   try {
     return JSON.parse(raw) as Snapshot
@@ -87,28 +115,53 @@ export async function getSnapshot(kv: SnapshotKV, date: string): Promise<Snapsho
   }
 }
 
-export async function getLatestSnapshot(kv: SnapshotKV): Promise<Snapshot | null> {
-  const dates = await listSnapshotDates(kv)
+export async function getLatestSnapshotFor(
+  kv: SnapshotKV,
+  source: string,
+  mode: string,
+): Promise<Snapshot | null> {
+  const dates = await listSnapshotDatesFor(kv, source, mode)
   if (dates.length === 0) return null
-  const latest = dates[dates.length - 1]
-  return getSnapshot(kv, latest)
+  return getSnapshotFor(kv, source, mode, dates[dates.length - 1])
 }
 
-export async function getRecentSnapshots(
+export async function getRecentSnapshotsFor(
   kv: SnapshotKV,
+  source: string,
+  mode: string,
   days: number,
 ): Promise<Snapshot[]> {
-  const dates = await listSnapshotDates(kv)
+  const dates = await listSnapshotDatesFor(kv, source, mode)
   if (dates.length === 0) return []
   const cutoffMs = Date.now() - days * 86_400_000
   const cutoffStr = new Date(cutoffMs).toISOString().slice(0, 10)
   const wanted = dates.filter(d => d >= cutoffStr)
-  const settled = await Promise.allSettled(wanted.map(d => getSnapshot(kv, d)))
+  const settled = await Promise.allSettled(wanted.map(d => getSnapshotFor(kv, source, mode, d)))
   const out: Snapshot[] = []
   for (const r of settled) {
     if (r.status === 'fulfilled' && r.value) out.push(r.value)
   }
   return out
+}
+
+// ── Nexar-specific compatibility wrappers ───────────────────────────────────
+// Existing callers use these — they delegate to the generic helpers with the
+// Nexar source/mode pair. Kept named the same for backward compatibility.
+
+export async function listSnapshotDates(kv: SnapshotKV): Promise<string[]> {
+  return listSnapshotDatesFor(kv, PRIMARY_SOURCE, PRIMARY_MODE)
+}
+
+export async function getSnapshot(kv: SnapshotKV, date: string): Promise<Snapshot | null> {
+  return getSnapshotFor(kv, PRIMARY_SOURCE, PRIMARY_MODE, date)
+}
+
+export async function getLatestSnapshot(kv: SnapshotKV): Promise<Snapshot | null> {
+  return getLatestSnapshotFor(kv, PRIMARY_SOURCE, PRIMARY_MODE)
+}
+
+export async function getRecentSnapshots(kv: SnapshotKV, days: number): Promise<Snapshot[]> {
+  return getRecentSnapshotsFor(kv, PRIMARY_SOURCE, PRIMARY_MODE, days)
 }
 
 // ── Capture builder ─────────────────────────────────────────────────────────
@@ -219,6 +272,7 @@ function aggregateCategory(
 
   return {
     categoryId: cat.categoryId,
+    canonicalCategoryId: cat.canonicalCategoryId,
     categoryLabel: cat.categoryLabel,
     representativeSkuCount: cat.skus.length,
     quotedSkuCount: availablePrices.length,

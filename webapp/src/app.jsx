@@ -358,6 +358,8 @@ function App(){
   const [evidenceData,setEvidenceData]=useState(null);
   // Phase 15A: full basket-coverage catalog (read-only, no Nexar calls).
   const [coverageData,setCoverageData]=useState(null);
+  // Phase 16A: combined Mouser + Nexar evidence (read-only, no Nexar calls).
+  const [combinedEvidence,setCombinedEvidence]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -497,11 +499,12 @@ function App(){
     let cancelled = false;
     (async () => {
       try {
-        const [latestRes, trendsRes, evidenceRes, coverageRes] = await Promise.allSettled([
+        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes] = await Promise.allSettled([
           fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/nexar/basket-coverage').then(r => r.ok ? r.json() : null),
+          fetch('/api/snapshots/evidence/combined').then(r => r.ok ? r.json() : null),
         ]);
         if (cancelled) return;
         if (latestRes.status === 'fulfilled' && latestRes.value) {
@@ -526,6 +529,9 @@ function App(){
         if (coverageRes.status === 'fulfilled' && coverageRes.value) {
           setCoverageData(coverageRes.value);
         }
+        if (combinedRes.status === 'fulfilled' && combinedRes.value) {
+          setCombinedEvidence(combinedRes.value);
+        }
       } catch (_) { /* silent */ }
     })();
     return () => { cancelled = true; };
@@ -544,6 +550,17 @@ function App(){
     const cats = coverageData?.categories;
     if (!cats) return null;
     return cats.find(c => c.categoryId === catId) || null;
+  }
+
+  // Phase 16A: per-canonical-subcategory combined-evidence row (Mouser + Nexar).
+  // Cell IDs are Mouser PART_MAP legacy ids; resolve to canonical via the
+  // legacyToCanonical map embedded in the combined-evidence response.
+  function combinedAgreementFor(catId) {
+    const rows = combinedEvidence?.sourceAgreement;
+    if (!rows) return null;
+    const map = combinedEvidence?.legacyToCanonical || {};
+    const canonicalId = map[catId] || catId;
+    return rows.find(r => r.canonicalCategoryId === canonicalId) || null;
   }
 
   // Quick lookup: returns the basket category record only when it has at
@@ -588,7 +605,8 @@ function App(){
     const d=liveData?.[catId];
     const basket=basketCatFor(catId);
     const evid=evidenceCatFor(catId);
-    if(!d&&!basket&&!evid)return null; // nothing to show
+    const agree=combinedAgreementFor(catId);
+    if(!d&&!basket&&!evid&&!agree)return null; // nothing to show
     const cat=CATS.find(c=>c.id===catId);
     // Source confidence (coverage, not direction confirmation):
     //   multi-source → ≥2 trusted distributors with quoted available offers
@@ -657,6 +675,32 @@ function App(){
           </div>
         );
       })()}
+      {agree&&(combinedEvidence?.latestMouserSnapshotDate||combinedEvidence?.latestNexarSnapshotDate)&&(()=>{
+        const aColor = agree.agreementStatus==='strong_agreement'?'#4dffc3'
+                    : agree.agreementStatus==='moderate_agreement'?'#00c9a7'
+                    : agree.agreementStatus==='divergent'?'#f0a84e'
+                    : agree.agreementStatus==='single_source_only'?'#7a96b8'
+                    : '#4a6a8a';
+        const aLabel = agree.agreementStatus.replace(/_/g,' ');
+        return (
+          <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
+            <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
+              Combined source evidence
+              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· Mouser backbone + Nexar rotating</span>
+            </div>
+            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
+              {combinedEvidence?.latestMouserSnapshotDate&&<div>Mouser latest: {combinedEvidence.latestMouserSnapshotDate}</div>}
+              {combinedEvidence?.latestNexarSnapshotDate&&<div>Nexar latest: {combinedEvidence.latestNexarSnapshotDate}</div>}
+              <div>Agreement: <span style={{color:aColor,fontWeight:'bold'}}>{aLabel}</span></div>
+              {agree.mouserPrice!=null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar ${agree.nexarTrustedPrice.toFixed(4)} · Δ {agree.priceDeltaPct!=null?`${agree.priceDeltaPct>0?'+':''}${agree.priceDeltaPct}%`:'—'}</div>}
+              {agree.mouserPrice!=null&&agree.nexarTrustedPrice==null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar —</div>}
+              {agree.mouserPrice==null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser — · Nexar ${agree.nexarTrustedPrice.toFixed(4)}</div>}
+              {(agree.mouserInventory!=null||agree.nexarTrustedInventory!=null)&&<div>Inventory: Mouser {(agree.mouserInventory||0).toLocaleString()} · Nexar {(agree.nexarTrustedInventory||0).toLocaleString()}{agree.inventoryDeltaPct!=null?` · Δ ${agree.inventoryDeltaPct>0?'+':''}${agree.inventoryDeltaPct}%`:''}</div>}
+              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Source agreement only — shortage/easing labels still gated by ≥2 dated snapshots.</div>
+            </div>
+          </div>
+        );
+      })()}
     </>;
   }
 
@@ -717,6 +761,7 @@ function App(){
         <span style={{color:'#f0a84e',marginLeft:6}}>· LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
         <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
         <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{evidenceData?.evidence?` · Source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`:''}{evidenceData?.coverage?` · Basket coverage: ${evidenceData.coverage.sampledSkuCount} / ${evidenceData.coverage.basketCatalogSkuCount} sampled today${evidenceData.coverage.samplingPolicy==='anchor_plus_rotation'?' · rotating coverage':''}${evidenceData.coverage.estimatedFullCycleDays?` · full cycle ~${evidenceData.coverage.estimatedFullCycleDays} days`:''}`:''}{trendMeta?` · Trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
+        <span style={{color:'#7a96b8',marginLeft:6}}>· Taxonomy: 28 TI subcategories · Mouser backbone · Nexar rotating corroboration{combinedEvidence?.latestMouserSnapshotDate?` · Mouser snapshot ${combinedEvidence.latestMouserSnapshotDate}`:''}{combinedEvidence?.latestNexarSnapshotDate?` · Nexar snapshot ${combinedEvidence.latestNexarSnapshotDate}`:''}</span>
       </div>
 
       {/* ── Signal Summary ── */}

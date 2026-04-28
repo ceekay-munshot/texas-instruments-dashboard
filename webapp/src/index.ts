@@ -10,11 +10,38 @@ import {
   listSnapshotDates,
   snapshotKey,
   todayUtc,
+  MOUSER_SOURCE,
+  MOUSER_MODE,
+  mouserSnapshotKey,
+  getLatestSnapshotFor,
+  getRecentSnapshotsFor,
+  listSnapshotDatesFor,
   type SnapshotKV,
 } from './sources/snapshotStore'
 import { computeTrends } from './sources/snapshotTrends'
 import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
-import { SNAPSHOT_SCHEMA_VERSION } from './data/snapshotSchema'
+import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
+import {
+  PART_MAP,
+  BASELINES,
+  BASELINE_DATE,
+  BASELINE_PERIOD_LABEL,
+  BASELINE_LABEL,
+  BASELINE_DISPLAY,
+  BASELINE_DESCRIPTION,
+  BASELINE_ROLLOVER_POLICY,
+  BASELINE_REVIEW_AFTER_DAYS,
+} from './data/mouserCatalog'
+import {
+  TI_TAXONOMY,
+  TI_TAXONOMY_FLAT,
+  TI_TAXONOMY_GROUP_COUNT,
+  TI_TAXONOMY_SUBCATEGORY_COUNT,
+  TI_TAXONOMY_VERSION,
+  canonicalCategoryId,
+  summarizeTaxonomyCoverage,
+} from './data/tiTaxonomy'
+import { captureMouserSnapshot } from './sources/mouserSnapshotCapture'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -30,90 +57,10 @@ const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('/api/*', cors())
 
-// ── PART MAP — primary + fallback per category ────────────────────────────────
-const PART_MAP: Record<string, { label: string; parts: string[] }> = {
-  pm_ldo:    { label: 'LDO Regulators',       parts: ['TPS7A8300RGWR','TPS7A4501DCQR'] },
-  pm_acdc:   { label: 'AC/DC Switching',       parts: ['UCC28180D','UCC28C40DR'] },
-  pm_dcdc:   { label: 'DC/DC Switching',       parts: ['TPS54360BDDA','LM5176PWPR'] },
-  pm_super:  { label: 'Supervisor & Reset',    parts: ['TPS3839G33DQNR','TPS3700DDCR2'] },
-  pm_batt:   { label: 'Battery Mgmt',          parts: ['BQ25896RTWT','BQ76952PFBR'] },
-  amp_op:    { label: 'Op-Amps',               parts: ['OPA376AIDBVR','TLV2372IDGKR'] },
-  amp_instr: { label: 'Instrumentation',       parts: ['INA826AIDR','INA333AIDR'] },
-  amp_audio: { label: 'Audio Amps',            parts: ['TPA3118D2DAPR','LM4871M/NOPB'] },
-  dac_adc:   { label: 'ADC',                   parts: ['ADS1115IRUGR','ADS8685IPW'] },
-  dac_dac:   { label: 'DAC',                   parts: ['DAC8552IDGK','DAC60508ZCRTET'] },
-  if_can:    { label: 'CAN Transceivers',      parts: ['TCAN1042DRBTQ1','TCAN1051DRQ1'] },
-  if_lin:    { label: 'LIN Transceivers',      parts: ['TLIN1021DRBRQ1','SN65HVDA100DR'] },
-  if_eth:    { label: 'Ethernet PHYs',         parts: ['DP83867IRRGZR','DP83826ERHBR'] },
-  iso_dig:   { label: 'Digital Isolators',     parts: ['ISO7742DWR','ISO1541DWR'] },
-  iso_rein:  { label: 'Reinforced Isolators',  parts: ['ISO7042CDWR','ISO5852SQDWRQ1'] },
-  mcu_msp:   { label: 'MSP430',                parts: ['MSP430FR2355TRHAT','MSP430G2553IPW28R'] },
-  mcu_c2k:   { label: 'C2000 Real-Time',       parts: ['TMS320F28035PNT','TMS320F280049CPMS'] },
-  mcu_m0:    { label: 'MSPM0',                 parts: ['MSPM0G3507SPTR','MSPM0L1306SRHAR'] },
-  mcu_cc:    { label: 'SimpleLink',            parts: ['CC2652R1FRGZR','CC2640R2FRGZR'] },
-  mcu_sit:   { label: 'Sitara MPU',            parts: ['AM3352BZCZD80','AM3359BZCZD80'] },
-  gan_342:   { label: 'LMG342x (600V)',        parts: ['LMG3422R030RQZT','LMG3410R070RJZR'] },
-  gan_365:   { label: 'LMG3650 (TOLL)',        parts: ['LMG3652R070KLAR','LMG3650R070KLAR'] },  // LMG3652 has unit pricing; LMG3650 is reel-only (min=2000)
-  gan_520:   { label: 'LMG5200 (80V)',         parts: ['LMG5200MOFT','LMG5350R070YFFT'] },
-  dc_48v:    { label: '48V Bus Converters',    parts: ['LM5180NGUR','LM25180RNXR'] },
-  dc_sps:    { label: 'Smart Power Stages',    parts: ['TPS53688RSBT','TPS53689RSBR'] },
-  dc_efuse:  { label: 'eFuses',                parts: ['TPS2595DRCR','TPS25940ARVCR'] },
-  dc_hswap:  { label: 'Hot-Swap Controllers',  parts: ['TPS23861PW','TPS2484PWR'] },
-  dc_tps:    { label: 'TPS536xx (AI Power)',   parts: ['TPS53622RSLR','TPS53681RSBT'] },
-}
-
-// ── BASELINES — Mouser qty=1 unit prices, post-Q1-26-close snapshot (USD) ─────
-// Methodology: qty=1 price break, INR→USD at ₹83.5, verified via direct API call.
-// Captured: 28-Apr-2026 — closest practical proxy for Q1-26 close (Q1 ended
-// 31-Mar-2026; capture window ~28 days post-close).
-// Live-row math: QoQ % = (live_price - baseline) / baseline * 100
-// Rollover policy: at the next end-of-quarter cutoff, replace these with the
-// next-quarter close prices and advance BASELINE_DATE / BASELINE_PERIOD_LABEL.
-// Previous baseline (replaced 2026-04-28): 27-Feb-2026 mid-Q1 partial snapshot.
-const BASELINES: Record<string, number> = {
-  pm_ldo:    7.0861,   // TPS7A8300RGWR    qty=1
-  pm_acdc:   2.0086,   // UCC28180D        qty=1
-  pm_dcdc:   5.9368,   // TPS54360BDDA     qty=1
-  pm_super:  0.8704,   // TPS3839G33DQNR   qty=1
-  pm_batt:   5.4346,   // BQ25896RTWT      qty=1
-  amp_op:    2.1983,   // OPA376AIDBVR     qty=1
-  amp_instr: 3.7607,   // INA826AIDR       qty=1
-  amp_audio: 1.9305,   // TPA3118D2DAPR    qty=1
-  dac_adc:   5.7135,   // ADS1115IRUGR     qty=1
-  dac_dac:   22.2963,  // DAC60508ZCRTET   qty=1
-  if_can:    2.7898,   // TCAN1042DRBTQ1   qty=1
-  if_lin:    1.7966,   // TLIN1021DRBRQ1   qty=1
-  if_eth:    8.0459,   // DP83867IRRGZR    qty=1
-  iso_dig:   3.4036,   // ISO7742DWR       qty=1
-  iso_rein:  7.5326,   // ISO5852SQDWRQ1   qty=1
-  mcu_msp:   4.9770,   // MSP430FR2355TRHAT qty=1
-  mcu_c2k:   16.1921,  // TMS320F28035PNT  qty=1
-  mcu_m0:    2.7451,   // MSPM0G3507SPTR   qty=1
-  mcu_cc:    10.0545,  // CC2652R1FRGZR    qty=1
-  mcu_sit:   14.8976,  // AM3352BZCZD80    qty=1
-  gan_342:   30.2640,  // LMG3422R030RQZT  qty=1
-  gan_365:   9.4743,   // LMG3650R070KLAR  qty=2000 (reel; no unit break)
-  gan_520:   18.9485,  // LMG5200MOFT      qty=1
-  dc_48v:    5.0552,   // LM5180NGUR       qty=1
-  dc_sps:    14.8307,  // TPS53688RSBT     qty=1
-  dc_efuse:  2.7898,   // TPS25940ARVCR    qty=1
-  dc_hswap:  5.1222,   // TPS23861PW       qty=1
-  dc_tps:    13.4134,  // TPS53681RSBT     qty=1
-}
-
-// ── Baseline metadata ────────────────────────────────────────────────────────
-// The dashboard is fundamentally a quarter-over-quarter monitor. The live row
-// compares current Mouser spot prices against the "latest baseline" — the most
-// recent controlled snapshot. Rolling the baseline forward at the end of a
-// quarter is a manual operation: capture new prices, update BASELINES + the
-// constants below in a single PR.
-const BASELINE_DATE = '2026-04-28'
-const BASELINE_PERIOD_LABEL = 'Q1-26 close'
-const BASELINE_LABEL = 'Latest baseline'
-const BASELINE_DISPLAY = 'Q1-26 close · captured 28-Apr-26'
-const BASELINE_DESCRIPTION = 'Q1-26 close baseline used for live spot-price comparison; live row tracks Q2-26 movement vs this anchor'
-const BASELINE_ROLLOVER_POLICY = 'Manual rollover after controlled quarterly baseline capture'
-const BASELINE_REVIEW_AFTER_DAYS = 90
+// ── PART_MAP / BASELINES live in webapp/src/data/mouserCatalog.ts ────────────
+// Both the live /api/prices row and the new Mouser daily-snapshot backbone
+// (Phase 16A) read from the same constants there. Keeping that data in a
+// dedicated module avoids duplicate sources of truth.
 
 function getBaselineMeta() {
   const baselineMs = Date.parse(BASELINE_DATE)
@@ -499,6 +446,36 @@ app.get('/api/sources/status', (c) => {
 // secrets are missing, returns { configured: false, status: 'not_configured' }.
 // Errors are sanitized — credentials, raw GraphQL bodies, and stack traces are
 // never echoed to the client.
+// ── Phase 16A — canonical TI taxonomy (read-only) ────────────────────────────
+// Single source of truth for the 8 major TI groups and 28 customer-facing
+// subcategories. No external calls; no Nexar; safe for page-load fetch.
+app.get('/api/ti/taxonomy', (c) => {
+  // Subcategories the rotating Nexar basket recognizes today (canonical IDs).
+  const repBasketCanonicalIds = Array.from(
+    new Set(
+      PHASE_8_BASKET_PREVIEW.map(b =>
+        b.canonicalCategoryId ?? canonicalCategoryId(b.categoryId),
+      ),
+    ),
+  )
+  const coverageSummary = summarizeTaxonomyCoverage({
+    representativeBasketSubcategories: repBasketCanonicalIds,
+  })
+  return c.json({
+    taxonomyVersion: TI_TAXONOMY_VERSION,
+    groupCount: TI_TAXONOMY_GROUP_COUNT,
+    subcategoryCount: TI_TAXONOMY_SUBCATEGORY_COUNT,
+    groups: TI_TAXONOMY,
+    coverageSummary,
+    notes: [
+      'Mouser is the full free backbone — no paid quota required.',
+      'Nexar is sparse rotating corroboration, capped at 4 calls/day.',
+      'TI Direct, DigiKey Direct, and Arrow Direct are roadmap (future).',
+      'Broker inventory is excluded from the core trust signal.',
+    ],
+  })
+})
+
 // ── Phase 15A/15B — basket coverage (read-only catalog reflection) ───────────
 // Returns the full representative TI basket catalog plus today's sampling
 // plan and a 7-day forward rotation preview. Never calls Nexar, never
@@ -576,6 +553,31 @@ app.get('/api/nexar/basket-coverage', (c) => {
       })),
     }
   })
+  // Phase 16A — taxonomyCoverage block: how the representative basket maps to
+  // the canonical 28-subcategory taxonomy. No external calls.
+  const repBasketCanonicalIds = Array.from(
+    new Set(
+      PHASE_8_BASKET_PREVIEW.map(b =>
+        b.canonicalCategoryId ?? canonicalCategoryId(b.categoryId),
+      ),
+    ),
+  )
+  const taxonomyCanonicalIds = TI_TAXONOMY_FLAT.map(s => s.categoryId)
+  const coveredCanonicalSubcategories = repBasketCanonicalIds.filter(id =>
+    taxonomyCanonicalIds.includes(id),
+  )
+  const uncoveredCanonicalSubcategories = taxonomyCanonicalIds.filter(
+    id => !coveredCanonicalSubcategories.includes(id),
+  )
+  const taxonomyCoverage = {
+    canonicalSubcategoryCount: TI_TAXONOMY_SUBCATEGORY_COUNT,
+    representativeBasketSubcategoryCount: coveredCanonicalSubcategories.length,
+    representativeBasketCoveragePct: TI_TAXONOMY_SUBCATEGORY_COUNT > 0
+      ? Math.round((coveredCanonicalSubcategories.length / TI_TAXONOMY_SUBCATEGORY_COUNT) * 1000) / 10
+      : 0,
+    coveredCanonicalSubcategories,
+    uncoveredCanonicalSubcategories,
+  }
   return c.json({
     configured: true,
     status: 'ok' as const,
@@ -595,6 +597,8 @@ app.get('/api/nexar/basket-coverage', (c) => {
     anchorSlots: sampling.anchorSlots,
     estimatedFullCycleDays: sampling.estimatedFullCycleDays,
     nextRotationPreview: preview,
+    taxonomyCoverage,
+    taxonomyVersion: TI_TAXONOMY_VERSION,
     quotaNote: BASKET_PREVIEW_QUOTA_NOTE,
     expansionNote: 'Daily cap stays at 4 to respect the Nexar Evaluation quota. Anchor SKUs are sampled every day for continuity; the remaining slots rotate through secondary/watchlist categories deterministically by UTC date so unsampled categories build observed history over time. nextRotationPreview is a planned simulation only — not observed data.',
     categories,
@@ -1109,6 +1113,246 @@ app.get('/api/snapshots/trends', async (c) => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 16A — Mouser daily-snapshot backbone (free, no paid quota required)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function mouserCanonicalCoverageSummary(snap: Snapshot | null) {
+  if (!snap) return null
+  const ok = (snap.categories || []).filter(c => (c.quotedSkuCount ?? 0) > 0)
+  const okCanonical = Array.from(
+    new Set(
+      ok.map(c => c.canonicalCategoryId ?? canonicalCategoryId(c.categoryId)),
+    ),
+  )
+  const missingCanonical = TI_TAXONOMY_FLAT.map(s => s.categoryId).filter(
+    id => !okCanonical.includes(id),
+  )
+  return {
+    canonicalSubcategoryCount: TI_TAXONOMY_SUBCATEGORY_COUNT,
+    mouserCoveredCanonicalSubcategories: okCanonical,
+    mouserCoveredCount: okCanonical.length,
+    mouserMissingCanonicalSubcategories: missingCanonical,
+    mouserMissingCount: missingCanonical.length,
+  }
+}
+
+// POST /api/snapshots/mouser/capture — gated by SNAPSHOT_CAPTURE_SECRET (same secret as Nexar).
+// One Mouser snapshot per UTC date; ?overwrite=true allows replacement.
+// Stores under: source-snapshots/texas_instruments/mouser_direct/full_mouser_category_snapshot/YYYY-MM-DD
+app.post('/api/snapshots/mouser/capture', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const overwrite = c.req.query('overwrite') === 'true'
+
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      success: false,
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      message: 'Bind SOURCE_SNAPSHOTS_KV before invoking Mouser capture.',
+      ...base,
+    })
+  }
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      configured: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking capture.',
+      ...base,
+    })
+  }
+  const providedRaw =
+    c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.MOUSER_API_KEY) {
+    return c.json({
+      success: false,
+      configured: true,
+      status: 'mouser_not_configured',
+      message: 'Mouser capture requires MOUSER_API_KEY to be set.',
+      ...base,
+    }, 502)
+  }
+
+  const date = todayUtc()
+  const key = mouserSnapshotKey(date)
+
+  if (!overwrite) {
+    const existing = await env.SOURCE_SNAPSHOTS_KV.get(key)
+    if (existing) {
+      let parsed: Snapshot | null = null
+      try { parsed = JSON.parse(existing) } catch { parsed = null }
+      return c.json({
+        success: true, // idempotent — same as Nexar
+        configured: true,
+        status: 'already_exists_for_today',
+        message: 'A Mouser snapshot already exists for today; pass ?overwrite=true to replace.',
+        snapshotDate: date,
+        key,
+        source: MOUSER_SOURCE,
+        noPaidQuotaRequired: true,
+        canonicalCoverageSummary: mouserCanonicalCoverageSummary(parsed),
+        ...base,
+      })
+    }
+  }
+
+  let result
+  try {
+    result = await captureMouserSnapshot({
+      apiKey: env.MOUSER_API_KEY,
+      snapshotDate: date,
+    })
+  } catch (e: any) {
+    return c.json({
+      success: false,
+      configured: true,
+      status: 'capture_failed',
+      message: String(e?.message || 'unknown error').slice(0, 200),
+      ...base,
+    }, 502)
+  }
+
+  const { snapshot, callsUsed, okCategoryCount, rateLimitedCategoryCount, errorCategoryCount } = result
+  await env.SOURCE_SNAPSHOTS_KV.put(key, JSON.stringify(snapshot))
+
+  return c.json({
+    success: true,
+    configured: true,
+    status: 'stored',
+    snapshotDate: snapshot.snapshotDate,
+    stored: true,
+    overwritten: overwrite,
+    key,
+    source: MOUSER_SOURCE,
+    mode: MOUSER_MODE,
+    noPaidQuotaRequired: true,
+    categoryCount: snapshot.categoryCount,
+    skuCount: snapshot.skuCount,
+    callsUsed,
+    okCategoryCount,
+    rateLimitedCategoryCount,
+    errorCategoryCount,
+    canonicalCoverageSummary: mouserCanonicalCoverageSummary(snapshot),
+    ...base,
+  })
+})
+
+// GET /api/snapshots/mouser/latest
+app.get('/api/snapshots/mouser/latest', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      latestSnapshotDate: null,
+      snapshot: null,
+      source: MOUSER_SOURCE,
+      ...base,
+    })
+  }
+  const snap = await getLatestSnapshotFor(
+    env.SOURCE_SNAPSHOTS_KV,
+    MOUSER_SOURCE,
+    MOUSER_MODE,
+  )
+  if (!snap) {
+    return c.json({
+      configured: true,
+      status: 'no_snapshots',
+      latestSnapshotDate: null,
+      snapshot: null,
+      source: MOUSER_SOURCE,
+      ...base,
+    })
+  }
+  return c.json({
+    configured: true,
+    status: 'ok',
+    latestSnapshotDate: snap.snapshotDate,
+    snapshot: snap,
+    source: MOUSER_SOURCE,
+    canonicalCoverageSummary: mouserCanonicalCoverageSummary(snap),
+    ...base,
+  })
+})
+
+// GET /api/snapshots/mouser/history?days=30 (max 90)
+app.get('/api/snapshots/mouser/history', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const days = clampHistoryDays(c.req.query('days'))
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      windowDays: days,
+      snapshotCount: 0,
+      snapshots: [],
+      source: MOUSER_SOURCE,
+      ...base,
+    })
+  }
+  const snaps = await getRecentSnapshotsFor(
+    env.SOURCE_SNAPSHOTS_KV,
+    MOUSER_SOURCE,
+    MOUSER_MODE,
+    days,
+  )
+  return c.json({
+    configured: true,
+    status: snaps.length > 0 ? 'ok' : 'no_snapshots',
+    windowDays: days,
+    snapshotCount: snaps.length,
+    snapshots: snaps,
+    source: MOUSER_SOURCE,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/mouser/trends?days=30
+app.get('/api/snapshots/mouser/trends', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const days = clampHistoryDays(c.req.query('days'))
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      windowDays: days,
+      observationCount: 0,
+      categoryTrends: [],
+      source: MOUSER_SOURCE,
+      ...base,
+    })
+  }
+  const snaps = await getRecentSnapshotsFor(
+    env.SOURCE_SNAPSHOTS_KV,
+    MOUSER_SOURCE,
+    MOUSER_MODE,
+    days,
+  )
+  const trends = computeTrends(snaps, days)
+  return c.json({
+    configured: true,
+    status: trends.status,
+    windowDays: days,
+    observationCount: trends.observationCount,
+    firstDate: trends.firstDate,
+    latestDate: trends.latestDate,
+    categoryTrends: trends.categoryTrends,
+    source: MOUSER_SOURCE,
+    ...base,
+  })
+})
+
 // GET /api/snapshots/evidence/latest — current-source evidence layer (Phase 14A).
 // Reads the latest snapshot only. Never calls Nexar, never triggers capture.
 // Pairs with /api/snapshots/trends so the UI can show evidence today AND keep
@@ -1197,5 +1441,178 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
     ...base,
   })
 })
+
+// ── Phase 16A — combined Mouser + Nexar evidence ─────────────────────────────
+// Reads BOTH the latest Mouser full snapshot and the latest Nexar rotating
+// snapshot; computes a per-canonical-subcategory agreement table. Read-only,
+// never calls Nexar, never triggers capture.
+app.get('/api/snapshots/evidence/combined', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+
+  const repBasketCanonicalIds = Array.from(
+    new Set(
+      PHASE_8_BASKET_PREVIEW.map(b =>
+        b.canonicalCategoryId ?? canonicalCategoryId(b.categoryId),
+      ),
+    ),
+  )
+  const taxonomyCoverage = summarizeTaxonomyCoverage({
+    representativeBasketSubcategories: repBasketCanonicalIds,
+  })
+
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      latestMouserSnapshotDate: null,
+      latestNexarSnapshotDate: null,
+      taxonomyCoverage,
+      mouserCoverage: null,
+      nexarCoverage: null,
+      combinedCoverage: null,
+      sourceAgreement: [],
+      notes: COMBINED_EVIDENCE_NOTES,
+      ...base,
+    })
+  }
+
+  const [mouserSnap, nexarSnap] = await Promise.all([
+    getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, MOUSER_SOURCE, MOUSER_MODE),
+    getLatestSnapshot(env.SOURCE_SNAPSHOTS_KV),
+  ])
+
+  // Build per-canonical lookups.
+  const mouserByCanonical = new Map<string, { categoryLabel: string; price: number | null; inventory: number }>()
+  for (const cat of mouserSnap?.categories ?? []) {
+    const id = cat.canonicalCategoryId ?? canonicalCategoryId(cat.categoryId)
+    mouserByCanonical.set(id, {
+      categoryLabel: cat.categoryLabel,
+      price: cat.avgBestTrustedAvailableUnitPrice ?? cat.medianBestTrustedAvailableUnitPrice ?? null,
+      inventory: cat.totalTrustedAvailableInventory ?? 0,
+    })
+  }
+  const nexarByCanonical = new Map<string, { categoryLabel: string; price: number | null; inventory: number }>()
+  for (const cat of nexarSnap?.categories ?? []) {
+    const id = cat.canonicalCategoryId ?? canonicalCategoryId(cat.categoryId)
+    nexarByCanonical.set(id, {
+      categoryLabel: cat.categoryLabel,
+      price: cat.avgBestTrustedAvailableUnitPrice ?? cat.medianBestTrustedAvailableUnitPrice ?? null,
+      inventory: cat.totalTrustedAvailableInventory ?? 0,
+    })
+  }
+
+  const sourceAgreement = TI_TAXONOMY_FLAT.map(sub => {
+    const m = mouserByCanonical.get(sub.categoryId) ?? null
+    const n = nexarByCanonical.get(sub.categoryId) ?? null
+    let priceDeltaPct: number | null = null
+    if (m?.price != null && n?.price != null && m.price > 0) {
+      priceDeltaPct = Math.round(((n.price - m.price) / m.price) * 1000) / 10
+    }
+    let inventoryDeltaPct: number | null = null
+    if (m && n && m.inventory > 0) {
+      inventoryDeltaPct = Math.round(((n.inventory - m.inventory) / m.inventory) * 1000) / 10
+    }
+    let agreementStatus:
+      | 'strong_agreement'
+      | 'moderate_agreement'
+      | 'divergent'
+      | 'single_source_only'
+      | 'insufficient_data' = 'insufficient_data'
+    if (m && n && m.price != null && n.price != null) {
+      const absPct = Math.abs(priceDeltaPct ?? 0)
+      if (absPct <= 5) agreementStatus = 'strong_agreement'
+      else if (absPct <= 15) agreementStatus = 'moderate_agreement'
+      else agreementStatus = 'divergent'
+    } else if ((m && m.price != null) || (n && n.price != null)) {
+      agreementStatus = 'single_source_only'
+    }
+    return {
+      canonicalCategoryId: sub.categoryId,
+      categoryLabel: sub.categoryLabel,
+      groupId: sub.groupId,
+      groupLabel: sub.groupLabel,
+      mouserPrice: m?.price ?? null,
+      nexarTrustedPrice: n?.price ?? null,
+      priceDeltaPct,
+      mouserInventory: m?.inventory ?? null,
+      nexarTrustedInventory: n?.inventory ?? null,
+      inventoryDeltaPct,
+      agreementStatus,
+    }
+  })
+
+  const mouserCoverage = mouserSnap
+    ? mouserCanonicalCoverageSummary(mouserSnap)
+    : null
+  const nexarCoverage = nexarSnap
+    ? {
+        canonicalSubcategoryCount: TI_TAXONOMY_SUBCATEGORY_COUNT,
+        nexarSampledCanonicalSubcategories: Array.from(
+          new Set(
+            (nexarSnap.categories ?? []).map(c =>
+              c.canonicalCategoryId ?? canonicalCategoryId(c.categoryId),
+            ),
+          ),
+        ),
+      }
+    : null
+
+  const combinedCanonicalIds = Array.from(
+    new Set([
+      ...(mouserCoverage?.mouserCoveredCanonicalSubcategories ?? []),
+      ...(nexarCoverage?.nexarSampledCanonicalSubcategories ?? []),
+    ]),
+  )
+  const combinedCoverage = {
+    canonicalSubcategoryCount: TI_TAXONOMY_SUBCATEGORY_COUNT,
+    coveredAnySource: combinedCanonicalIds.length,
+    coveredBothSources: sourceAgreement.filter(
+      r => r.mouserPrice != null && r.nexarTrustedPrice != null,
+    ).length,
+    coveredCanonicalSubcategories: combinedCanonicalIds,
+  }
+
+  const status =
+    !mouserSnap && !nexarSnap
+      ? 'no_snapshots'
+      : !mouserSnap
+        ? 'nexar_only'
+        : !nexarSnap
+          ? 'mouser_only'
+          : 'ok'
+
+  // Embed the legacy → canonical map so clients can resolve cell IDs without
+  // having to ship the taxonomy module to the browser.
+  const legacyToCanonical: Record<string, string> = {}
+  for (const id of Object.keys(PART_MAP)) {
+    legacyToCanonical[id] = canonicalCategoryId(id)
+  }
+  for (const b of PHASE_8_BASKET_PREVIEW) {
+    legacyToCanonical[b.categoryId] = b.canonicalCategoryId ?? canonicalCategoryId(b.categoryId)
+  }
+
+  return c.json({
+    configured: true,
+    status,
+    latestMouserSnapshotDate: mouserSnap?.snapshotDate ?? null,
+    latestNexarSnapshotDate: nexarSnap?.snapshotDate ?? null,
+    taxonomyCoverage,
+    mouserCoverage,
+    nexarCoverage,
+    combinedCoverage,
+    sourceAgreement,
+    legacyToCanonical,
+    notes: COMBINED_EVIDENCE_NOTES,
+    ...base,
+  })
+})
+
+const COMBINED_EVIDENCE_NOTES = [
+  'Mouser is the full free backbone.',
+  'Nexar is quota-limited rotating corroboration.',
+  'Broker inventory excluded from core signal.',
+  'Canonical taxonomy has 28 subcategories.',
+] as const
 
 export default app

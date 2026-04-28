@@ -1,28 +1,24 @@
 name: TI Source Snapshot Capture
 
-# Daily scheduled capture of the TI representative-basket source snapshot.
+# Daily scheduled capture of TI source snapshots.
 # Runs once a day at 07:30 UTC. Can also be invoked manually.
 #
-# What it does:
-#   POST https://texas-instruments-dashboard-final.pages.dev/api/snapshots/capture
-#   with header `X-Capture-Secret: <repo secret SNAPSHOT_CAPTURE_SECRET>`.
+# What it does (in order, Phase 16A):
+#   1. POST /api/snapshots/mouser/capture   — full Mouser daily backbone (free, 28 categories)
+#   2. POST /api/snapshots/capture          — Nexar representative-basket rotating sample (≤4 calls)
+#
+# Both endpoints share the same SNAPSHOT_CAPTURE_SECRET. Mouser is captured
+# first because it is the free full backbone — even if Nexar fails the
+# dashboard still gets a complete daily snapshot. Nexar is captured second so
+# its quota of 4 calls/day is always preserved for corroboration.
 #
 # Required GitHub Actions secret:
 #   SNAPSHOT_CAPTURE_SECRET — must match the same-named secret stored on the
 #   Cloudflare Pages project (Settings → Variables and Secrets → Production).
 #
-# Failure modes (workflow exits non-zero):
-#   - HTTP non-200 with a non-JSON body
-#   - response status: unauthorized
-#   - response status: snapshot_storage_not_configured
-#   - response status: capture_secret_not_configured
-#   - response status: nexar_not_configured
-#   - response.success !== true and status not recognized
-#
-# Treated as success:
+# Treated as success for either capture:
 #   - response.success === true
-#   - response.status === "already_exists_for_today" (manual capture earlier
-#     today is fine — the worker is idempotent without ?overwrite=true)
+#   - response.status === "already_exists_for_today" (idempotent)
 
 on:
   schedule:
@@ -38,9 +34,9 @@ concurrency:
 
 jobs:
   capture:
-    name: POST /api/snapshots/capture
+    name: POST Mouser then Nexar capture
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Validate SNAPSHOT_CAPTURE_SECRET is configured
@@ -55,10 +51,10 @@ jobs:
           fi
           echo "Secret is configured (value not printed)."
 
-      - name: Capture snapshot
+      - name: Capture Mouser snapshot (free full backbone)
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
-          CAPTURE_URL: https://texas-instruments-dashboard-final.pages.dev/api/snapshots/capture
+          CAPTURE_URL: https://texas-instruments-dashboard-final.pages.dev/api/snapshots/mouser/capture
         run: |
           set -uo pipefail
 
@@ -72,17 +68,82 @@ jobs:
             -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
             "${CAPTURE_URL}")"
 
-          echo "HTTP status: ${http_status}"
+          echo "Mouser capture HTTP status: ${http_status}"
 
-          # Validate response is JSON before continuing.
           if ! jq -e . < "$response_file" > /dev/null 2>&1; then
-            echo "::error::Capture response was not valid JSON (HTTP ${http_status})."
+            echo "::error::Mouser capture response was not valid JSON (HTTP ${http_status})."
             head -c 500 "$response_file" || true
             exit 1
           fi
 
           # Print only safe, non-secret fields from the response.
-          echo "Response (sanitized):"
+          echo "Mouser response (sanitized):"
+          jq -c '{
+            success, status, message,
+            snapshotDate, key, overwritten,
+            source, noPaidQuotaRequired,
+            categoryCount, skuCount, callsUsed,
+            okCategoryCount, rateLimitedCategoryCount, errorCategoryCount,
+            canonicalCoverageSummary,
+            storageConfigured, captureSecretConfigured,
+            schemaVersion
+          }' < "$response_file"
+
+          status="$(jq -r '.status // empty' < "$response_file")"
+          success="$(jq -r '.success // empty' < "$response_file")"
+
+          if [ "${status}" = "already_exists_for_today" ]; then
+            echo "ℹ︎ Mouser snapshot already captured for today — idempotent skip."
+          elif [ "${success}" = "true" ]; then
+            echo "Mouser snapshot captured."
+          else
+            case "${status}" in
+              unauthorized)
+                echo "::error::Mouser capture refused (unauthorized) — verify SNAPSHOT_CAPTURE_SECRET."
+                exit 1
+                ;;
+              snapshot_storage_not_configured)
+                echo "::error::SOURCE_SNAPSHOTS_KV namespace is not bound on the Cloudflare Pages project."
+                exit 1
+                ;;
+              capture_secret_not_configured)
+                echo "::error::SNAPSHOT_CAPTURE_SECRET is not set on the Cloudflare Pages project."
+                exit 1
+                ;;
+              mouser_not_configured)
+                echo "::error::MOUSER_API_KEY is not set on the Cloudflare Pages project."
+                exit 1
+                ;;
+              *)
+                echo "::error::Unexpected Mouser response — success=${success} status=${status} http=${http_status}"
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Capture Nexar snapshot (rotating corroboration, ≤4 calls)
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          CAPTURE_URL: https://texas-instruments-dashboard-final.pages.dev/api/snapshots/capture
+        run: |
+          set -uo pipefail
+
+          response_file="$(mktemp)"
+
+          http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            "${CAPTURE_URL}")"
+
+          echo "Nexar capture HTTP status: ${http_status}"
+
+          if ! jq -e . < "$response_file" > /dev/null 2>&1; then
+            echo "::error::Nexar capture response was not valid JSON (HTTP ${http_status})."
+            head -c 500 "$response_file" || true
+            exit 1
+          fi
+
+          echo "Nexar response (sanitized):"
           jq -c '{
             success, status, message,
             snapshotDate, key, overwritten,
@@ -95,16 +156,14 @@ jobs:
           status="$(jq -r '.status // empty' < "$response_file")"
           success="$(jq -r '.success // empty' < "$response_file")"
 
-          # Benign — manual capture already ran today; don't fail the workflow.
           if [ "${status}" = "already_exists_for_today" ]; then
-            echo "ℹ︎ Snapshot already captured for today (idempotent skip). Treating as success."
+            echo "ℹ︎ Nexar snapshot already captured for today — idempotent skip."
             exit 0
           fi
 
-          # Hard-fail statuses with descriptive operator hints.
           case "${status}" in
             unauthorized)
-              echo "::error::Capture refused (unauthorized) — verify SNAPSHOT_CAPTURE_SECRET in GitHub Actions matches the value stored in Cloudflare Pages."
+              echo "::error::Nexar capture refused (unauthorized) — verify SNAPSHOT_CAPTURE_SECRET."
               exit 1
               ;;
             snapshot_storage_not_configured)
@@ -121,12 +180,10 @@ jobs:
               ;;
           esac
 
-          # Generic success path — server reported success: true with a fresh
-          # snapshot stored.
           if [ "${success}" = "true" ]; then
-            echo "Snapshot captured successfully."
+            echo "Nexar snapshot captured successfully."
             exit 0
           fi
 
-          echo "::error::Unexpected response — success=${success} status=${status} http=${http_status}"
+          echo "::error::Unexpected Nexar response — success=${success} status=${status} http=${http_status}"
           exit 1

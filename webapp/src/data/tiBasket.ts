@@ -63,6 +63,9 @@ export type BasketCategory = {
   whyItMatters?: string
   /** Category-level coverage target (subset of, or aligned with, per-SKU). */
   sourceCoverageTarget?: SkuSourceTarget[]
+  /** Canonical taxonomy id (Phase 16A). Older records may omit this; consumers
+   *  should fall back to `canonicalCategoryId(categoryId)` from tiTaxonomy.ts. */
+  canonicalCategoryId?: string
   skus: BasketSku[]
 }
 
@@ -84,6 +87,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   // ── ANCHOR CATEGORIES (sampled today) ───────────────────────────────────
   {
     categoryId: 'pm_ldo',
+    canonicalCategoryId: 'power_ldo',
     categoryLabel: 'LDO Regulators',
     groupId: 'power_management',
     groupLabel: 'Power Management',
@@ -116,6 +120,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   },
   {
     categoryId: 'pm_batt',
+    canonicalCategoryId: 'power_battery_mgmt',
     categoryLabel: 'Battery Management',
     groupId: 'power_management',
     groupLabel: 'Power Management',
@@ -150,6 +155,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   // ── SECONDARY CATEGORIES (catalogued, unsampled at maxCalls=4) ──────────
   {
     categoryId: 'pm_dcdc',
+    canonicalCategoryId: 'power_dcdc_switching',
     categoryLabel: 'Buck / DC-DC Converters',
     groupId: 'power_management',
     groupLabel: 'Power Management',
@@ -182,6 +188,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   },
   {
     categoryId: 'amp_op',
+    canonicalCategoryId: 'amp_opamps',
     categoryLabel: 'Precision Amplifiers',
     groupId: 'amplifiers',
     groupLabel: 'Amplifiers',
@@ -214,6 +221,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   },
   {
     categoryId: 'dac_adc',
+    canonicalCategoryId: 'conv_adc',
     categoryLabel: 'Data Converters / ADCs',
     groupId: 'data_converters',
     groupLabel: 'Data Converters',
@@ -246,6 +254,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   },
   {
     categoryId: 'if_can',
+    canonicalCategoryId: 'interface_can',
     categoryLabel: 'Interface / CAN Transceivers',
     groupId: 'interface',
     groupLabel: 'Interface ICs',
@@ -278,6 +287,7 @@ export const PHASE_8_BASKET_PREVIEW: BasketCategory[] = [
   },
   {
     categoryId: 'mcu_msp',
+    canonicalCategoryId: 'mcu_msp430',
     categoryLabel: 'Embedded Processing / MSP430 MCUs',
     groupId: 'microcontrollers',
     groupLabel: 'Microcontrollers',
