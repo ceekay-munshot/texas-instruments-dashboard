@@ -1,29 +1,27 @@
-// ── DigiKey sandbox adapter (Phase 19A) ──────────────────────────────────────
+// ── DigiKey sandbox adapter (Phase 19A.1 — diagnostic) ──────────────────────
 // Connectivity-only adapter for the DigiKey **sandbox** API. This module:
 //   - Authenticates via OAuth 2.0 client_credentials.
 //   - Fetches product/price/inventory for a small set of MPNs.
 //   - Never logs the client_id, client_secret, or access_token.
 //   - Refuses to run unless DIGIKEY_ENV === 'sandbox'.
 //   - Returns structured errors instead of throwing — the caller endpoint can
-//     surface a graceful status to the customer.
+//     surface a graceful, sanitized status to the customer.
+//   - **Phase 19A.1**: surfaces stage-level diagnostics so we can tell whether
+//     a 4xx came from the OAuth token endpoint or from the product endpoint,
+//     redacts secrets defensively from any echoed body, and falls back to the
+//     V4 `/productdetails` GET endpoint if keyword-search rejects the request.
 //
-// IMPORTANT — Phase 19A does NOT:
+// IMPORTANT — Phase 19A.1 still does NOT:
 //   - Store any DigiKey snapshot to KV.
 //   - Modify combined evidence, source agreement, or trends.
 //   - Run from page load. Probe is POST-only and auth-gated.
-//
-// We treat the DigiKey response shape defensively. The exact field names below
-// reflect DigiKey's documented v3/v4 product search responses; if a future
-// API revision returns a different shape we surface `rawStatus` and `warnings`
-// rather than crash.
 
 const SANDBOX_BASE_URL = 'https://sandbox-api.digikey.com'
 const TOKEN_PATH = '/v1/oauth2/token'
-const PRODUCT_DETAILS_PATH_V4 = '/products/v4/search'
+const KEYWORD_SEARCH_PATH = '/products/v4/search/keyword'
 const SANDBOX_LOCALE_SITE = 'US'
 const SANDBOX_LOCALE_LANGUAGE = 'en'
 const SANDBOX_LOCALE_CURRENCY = 'USD'
-const SANDBOX_CUSTOMER_ID = '0'
 
 export type DigiKeyEnv = {
   DIGIKEY_CLIENT_ID?: string
@@ -59,37 +57,95 @@ export function checkDigiKeySandboxConfigured(env: DigiKeyEnv): DigiKeyStatus {
   }
 }
 
+// ── Sanitization ────────────────────────────────────────────────────────────
+// Remove anything that looks like a credential before echoing it back.
+
+const BEARER_RE = /Bearer\s+[A-Za-z0-9._\-]+/gi
+const ACCESS_TOKEN_RE = /"access_token"\s*:\s*"[^"]*"/gi
+const REFRESH_TOKEN_RE = /"refresh_token"\s*:\s*"[^"]*"/gi
+// Generic JWT/long-token stripper (3+ base64-ish segments separated by dots,
+// or 32+-char hex/base64 runs). Defensive; intentionally aggressive.
+const LONG_TOKEN_RE = /([A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{0,})?)/g
+const HEX_OR_B64_RUN = /\b[A-Za-z0-9_-]{32,}\b/g
+
+function sanitizeMessage(raw: string | null | undefined, env: DigiKeyEnv): string {
+  if (!raw) return ''
+  let s = String(raw).replace(/[\r\n]+/g, ' ')
+  s = s.replace(BEARER_RE, 'Bearer [redacted]')
+  s = s.replace(ACCESS_TOKEN_RE, '"access_token":"[redacted]"')
+  s = s.replace(REFRESH_TOKEN_RE, '"refresh_token":"[redacted]"')
+  s = s.replace(LONG_TOKEN_RE, '[redacted]')
+  s = s.replace(HEX_OR_B64_RUN, '[redacted]')
+  // If the actual env values somehow appeared in the body, strip them too —
+  // DigiKey doesn't echo them in practice, but defense in depth.
+  const cid = (env.DIGIKEY_CLIENT_ID ?? '').trim()
+  const sec = (env.DIGIKEY_CLIENT_SECRET ?? '').trim()
+  if (cid && cid.length >= 8) {
+    s = s.split(cid).join('[redacted-client-id]')
+  }
+  if (sec && sec.length >= 8) {
+    s = s.split(sec).join('[redacted-client-secret]')
+  }
+  return s.slice(0, 250)
+}
+
+function tryExtractDigiKeyError(text: string): { code: string | null; message: string | null } {
+  // DigiKey error responses commonly look like:
+  //   { "ErrorMessage": "...", "StatusCode": 403, "ErrorDetails": "...", "RequestId": "..." }
+  // or for OAuth errors:
+  //   { "error": "...", "error_description": "..." }
+  try {
+    const j = JSON.parse(text)
+    const code =
+      (typeof j?.error === 'string' && j.error) ||
+      (typeof j?.ErrorCode === 'string' && j.ErrorCode) ||
+      (typeof j?.errorCode === 'string' && j.errorCode) ||
+      (typeof j?.statusCode === 'number' ? `status_${j.statusCode}` : null) ||
+      null
+    const message =
+      (typeof j?.error_description === 'string' && j.error_description) ||
+      (typeof j?.ErrorMessage === 'string' && j.ErrorMessage) ||
+      (typeof j?.errorMessage === 'string' && j.errorMessage) ||
+      (typeof j?.ErrorDetails === 'string' && j.ErrorDetails) ||
+      (typeof j?.message === 'string' && j.message) ||
+      null
+    return { code, message }
+  } catch {
+    return { code: null, message: null }
+  }
+}
+
 // ── OAuth ───────────────────────────────────────────────────────────────────
-// Tiny in-memory token cache scoped to the worker invocation. Cloudflare
-// Workers re-instantiate per request, so this is effectively per-request, but
-// we keep it because a probe loops through ≤ 3 MPNs and reusing the token
-// avoids 3× auth round-trips.
 
 let tokenCache: { token: string; expiresAtMs: number } | null = null
 
-type TokenSuccess = { ok: true; token: string }
+type TokenSuccess = {
+  ok: true
+  token: string
+  httpStatus: number
+}
 type TokenFailure = {
   ok: false
-  status: 'digikey_auth_failed'
+  status: 'digikey_token_auth_failed' | 'digikey_token_unreachable' | 'digikey_token_invalid_response'
   httpStatus: number
-  message: string
+  sanitizedCode: string | null
+  sanitizedMessage: string
 }
 
-async function fetchSandboxToken(
-  env: DigiKeyEnv,
-): Promise<TokenSuccess | TokenFailure> {
+async function fetchSandboxToken(env: DigiKeyEnv): Promise<TokenSuccess | TokenFailure> {
   const now = Date.now()
   if (tokenCache && tokenCache.expiresAtMs > now + 5_000) {
-    return { ok: true, token: tokenCache.token }
+    return { ok: true, token: tokenCache.token, httpStatus: 200 }
   }
   const clientId = (env.DIGIKEY_CLIENT_ID ?? '').trim()
   const clientSecret = (env.DIGIKEY_CLIENT_SECRET ?? '').trim()
   if (!clientId || !clientSecret) {
     return {
       ok: false,
-      status: 'digikey_auth_failed',
+      status: 'digikey_token_auth_failed',
       httpStatus: 0,
-      message: 'DigiKey credentials missing.',
+      sanitizedCode: 'credentials_missing',
+      sanitizedMessage: 'DigiKey credentials missing.',
     }
   }
   const body = new URLSearchParams({
@@ -111,41 +167,35 @@ async function fetchSandboxToken(
   } catch (e: any) {
     return {
       ok: false,
-      status: 'digikey_auth_failed',
+      status: 'digikey_token_unreachable',
       httpStatus: 0,
-      message: 'Token endpoint unreachable: ' + String(e?.message || 'unknown error').slice(0, 200),
+      sanitizedCode: 'token_unreachable',
+      sanitizedMessage: sanitizeMessage(e?.message || 'unknown error', env),
     }
   }
 
+  let bodyText = ''
+  try { bodyText = await res.text() } catch { bodyText = '' }
+  const extracted = tryExtractDigiKeyError(bodyText)
+
   if (!res.ok) {
-    // Read response body for diagnostics, but DO NOT echo any echoed
-    // credential values back to the client. DigiKey error bodies typically
-    // include `error_description` strings only.
-    let errMessage = `HTTP ${res.status}`
-    try {
-      const text = await res.text()
-      // Intentionally truncate to 200 chars and do not pass through anything
-      // that could include the client secret. Token endpoint never echoes the
-      // secret in practice; this trim is defense-in-depth.
-      errMessage = text.replace(/[\r\n]+/g, ' ').slice(0, 200)
-    } catch { /* ignore */ }
     return {
       ok: false,
-      status: 'digikey_auth_failed',
+      status: 'digikey_token_auth_failed',
       httpStatus: res.status,
-      message: errMessage,
+      sanitizedCode: extracted.code,
+      sanitizedMessage: sanitizeMessage(extracted.message ?? bodyText, env),
     }
   }
 
   let data: any
-  try {
-    data = await res.json()
-  } catch (e: any) {
+  try { data = JSON.parse(bodyText) } catch {
     return {
       ok: false,
-      status: 'digikey_auth_failed',
+      status: 'digikey_token_invalid_response',
       httpStatus: res.status,
-      message: 'Token response was not valid JSON.',
+      sanitizedCode: 'token_invalid_json',
+      sanitizedMessage: 'Token response was not valid JSON.',
     }
   }
   const token = data?.access_token
@@ -153,31 +203,52 @@ async function fetchSandboxToken(
   if (!token || typeof token !== 'string') {
     return {
       ok: false,
-      status: 'digikey_auth_failed',
+      status: 'digikey_token_invalid_response',
       httpStatus: res.status,
-      message: 'Token response missing access_token.',
+      sanitizedCode: 'token_missing_access_token',
+      sanitizedMessage: 'Token response missing access_token.',
     }
   }
-  // Cache slightly under the reported expiry to be safe.
   tokenCache = { token, expiresAtMs: now + Math.max(60_000, expiresIn * 1000 - 30_000) }
-  return { ok: true, token }
+  return { ok: true, token, httpStatus: res.status }
 }
 
-// ── Product fetch ───────────────────────────────────────────────────────────
+// ── Product fetch (with fallback endpoint) ──────────────────────────────────
 
 export type DigiKeyProductReadout = {
   mpn: string
   found: boolean
-  rawStatus: 'ok' | 'no_match' | 'error' | 'auth_failed' | 'rate_limited'
+  rawStatus: 'ok' | 'no_match' | 'error' | 'auth_failed' | 'rate_limited' | 'token_failed'
   unitPrice: number | null
   availableInventory: number | null
   leadTimeDays: number | null
   currency: string | null
   distributor: 'DigiKey'
   warnings: string[]
-  /** When the API responded but with an unexpected/empty shape, surface the
-   *  HTTP status for diagnostics — never the body. */
-  httpStatus?: number
+  /** Diagnostic block — sanitized, never includes credentials. */
+  diagnostics: {
+    /** Where the failure (if any) happened. */
+    stage: 'token' | 'product_search' | 'none'
+    endpointUsed: string | null
+    method: 'GET' | 'POST' | null
+    tokenHttpStatus: number | null
+    productHttpStatus: number | null
+    sanitizedDigiKeyErrorCode: string | null
+    sanitizedDigiKeyMessage: string
+    failureClass:
+      | 'digikey_token_auth_failed'
+      | 'digikey_token_unreachable'
+      | 'digikey_token_invalid_response'
+      | 'digikey_product_unauthorized'
+      | 'digikey_product_forbidden'
+      | 'digikey_product_not_entitled'
+      | 'digikey_product_bad_request'
+      | 'digikey_product_rate_limited'
+      | 'digikey_product_not_found'
+      | 'digikey_unexpected_response_shape'
+      | 'digikey_unreachable'
+      | null
+  }
 }
 
 function safeParseInt(v: unknown): number | null {
@@ -198,206 +269,80 @@ function safeParseFloat(v: unknown): number | null {
   return null
 }
 
-/**
- * Fetch a single MPN from the DigiKey sandbox via v4 product search.
- * Defensive: any unexpected shape is reported as `no_match` or `error` with
- * a warning. Never throws.
- */
-export async function fetchDigiKeySandboxProductByMpn(
-  env: DigiKeyEnv,
-  mpn: string,
-): Promise<DigiKeyProductReadout> {
-  const status = checkDigiKeySandboxConfigured(env)
-  if (!status.configured) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'auth_failed',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: ['digikey_not_configured'],
+/** Map a 4xx HTTP status from the product endpoint into a structured class. */
+function classifyProductHttp(status: number, code: string | null): DigiKeyProductReadout['diagnostics']['failureClass'] {
+  if (status === 401) return 'digikey_product_unauthorized'
+  if (status === 403) {
+    // ProductInformation V4 entitlement issues commonly come back as 403 with
+    // a body indicating `not_subscribed` / `not_entitled` / `unauthorized_client`.
+    const c = (code ?? '').toLowerCase()
+    if (
+      c.includes('not_subscribed') ||
+      c.includes('not_entitled') ||
+      c.includes('unauthorized_client') ||
+      c.includes('not_authorized') ||
+      c.includes('unauthorized') ||
+      c.includes('subscriptionrequired')
+    ) {
+      return 'digikey_product_not_entitled'
     }
+    return 'digikey_product_forbidden'
   }
+  if (status === 400) return 'digikey_product_bad_request'
+  if (status === 429) return 'digikey_product_rate_limited'
+  if (status === 404) return 'digikey_product_not_found'
+  return 'digikey_unexpected_response_shape'
+}
 
-  const tok = await fetchSandboxToken(env)
-  if (!tok.ok) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'auth_failed',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: [tok.status, `http:${tok.httpStatus}`],
-      httpStatus: tok.httpStatus,
-    }
+function digikeyHeaders(env: DigiKeyEnv, token: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${token}`,
+    // DigiKey docs show the canonical casing as `X-DIGIKEY-Client-Id`. Keep
+    // this exact casing — many gateways are case-sensitive on this header.
+    'X-DIGIKEY-Client-Id': (env.DIGIKEY_CLIENT_ID ?? '').trim(),
+    'X-DIGIKEY-Locale-Site': SANDBOX_LOCALE_SITE,
+    'X-DIGIKEY-Locale-Language': SANDBOX_LOCALE_LANGUAGE,
+    'X-DIGIKEY-Locale-Currency': SANDBOX_LOCALE_CURRENCY,
+    Accept: 'application/json',
   }
+}
 
-  // v4 keyword search by MPN. Sandbox accepts the same shape as production.
-  const url =
-    SANDBOX_BASE_URL +
-    PRODUCT_DETAILS_PATH_V4 +
-    '/keyword'
-  const requestBody = JSON.stringify({
-    Keywords: mpn,
-    RecordCount: 1,
-    RecordStartPosition: 0,
-    Filters: {},
-    Sort: { Option: 'SortByUnitPrice', Direction: 'Ascending', SortParameterId: 0 },
-    RequestedQuantity: 1,
-  })
+/** Extract product fields from a v4 keyword-search OR productdetails response. */
+function extractProductFields(p: any): {
+  matchedMpn: string | null
+  unitPrice: number | null
+  availableInventory: number | null
+  leadTimeDays: number | null
+  currency: string
+} {
+  const matchedMpn =
+    (typeof p?.ManufacturerProductNumber === 'string' && p.ManufacturerProductNumber) ||
+    (typeof p?.ManufacturerPartNumber === 'string' && p.ManufacturerPartNumber) ||
+    null
 
-  let res: Response
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${tok.token}`,
-        'X-DIGIKEY-Client-Id': (env.DIGIKEY_CLIENT_ID ?? '').trim(),
-        'X-DIGIKEY-Locale-Site': SANDBOX_LOCALE_SITE,
-        'X-DIGIKEY-Locale-Language': SANDBOX_LOCALE_LANGUAGE,
-        'X-DIGIKEY-Locale-Currency': SANDBOX_LOCALE_CURRENCY,
-        'X-DIGIKEY-Customer-Id': SANDBOX_CUSTOMER_ID,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: requestBody,
-    })
-  } catch (e: any) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'error',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: ['digikey_unreachable', String(e?.message || 'unknown').slice(0, 200)],
-    }
-  }
-
-  if (res.status === 429) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'rate_limited',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: ['digikey_rate_limited'],
-      httpStatus: 429,
-    }
-  }
-  if (res.status === 401 || res.status === 403) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'auth_failed',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: ['digikey_unauthorized'],
-      httpStatus: res.status,
-    }
-  }
-  if (!res.ok) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'error',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: [`digikey_http_${res.status}`],
-      httpStatus: res.status,
-    }
-  }
-
-  let data: any
-  try {
-    data = await res.json()
-  } catch {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'error',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: ['digikey_invalid_json'],
-      httpStatus: res.status,
-    }
-  }
-
-  // DigiKey v4 keyword-search response shape:
-  //   { Products: [{ ManufacturerPartNumber, QuantityAvailable, UnitPrice,
-  //                  StandardPricing: [{ BreakQuantity, UnitPrice }],
-  //                  ProductVariations: [{ StandardPricing: [...] }],
-  //                  ManufacturerLeadWeeks, ... }],
-  //     ProductsCount: N, ... }
-  //
-  // We accept several plausible shapes (`Products` array OR `Product` single)
-  // because sandbox vs prod responses can vary. Any unexpected shape produces
-  // `no_match` with a warning rather than crashing.
-  const products: any[] = Array.isArray(data?.Products)
-    ? data.Products
-    : Array.isArray(data?.ExactManufacturerProducts)
-      ? data.ExactManufacturerProducts
-      : data?.Product
-        ? [data.Product]
-        : []
-  if (products.length === 0) {
-    return {
-      mpn,
-      found: false,
-      rawStatus: 'no_match',
-      unitPrice: null,
-      availableInventory: null,
-      leadTimeDays: null,
-      currency: null,
-      distributor: 'DigiKey',
-      warnings: ['digikey_no_products_in_response'],
-      httpStatus: res.status,
-    }
-  }
-  const p = products[0]
-  // Price: prefer unit-price field, then min break in StandardPricing, then
-  // ProductVariations[0].StandardPricing[0].UnitPrice. None → null.
-  let unitPrice: number | null = null
-  unitPrice = safeParseFloat(p?.UnitPrice)
+  let unitPrice: number | null = safeParseFloat(p?.UnitPrice)
   if (unitPrice == null && Array.isArray(p?.StandardPricing) && p.StandardPricing.length > 0) {
-    // Pick the lowest-quantity break.
-    const breaks = p.StandardPricing.slice().sort((a: any, b: any) => safeParseInt(a.BreakQuantity) ?? 0 - (safeParseInt(b.BreakQuantity) ?? 0))
+    const breaks = p.StandardPricing.slice().sort(
+      (a: any, b: any) => (safeParseInt(a.BreakQuantity) ?? 0) - (safeParseInt(b.BreakQuantity) ?? 0),
+    )
     unitPrice = safeParseFloat(breaks[0]?.UnitPrice)
   }
   if (unitPrice == null && Array.isArray(p?.ProductVariations)) {
     const v0 = p.ProductVariations[0]
     if (v0?.StandardPricing?.length > 0) {
-      const breaks = v0.StandardPricing.slice().sort((a: any, b: any) => (safeParseInt(a.BreakQuantity) ?? 0) - (safeParseInt(b.BreakQuantity) ?? 0))
+      const breaks = v0.StandardPricing.slice().sort(
+        (a: any, b: any) => (safeParseInt(a.BreakQuantity) ?? 0) - (safeParseInt(b.BreakQuantity) ?? 0),
+      )
       unitPrice = safeParseFloat(breaks[0]?.UnitPrice)
     }
   }
-  // Inventory: QuantityAvailable (number); fall back to ProductVariations[0].QuantityAvailableforPackageType.
+
   let availableInventory: number | null = safeParseInt(p?.QuantityAvailable)
   if (availableInventory == null && Array.isArray(p?.ProductVariations)) {
     const v0 = p.ProductVariations[0]
     availableInventory = safeParseInt(v0?.QuantityAvailableforPackageType ?? v0?.QuantityAvailable)
   }
-  // Lead time: ManufacturerLeadWeeks ("12 Weeks" or number) → days.
+
   let leadTimeDays: number | null = null
   const lwRaw = p?.ManufacturerLeadWeeks
   if (typeof lwRaw === 'number' && Number.isFinite(lwRaw)) leadTimeDays = Math.trunc(lwRaw * 7)
@@ -405,33 +350,323 @@ export async function fetchDigiKeySandboxProductByMpn(
     const m = lwRaw.match(/(\d+)/)
     if (m) leadTimeDays = parseInt(m[1], 10) * 7
   }
-  // Currency: response field varies. Sandbox commonly returns the request locale.
+
   const currency = (typeof p?.Currency === 'string' && p.Currency) || SANDBOX_LOCALE_CURRENCY
+  return { matchedMpn, unitPrice, availableInventory, leadTimeDays, currency }
+}
 
-  // ManufacturerPartNumber may live at p.ManufacturerProductNumber on v4.
-  const matchedMpn =
-    typeof p?.ManufacturerProductNumber === 'string'
-      ? p.ManufacturerProductNumber
-      : typeof p?.ManufacturerPartNumber === 'string'
-        ? p.ManufacturerPartNumber
-        : mpn
+type ProductCallResult =
+  | { kind: 'ok'; product: any; httpStatus: number; endpoint: string; method: 'GET' | 'POST' }
+  | { kind: 'no_products'; httpStatus: number; endpoint: string; method: 'GET' | 'POST' }
+  | { kind: 'http_error'; httpStatus: number; bodyText: string; endpoint: string; method: 'GET' | 'POST' }
+  | { kind: 'unreachable'; message: string; endpoint: string; method: 'GET' | 'POST' }
+  | { kind: 'invalid_json'; httpStatus: number; endpoint: string; method: 'GET' | 'POST' }
 
-  const warnings: string[] = []
-  if (unitPrice == null) warnings.push('digikey_no_price_in_response')
-  if (availableInventory == null) warnings.push('digikey_no_inventory_in_response')
+async function callKeywordSearch(env: DigiKeyEnv, token: string, mpn: string): Promise<ProductCallResult> {
+  const endpoint = SANDBOX_BASE_URL + KEYWORD_SEARCH_PATH
+  const method: 'POST' = 'POST'
+  let res: Response
+  try {
+    res = await fetch(endpoint, {
+      method,
+      headers: { ...digikeyHeaders(env, token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        Keywords: mpn,
+        Limit: 1,
+        Offset: 0,
+        FilterOptionsRequest: {},
+        SortOptions: { Field: 'None', SortOrder: 'Ascending' },
+      }),
+    })
+  } catch (e: any) {
+    return { kind: 'unreachable', message: String(e?.message || 'unknown'), endpoint, method }
+  }
+  let text = ''
+  try { text = await res.text() } catch { text = '' }
+  if (!res.ok) {
+    return { kind: 'http_error', httpStatus: res.status, bodyText: text, endpoint, method }
+  }
+  let data: any
+  try { data = JSON.parse(text) } catch {
+    return { kind: 'invalid_json', httpStatus: res.status, endpoint, method }
+  }
+  const products: any[] =
+    Array.isArray(data?.Products) ? data.Products
+    : Array.isArray(data?.ExactManufacturerProducts) ? data.ExactManufacturerProducts
+    : Array.isArray(data?.ExactMatches) ? data.ExactMatches
+    : data?.Product ? [data.Product]
+    : []
+  if (products.length === 0) {
+    return { kind: 'no_products', httpStatus: res.status, endpoint, method }
+  }
+  return { kind: 'ok', product: products[0], httpStatus: res.status, endpoint, method }
+}
 
+async function callProductDetails(env: DigiKeyEnv, token: string, mpn: string): Promise<ProductCallResult> {
+  // GET /products/v4/search/{manufacturerProductNumber}/productdetails
+  // No body. Documented as the simplest endpoint to fetch a single product
+  // by exact MPN. Used as a fallback when keyword search returns 4xx.
+  const endpoint = SANDBOX_BASE_URL + '/products/v4/search/' + encodeURIComponent(mpn) + '/productdetails'
+  const method: 'GET' = 'GET'
+  let res: Response
+  try {
+    res = await fetch(endpoint, { method, headers: digikeyHeaders(env, token) })
+  } catch (e: any) {
+    return { kind: 'unreachable', message: String(e?.message || 'unknown'), endpoint, method }
+  }
+  let text = ''
+  try { text = await res.text() } catch { text = '' }
+  if (!res.ok) {
+    return { kind: 'http_error', httpStatus: res.status, bodyText: text, endpoint, method }
+  }
+  let data: any
+  try { data = JSON.parse(text) } catch {
+    return { kind: 'invalid_json', httpStatus: res.status, endpoint, method }
+  }
+  // V4 productdetails response: { Product: {...}, RequestId, ... }
+  const product = data?.Product ?? data?.product ?? null
+  if (!product) {
+    return { kind: 'no_products', httpStatus: res.status, endpoint, method }
+  }
+  return { kind: 'ok', product, httpStatus: res.status, endpoint, method }
+}
+
+function buildErrorReadout(
+  mpn: string,
+  rawStatus: DigiKeyProductReadout['rawStatus'],
+  diagnostics: DigiKeyProductReadout['diagnostics'],
+  warnings: string[],
+): DigiKeyProductReadout {
   return {
-    mpn: matchedMpn,
-    found: true,
-    rawStatus: 'ok',
-    unitPrice,
-    availableInventory,
-    leadTimeDays,
-    currency,
+    mpn,
+    found: false,
+    rawStatus,
+    unitPrice: null,
+    availableInventory: null,
+    leadTimeDays: null,
+    currency: null,
     distributor: 'DigiKey',
     warnings,
-    httpStatus: res.status,
+    diagnostics,
   }
+}
+
+/**
+ * Fetch one MPN. Order:
+ *   1) POST /products/v4/search/keyword  (primary)
+ *   2) GET  /products/v4/search/{mpn}/productdetails  (fallback if primary 4xx)
+ *
+ * Returns a structured readout with sanitized diagnostics. Never throws.
+ */
+export async function fetchDigiKeySandboxProductByMpn(
+  env: DigiKeyEnv,
+  mpn: string,
+): Promise<DigiKeyProductReadout> {
+  const status = checkDigiKeySandboxConfigured(env)
+  if (!status.configured) {
+    return buildErrorReadout(mpn, 'auth_failed', {
+      stage: 'token',
+      endpointUsed: null,
+      method: null,
+      tokenHttpStatus: null,
+      productHttpStatus: null,
+      sanitizedDigiKeyErrorCode: 'not_configured',
+      sanitizedDigiKeyMessage: 'DigiKey adapter not configured (env or credentials missing).',
+      failureClass: 'digikey_token_auth_failed',
+    }, ['digikey_not_configured'])
+  }
+
+  const tok = await fetchSandboxToken(env)
+  if (!tok.ok) {
+    return buildErrorReadout(mpn, 'token_failed', {
+      stage: 'token',
+      endpointUsed: SANDBOX_BASE_URL + TOKEN_PATH,
+      method: 'POST',
+      tokenHttpStatus: tok.httpStatus,
+      productHttpStatus: null,
+      sanitizedDigiKeyErrorCode: tok.sanitizedCode,
+      sanitizedDigiKeyMessage: tok.sanitizedMessage,
+      failureClass: tok.status,
+    }, [tok.status, `http:${tok.httpStatus}`])
+  }
+
+  // 1) Primary — keyword search
+  const primary = await callKeywordSearch(env, tok.token, mpn)
+  if (primary.kind === 'ok') {
+    const f = extractProductFields(primary.product)
+    const warnings: string[] = []
+    if (f.unitPrice == null) warnings.push('digikey_no_price_in_response')
+    if (f.availableInventory == null) warnings.push('digikey_no_inventory_in_response')
+    return {
+      mpn: f.matchedMpn || mpn,
+      found: true,
+      rawStatus: 'ok',
+      unitPrice: f.unitPrice,
+      availableInventory: f.availableInventory,
+      leadTimeDays: f.leadTimeDays,
+      currency: f.currency,
+      distributor: 'DigiKey',
+      warnings,
+      diagnostics: {
+        stage: 'none',
+        endpointUsed: primary.endpoint,
+        method: primary.method,
+        tokenHttpStatus: tok.httpStatus,
+        productHttpStatus: primary.httpStatus,
+        sanitizedDigiKeyErrorCode: null,
+        sanitizedDigiKeyMessage: '',
+        failureClass: null,
+      },
+    }
+  }
+
+  // Decide whether to try the fallback. We do for 400/403/404 (the most
+  // common "wrong endpoint or wrong shape" classes) and for invalid_json /
+  // no_products responses. Auth-class 401/429 we surface immediately.
+  const shouldFallback = (() => {
+    if (primary.kind === 'http_error') {
+      return primary.httpStatus === 400 || primary.httpStatus === 403 || primary.httpStatus === 404
+    }
+    if (primary.kind === 'no_products' || primary.kind === 'invalid_json') return true
+    return false
+  })()
+
+  // Build the primary failure readout we'll return if the fallback also fails.
+  let primaryDiag: DigiKeyProductReadout['diagnostics']
+  let primaryWarnings: string[] = []
+  let primaryRawStatus: DigiKeyProductReadout['rawStatus'] = 'error'
+  if (primary.kind === 'http_error') {
+    const ext = tryExtractDigiKeyError(primary.bodyText)
+    const cls = classifyProductHttp(primary.httpStatus, ext.code)
+    primaryRawStatus = primary.httpStatus === 401 ? 'auth_failed'
+      : primary.httpStatus === 429 ? 'rate_limited'
+      : 'error'
+    primaryDiag = {
+      stage: 'product_search',
+      endpointUsed: primary.endpoint,
+      method: primary.method,
+      tokenHttpStatus: tok.httpStatus,
+      productHttpStatus: primary.httpStatus,
+      sanitizedDigiKeyErrorCode: ext.code,
+      sanitizedDigiKeyMessage: sanitizeMessage(ext.message ?? primary.bodyText, env),
+      failureClass: cls,
+    }
+    primaryWarnings = [`digikey_http_${primary.httpStatus}`, cls ?? 'digikey_unknown']
+  } else if (primary.kind === 'no_products') {
+    primaryRawStatus = 'no_match'
+    primaryDiag = {
+      stage: 'product_search',
+      endpointUsed: primary.endpoint,
+      method: primary.method,
+      tokenHttpStatus: tok.httpStatus,
+      productHttpStatus: primary.httpStatus,
+      sanitizedDigiKeyErrorCode: 'no_products',
+      sanitizedDigiKeyMessage: 'Keyword search returned 0 products.',
+      failureClass: 'digikey_unexpected_response_shape',
+    }
+    primaryWarnings = ['digikey_no_products_in_response']
+  } else if (primary.kind === 'invalid_json') {
+    primaryDiag = {
+      stage: 'product_search',
+      endpointUsed: primary.endpoint,
+      method: primary.method,
+      tokenHttpStatus: tok.httpStatus,
+      productHttpStatus: primary.httpStatus,
+      sanitizedDigiKeyErrorCode: 'invalid_json',
+      sanitizedDigiKeyMessage: 'Product response was not valid JSON.',
+      failureClass: 'digikey_unexpected_response_shape',
+    }
+    primaryWarnings = ['digikey_invalid_json']
+  } else {
+    // unreachable
+    primaryDiag = {
+      stage: 'product_search',
+      endpointUsed: primary.endpoint,
+      method: primary.method,
+      tokenHttpStatus: tok.httpStatus,
+      productHttpStatus: null,
+      sanitizedDigiKeyErrorCode: 'unreachable',
+      sanitizedDigiKeyMessage: sanitizeMessage(primary.message, env),
+      failureClass: 'digikey_unreachable',
+    }
+    primaryWarnings = ['digikey_unreachable']
+  }
+
+  if (!shouldFallback) {
+    return buildErrorReadout(mpn, primaryRawStatus, primaryDiag, primaryWarnings)
+  }
+
+  // 2) Fallback — productdetails
+  const fb = await callProductDetails(env, tok.token, mpn)
+  if (fb.kind === 'ok') {
+    const f = extractProductFields(fb.product)
+    const warnings: string[] = ['digikey_used_fallback_endpoint']
+    if (f.unitPrice == null) warnings.push('digikey_no_price_in_response')
+    if (f.availableInventory == null) warnings.push('digikey_no_inventory_in_response')
+    return {
+      mpn: f.matchedMpn || mpn,
+      found: true,
+      rawStatus: 'ok',
+      unitPrice: f.unitPrice,
+      availableInventory: f.availableInventory,
+      leadTimeDays: f.leadTimeDays,
+      currency: f.currency,
+      distributor: 'DigiKey',
+      warnings,
+      diagnostics: {
+        stage: 'none',
+        endpointUsed: fb.endpoint,
+        method: fb.method,
+        tokenHttpStatus: tok.httpStatus,
+        productHttpStatus: fb.httpStatus,
+        sanitizedDigiKeyErrorCode: null,
+        sanitizedDigiKeyMessage:
+          `Primary endpoint failed (${primaryDiag.sanitizedDigiKeyErrorCode ?? 'unknown'}); fallback succeeded.`,
+        failureClass: null,
+      },
+    }
+  }
+
+  // Both endpoints failed — return the more informative one. If fallback
+  // produced an http_error code, prefer those diagnostics; otherwise stick
+  // with the primary's (since we know primary actually returned 4xx).
+  if (fb.kind === 'http_error') {
+    const ext = tryExtractDigiKeyError(fb.bodyText)
+    const cls = classifyProductHttp(fb.httpStatus, ext.code)
+    return buildErrorReadout(
+      mpn,
+      fb.httpStatus === 401 ? 'auth_failed' : fb.httpStatus === 429 ? 'rate_limited' : 'error',
+      {
+        stage: 'product_search',
+        endpointUsed: fb.endpoint,
+        method: fb.method,
+        tokenHttpStatus: tok.httpStatus,
+        productHttpStatus: fb.httpStatus,
+        sanitizedDigiKeyErrorCode: ext.code,
+        sanitizedDigiKeyMessage:
+          `Primary (${primaryDiag.endpointUsed}) failed: ${primaryDiag.sanitizedDigiKeyMessage}. ` +
+          `Fallback (${fb.endpoint}) failed: ${sanitizeMessage(ext.message ?? fb.bodyText, env)}`.slice(0, 250),
+        failureClass: cls,
+      },
+      [
+        ...primaryWarnings,
+        `digikey_fallback_http_${fb.httpStatus}`,
+        cls ?? 'digikey_unknown',
+      ],
+    )
+  }
+
+  // Fallback unreachable / invalid_json / no_products — keep primary diag and
+  // tag that fallback also failed with its kind.
+  return buildErrorReadout(mpn, primaryRawStatus, {
+    ...primaryDiag,
+    sanitizedDigiKeyMessage:
+      `${primaryDiag.sanitizedDigiKeyMessage} | fallback (${fb.endpoint}) failed: ${
+        fb.kind === 'unreachable' ? sanitizeMessage(fb.message, env)
+        : fb.kind === 'invalid_json' ? 'invalid JSON'
+        : 'no products in response'
+      }`.slice(0, 250),
+  }, [...primaryWarnings, `digikey_fallback_${fb.kind}`])
 }
 
 // ── Probe driver ────────────────────────────────────────────────────────────
@@ -443,12 +678,27 @@ export type DigiKeyProbeResult = {
   callsAttempted: number
   results: DigiKeyProductReadout[]
   errors: Array<{ code: string; message: string }>
+  /** Phase 19A.1 — top-level diagnostics summary. Sanitized, no secrets. */
+  diagnostics: {
+    tokenStage: {
+      ok: boolean
+      httpStatus: number | null
+      sanitizedCode: string | null
+      sanitizedMessage: string
+    }
+    productStage: {
+      ok: boolean
+      endpointTried: string[]
+      lastHttpStatus: number | null
+      lastFailureClass: DigiKeyProductReadout['diagnostics']['failureClass']
+      sanitizedCode: string | null
+      sanitizedMessage: string
+    }
+  }
 }
 
 export const DIGIKEY_PROBE_MAX_MPNS = 3
 
-/** Run the probe. Sequential calls (not parallel) so the token cache amortizes
- *  one auth across all probed MPNs. Always returns a structured result. */
 export async function probeDigiKeySandbox(
   env: DigiKeyEnv,
   mpns: string[],
@@ -461,7 +711,11 @@ export async function probeDigiKeySandbox(
       env: status.env,
       callsAttempted: 0,
       results: [],
-      errors: [{ code: 'env_invalid', message: 'DIGIKEY_ENV must equal "sandbox" to enable the adapter.' }],
+      errors: [{ code: 'env_invalid', message: 'DIGIKEY_ENV must equal "sandbox".' }],
+      diagnostics: {
+        tokenStage: { ok: false, httpStatus: null, sanitizedCode: 'env_invalid', sanitizedMessage: 'DIGIKEY_ENV must equal "sandbox".' },
+        productStage: { ok: false, endpointTried: [], lastHttpStatus: null, lastFailureClass: null, sanitizedCode: null, sanitizedMessage: '' },
+      },
     }
   }
   if (!status.configured) {
@@ -472,63 +726,74 @@ export async function probeDigiKeySandbox(
       callsAttempted: 0,
       results: [],
       errors: [{ code: 'credentials_missing', message: 'DIGIKEY_CLIENT_ID and DIGIKEY_CLIENT_SECRET are required.' }],
+      diagnostics: {
+        tokenStage: { ok: false, httpStatus: null, sanitizedCode: 'credentials_missing', sanitizedMessage: 'DIGIKEY_CLIENT_ID and DIGIKEY_CLIENT_SECRET are required.' },
+        productStage: { ok: false, endpointTried: [], lastHttpStatus: null, lastFailureClass: null, sanitizedCode: null, sanitizedMessage: '' },
+      },
     }
   }
   if (!Array.isArray(mpns) || mpns.length === 0) {
     return {
-      success: false,
-      status: 'invalid_payload',
-      env: status.env,
-      callsAttempted: 0,
-      results: [],
+      success: false, status: 'invalid_payload', env: status.env, callsAttempted: 0, results: [],
       errors: [{ code: 'mpns_required', message: 'mpns must be a non-empty array.' }],
+      diagnostics: {
+        tokenStage: { ok: false, httpStatus: null, sanitizedCode: 'invalid_payload', sanitizedMessage: 'mpns required' },
+        productStage: { ok: false, endpointTried: [], lastHttpStatus: null, lastFailureClass: null, sanitizedCode: null, sanitizedMessage: '' },
+      },
     }
   }
   if (mpns.length > DIGIKEY_PROBE_MAX_MPNS) {
     return {
-      success: false,
-      status: 'too_many_mpns',
-      env: status.env,
-      callsAttempted: 0,
-      results: [],
+      success: false, status: 'too_many_mpns', env: status.env, callsAttempted: 0, results: [],
       errors: [{ code: 'mpns_exceed_cap', message: `Probe accepts at most ${DIGIKEY_PROBE_MAX_MPNS} MPNs.` }],
+      diagnostics: {
+        tokenStage: { ok: false, httpStatus: null, sanitizedCode: 'too_many_mpns', sanitizedMessage: `Probe accepts at most ${DIGIKEY_PROBE_MAX_MPNS} MPNs.` },
+        productStage: { ok: false, endpointTried: [], lastHttpStatus: null, lastFailureClass: null, sanitizedCode: null, sanitizedMessage: '' },
+      },
     }
   }
-  const cleaned = mpns
-    .map(m => (typeof m === 'string' ? m.trim() : ''))
-    .filter(m => m.length > 0)
+  const cleaned = mpns.map(m => (typeof m === 'string' ? m.trim() : '')).filter(m => m.length > 0)
   if (cleaned.length === 0) {
     return {
-      success: false,
-      status: 'invalid_payload',
-      env: status.env,
-      callsAttempted: 0,
-      results: [],
+      success: false, status: 'invalid_payload', env: status.env, callsAttempted: 0, results: [],
       errors: [{ code: 'mpns_empty', message: 'mpns must contain at least one non-empty string.' }],
+      diagnostics: {
+        tokenStage: { ok: false, httpStatus: null, sanitizedCode: 'invalid_payload', sanitizedMessage: 'mpns empty' },
+        productStage: { ok: false, endpointTried: [], lastHttpStatus: null, lastFailureClass: null, sanitizedCode: null, sanitizedMessage: '' },
+      },
     }
   }
 
   const results: DigiKeyProductReadout[] = []
-  const errors: Array<{ code: string; message: string }> = []
   let anyAuthFailure = false
+  let anyTokenFailure = false
   for (const mpn of cleaned) {
     const r = await fetchDigiKeySandboxProductByMpn(env, mpn)
     results.push(r)
-    if (r.rawStatus === 'auth_failed') {
-      anyAuthFailure = true
-      // No point continuing the loop if auth itself is failing — stop early.
-      break
-    }
+    if (r.rawStatus === 'token_failed') { anyTokenFailure = true; break }
+    if (r.rawStatus === 'auth_failed' && r.diagnostics.stage === 'product_search') anyAuthFailure = true
   }
 
+  // Build top-level diagnostics from the most informative result.
+  const firstFailure = results.find(r => r.rawStatus !== 'ok') ?? null
+  const lastResult = results[results.length - 1] ?? null
+  const tokenOk = !anyTokenFailure && (firstFailure?.diagnostics.stage !== 'token')
+  const tokenSanitizedCode = anyTokenFailure ? firstFailure!.diagnostics.sanitizedDigiKeyErrorCode : null
+  const tokenSanitizedMessage = anyTokenFailure ? firstFailure!.diagnostics.sanitizedDigiKeyMessage : ''
+  const tokenHttpStatus = anyTokenFailure ? firstFailure!.diagnostics.tokenHttpStatus : (results[0]?.diagnostics.tokenHttpStatus ?? null)
+
+  const productOk = results.some(r => r.rawStatus === 'ok')
+  const endpointTried = Array.from(new Set(results.map(r => r.diagnostics.endpointUsed).filter((e): e is string => !!e)))
+  const productSanitizedCode = productOk ? null : (firstFailure?.diagnostics.sanitizedDigiKeyErrorCode ?? null)
+  const productSanitizedMessage = productOk ? '' : (firstFailure?.diagnostics.sanitizedDigiKeyMessage ?? '')
+  const lastHttpStatus = lastResult?.diagnostics.productHttpStatus ?? null
+  const lastFailureClass = firstFailure?.diagnostics.failureClass ?? null
+
   const overallStatus =
-    anyAuthFailure
-      ? 'digikey_auth_failed'
-      : results.every(r => r.rawStatus === 'ok')
-        ? 'ok'
-        : results.some(r => r.rawStatus === 'ok')
-          ? 'partial'
-          : 'no_results'
+    anyTokenFailure ? 'digikey_token_auth_failed'
+    : results.every(r => r.rawStatus === 'ok') ? 'ok'
+    : results.some(r => r.rawStatus === 'ok') ? 'partial'
+    : (firstFailure?.diagnostics.failureClass ?? 'digikey_unexpected_response_shape')
 
   return {
     success: overallStatus === 'ok' || overallStatus === 'partial',
@@ -536,6 +801,22 @@ export async function probeDigiKeySandbox(
     env: 'sandbox',
     callsAttempted: results.length,
     results,
-    errors,
+    errors: [],
+    diagnostics: {
+      tokenStage: {
+        ok: tokenOk,
+        httpStatus: tokenHttpStatus,
+        sanitizedCode: tokenSanitizedCode,
+        sanitizedMessage: tokenSanitizedMessage,
+      },
+      productStage: {
+        ok: productOk,
+        endpointTried,
+        lastHttpStatus,
+        lastFailureClass,
+        sanitizedCode: productSanitizedCode,
+        sanitizedMessage: productSanitizedMessage,
+      },
+    },
   }
 }

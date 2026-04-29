@@ -875,6 +875,24 @@ curl -X POST 'https://texas-instruments-dashboard-final.pages.dev/api/digikey/sa
 **No KV writes.** Phase 19A is connectivity verification only.
 **No customer-facing exposure.** Source agreement, trends, manual evidence, and the dashboard UI are unchanged.
 
+#### DigiKey sandbox 403 checklist (Phase 19A.1)
+
+If the probe returns `digikey_product_forbidden` / `digikey_product_not_entitled` / `digikey_auth_failed`, the response now includes a `diagnostics` block that pinpoints the failure stage and a sanitized DigiKey error code without ever echoing credentials. Walk through this list:
+
+1. **Open the DigiKey developer portal.** Go to your sandbox application's "Apps" entry.
+2. **ProductInformation V4** is selected as one of the app's APIs/products. (If only V3 is selected, V4 endpoints will return 403.)
+3. **Click _Save_** after toggling APIs/products on. Toggling alone is not enough — Save commits the entitlement.
+4. **App key status is _Approved_.** Pending/Rejected keys cannot mint usable tokens against V4.
+5. **Wait 5–10 minutes after Save.** Entitlement propagation is asynchronous on the sandbox; new approvals can take a few minutes before product calls succeed even though the token endpoint already mints tokens.
+6. **Confirm the env vars come from the same sandbox app.** A common mismatch is using a sandbox `client_id` with a production `client_secret` (or vice versa) — token issuance can succeed against one tier and product calls fail against another.
+7. **After updating Cloudflare env vars, redeploy or restart** the Pages project so the worker picks up the new values. Cloudflare Pages applies env-var changes only on a subsequent deploy.
+8. **Read the probe diagnostics.**
+   - `diagnostics.tokenStage.ok = false` → token endpoint is rejecting your credentials. Likely cause: client id/secret mismatch or wrong-tier credentials. The `sanitizedDigiKeyErrorCode` will commonly be `invalid_client`.
+   - `diagnostics.tokenStage.ok = true` and `diagnostics.productStage.ok = false` with `failureClass: 'digikey_product_not_entitled'` → ProductInformation V4 entitlement is missing or hasn't propagated. Re-check step 1–5.
+   - `diagnostics.productStage.lastFailureClass = 'digikey_product_forbidden'` (no specific entitlement code) → frequently a mis-shaped request: required `X-DIGIKEY-Client-Id` header missing or wrong casing, or wrong endpoint method.
+   - `diagnostics.productStage.endpointTried` includes both `/products/v4/search/keyword` (POST) and `/products/v4/search/{mpn}/productdetails` (GET) — the adapter automatically falls back to the second on 4xx from the first, so you can see whether either path works.
+9. **What the sanitizer redacts.** Bearer tokens, anything looking like a JWT or long base64 token, the configured client id/secret if they ever appear in a body. Headers are never echoed. The probe response is safe to paste into a bug report.
+
 ## Local Development
 ```bash
 npm install
