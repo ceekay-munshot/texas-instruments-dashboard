@@ -13,15 +13,19 @@
 //   - The Store API endpoints refuse to call TI unless `TI_STORE_API_ENABLED`
 //     is exactly `'true'` AND the Product Information API works first.
 
-const TOKEN_URL = 'https://transact.ti.com/v2/oauth/token'
-// Product Information API — primary entry point. Path may be different in TI's
-// final docs; the adapter is defensive so unexpected shapes don't crash.
-const PRODUCT_INFO_URL = (partNumber: string) =>
-  `https://transact.ti.com/v2/productinformation/products/${encodeURIComponent(partNumber)}`
-// Store API — Inventory & Pricing. Used only when the operator flips
-// TI_STORE_API_ENABLED=true after TI's Store suite approval lands.
-const INVENTORY_PRICING_URL = (partNumber: string) =>
-  `https://transact.ti.com/v2/store/products/inventory-pricing?partNumber=${encodeURIComponent(partNumber)}`
+// Phase 20A.1 — defaults aligned to TI's official docs.
+//   Token endpoint: https://transact.ti.com/v1/oauth/accesstoken
+//   Product info:   https://transact.ti.com/v1/products/{partNumber}
+//   Extended info:  https://transact.ti.com/v1/products-extended/{partNumber}?page=0
+//   Store I&P:      https://transact.ti.com/v1/store/products/inventory-pricing?partNumber={pn}
+//
+// Each default can be overridden via env var (no redeploy needed). The
+// templates use `{partNumber}` as a placeholder so a single env value covers
+// the path without hand-coding URL building on the operator side.
+const DEFAULT_TOKEN_URL = 'https://transact.ti.com/v1/oauth/accesstoken'
+const DEFAULT_PRODUCT_INFO_TPL = 'https://transact.ti.com/v1/products/{partNumber}'
+const DEFAULT_PRODUCT_INFO_EXT_TPL = 'https://transact.ti.com/v1/products-extended/{partNumber}?page=0'
+const DEFAULT_INVENTORY_PRICING_TPL = 'https://transact.ti.com/v1/store/products/inventory-pricing?partNumber={partNumber}'
 
 const TOKEN_CACHE_TTL_MS = 55 * 60 * 1000 // 55 min, per spec
 
@@ -30,6 +34,41 @@ export type TiEnv = {
   TI_CLIENT_SECRET?: string
   TI_API_ENV?: string
   TI_STORE_API_ENABLED?: string
+  /** Phase 20A.1 — operator-safe URL overrides. None of these are secrets;
+   *  they're surfaced via /api/ti/status as host + path so the operator can
+   *  confirm what's being called without redeploying. */
+  TI_TOKEN_URL?: string
+  TI_PRODUCT_INFO_URL_TEMPLATE?: string
+  TI_PRODUCT_INFO_EXTENDED_URL_TEMPLATE?: string
+  TI_INVENTORY_PRICING_URL_TEMPLATE?: string
+}
+
+// Resolve URL helpers — operator env always wins over the default.
+function resolveTokenUrl(env: TiEnv): string {
+  return (env.TI_TOKEN_URL && env.TI_TOKEN_URL.trim()) || DEFAULT_TOKEN_URL
+}
+function resolveProductInfoUrl(env: TiEnv, partNumber: string): string {
+  const tpl = (env.TI_PRODUCT_INFO_URL_TEMPLATE && env.TI_PRODUCT_INFO_URL_TEMPLATE.trim()) || DEFAULT_PRODUCT_INFO_TPL
+  return tpl.split('{partNumber}').join(encodeURIComponent(partNumber))
+}
+function resolveProductInfoExtendedUrl(env: TiEnv, partNumber: string): string {
+  const tpl = (env.TI_PRODUCT_INFO_EXTENDED_URL_TEMPLATE && env.TI_PRODUCT_INFO_EXTENDED_URL_TEMPLATE.trim()) || DEFAULT_PRODUCT_INFO_EXT_TPL
+  return tpl.split('{partNumber}').join(encodeURIComponent(partNumber))
+}
+function resolveInventoryPricingUrl(env: TiEnv, partNumber: string): string {
+  const tpl = (env.TI_INVENTORY_PRICING_URL_TEMPLATE && env.TI_INVENTORY_PRICING_URL_TEMPLATE.trim()) || DEFAULT_INVENTORY_PRICING_TPL
+  return tpl.split('{partNumber}').join(encodeURIComponent(partNumber))
+}
+
+/** Safe URL inspection: returns host and path only — never the query string,
+ *  never any embedded secret. Used for /api/ti/status diagnostics. */
+function safeUrlSummary(url: string): { host: string; path: string } {
+  try {
+    const u = new URL(url)
+    return { host: u.host, path: u.pathname }
+  } catch {
+    return { host: '', path: '' }
+  }
 }
 
 export type TiStatus = {
@@ -156,8 +195,9 @@ export async function fetchTiToken(env: TiEnv): Promise<TiTokenSuccess | TiToken
     client_secret: clientSecret,
   }).toString()
   let res: Response
+  const tokenUrl = resolveTokenUrl(env)
   try {
-    res = await fetch(TOKEN_URL, {
+    res = await fetch(tokenUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -292,8 +332,9 @@ export async function fetchTiProductInfo(
     }, [tok.status])
   }
   let res: Response
+  const productUrl = resolveProductInfoUrl(env, cleaned)
   try {
-    res = await fetch(PRODUCT_INFO_URL(cleaned), {
+    res = await fetch(productUrl, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${tok.token}`,
@@ -476,8 +517,9 @@ export async function fetchTiInventoryPricing(
     }, [tok.status])
   }
   let res: Response
+  const inventoryUrl = resolveInventoryPricingUrl(env, cleaned)
   try {
-    res = await fetch(INVENTORY_PRICING_URL(cleaned), {
+    res = await fetch(inventoryUrl, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${tok.token}`,
@@ -581,5 +623,38 @@ export function tokenCacheSnapshot():
     hasCache: true,
     fetchedAt: new Date(tokenCache.fetchedAtMs).toISOString(),
     expiresAt: new Date(tokenCache.expiresAtMs).toISOString(),
+  }
+}
+
+/** Phase 20A.1 — return the host + path the adapter would call, for safe
+ *  display in /api/ti/status diagnostics. Never includes query strings (which
+ *  could carry secrets in a misconfigured override) or anything secret-bearing. */
+export function tiAttemptedEndpoints(env: TiEnv): {
+  attemptedTokenHost: string
+  attemptedTokenPath: string
+  attemptedProductInfoHost: string
+  attemptedProductInfoPath: string
+  attemptedInventoryPricingHost: string
+  attemptedInventoryPricingPath: string
+  tokenUrlOverridden: boolean
+  productInfoUrlOverridden: boolean
+  inventoryPricingUrlOverridden: boolean
+} {
+  const tok = safeUrlSummary(resolveTokenUrl(env))
+  // Substitute a placeholder so the resolved URL has a real path shape but
+  // never carries a real part number (no risk in this case, but keeps the
+  // shape stable for display).
+  const prod = safeUrlSummary(resolveProductInfoUrl(env, '_placeholder_'))
+  const inv = safeUrlSummary(resolveInventoryPricingUrl(env, '_placeholder_'))
+  return {
+    attemptedTokenHost: tok.host,
+    attemptedTokenPath: tok.path,
+    attemptedProductInfoHost: prod.host,
+    attemptedProductInfoPath: prod.path,
+    attemptedInventoryPricingHost: inv.host,
+    attemptedInventoryPricingPath: inv.path,
+    tokenUrlOverridden: !!(env.TI_TOKEN_URL && env.TI_TOKEN_URL.trim()),
+    productInfoUrlOverridden: !!(env.TI_PRODUCT_INFO_URL_TEMPLATE && env.TI_PRODUCT_INFO_URL_TEMPLATE.trim()),
+    inventoryPricingUrlOverridden: !!(env.TI_INVENTORY_PRICING_URL_TEMPLATE && env.TI_INVENTORY_PRICING_URL_TEMPLATE.trim()),
   }
 }

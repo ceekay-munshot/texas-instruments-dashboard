@@ -62,6 +62,7 @@ import {
   fetchTiProductInfo,
   fetchTiInventoryPricing,
   tokenCacheSnapshot as tiTokenCacheSnapshot,
+  tiAttemptedEndpoints,
 } from './sources/tiDirect'
 
 type Bindings = {
@@ -1669,6 +1670,7 @@ app.get('/api/ti/status', async (c) => {
       tokenSanitizedMessage = tok.sanitizedMessage
     }
   }
+  const endpoints = tiAttemptedEndpoints(env)
   return c.json({
     configured: status.configured,
     env: status.env,
@@ -1701,10 +1703,21 @@ app.get('/api/ti/status', async (c) => {
       tokenHttpStatus,
       sanitizedCode: tokenSanitizedCode,
       sanitizedMessage: tokenSanitizedMessage,
+      // Phase 20A.1 — host + path only. No query strings, no secrets, ever.
+      attemptedTokenHost: endpoints.attemptedTokenHost,
+      attemptedTokenPath: endpoints.attemptedTokenPath,
+      attemptedProductInfoHost: endpoints.attemptedProductInfoHost,
+      attemptedProductInfoPath: endpoints.attemptedProductInfoPath,
+      attemptedInventoryPricingHost: endpoints.attemptedInventoryPricingHost,
+      attemptedInventoryPricingPath: endpoints.attemptedInventoryPricingPath,
+      tokenUrlOverridden: endpoints.tokenUrlOverridden,
+      productInfoUrlOverridden: endpoints.productInfoUrlOverridden,
+      inventoryPricingUrlOverridden: endpoints.inventoryPricingUrlOverridden,
     },
     notes: [
       'OAuth token is cached in-memory for up to 55 minutes and is never returned.',
       'Store API endpoints refuse to call TI until TI_STORE_API_ENABLED=true.',
+      'Endpoint URLs can be overridden via TI_TOKEN_URL / TI_PRODUCT_INFO_URL_TEMPLATE / TI_INVENTORY_PRICING_URL_TEMPLATE. Templates use {partNumber}.',
     ],
   })
 })

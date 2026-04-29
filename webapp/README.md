@@ -926,12 +926,21 @@ We now have an approved TI Product Information API key. The TI Store API suite (
 
 **Required Cloudflare Pages env vars:**
 
-| Var | Purpose |
+| Var | Required | Default | Purpose |
+|---|---|---|---|
+| `TI_CLIENT_ID` | ✓ | — | TI Developer Portal app client id |
+| `TI_CLIENT_SECRET` | ✓ | — | TI Developer Portal app client secret |
+| `TI_API_ENV` | ✓ | — | Must be exactly `production`. Anything else disables the adapter. |
+| `TI_STORE_API_ENABLED` | optional | `false`/`pending_approval` | Operator flag. `true` once TI Store API suite approval lands; otherwise treated as `pending_approval`. |
+
+**Optional URL overrides (Phase 20A.1).** None of these are secrets; they exist so an operator can repoint the adapter at TI's exact endpoint paths via Cloudflare env vars without a code redeploy. Templates substitute `{partNumber}` at request time.
+
+| Var | Default |
 |---|---|
-| `TI_CLIENT_ID` | TI Developer Portal app client id |
-| `TI_CLIENT_SECRET` | TI Developer Portal app client secret |
-| `TI_API_ENV` | Must be exactly `production`. Anything else disables the adapter. |
-| `TI_STORE_API_ENABLED` | Operator flag. `true` once TI Store API suite approval lands; otherwise treated as `pending_approval`. |
+| `TI_TOKEN_URL` | `https://transact.ti.com/v1/oauth/accesstoken` |
+| `TI_PRODUCT_INFO_URL_TEMPLATE` | `https://transact.ti.com/v1/products/{partNumber}` |
+| `TI_PRODUCT_INFO_EXTENDED_URL_TEMPLATE` | `https://transact.ti.com/v1/products-extended/{partNumber}?page=0` |
+| `TI_INVENTORY_PRICING_URL_TEMPLATE` | `https://transact.ti.com/v1/store/products/inventory-pricing?partNumber={partNumber}` |
 
 **Endpoints:**
 
@@ -983,6 +992,33 @@ When Store API is in `pending approval`, an italic note appears below the card: 
 - No KV writes. Per-call results are returned ad-hoc and not stored as snapshots yet.
 - No customer-facing exposure of TI live data — the card is the only visible surface, and it shows status only.
 - No GitHub Actions wiring for TI capture yet — that comes once Store API is live and we know what daily ingest cadence makes sense.
+
+#### Phase 20A.1 — token-URL fix and operator-safe overrides
+
+The first probe against the deployed adapter surfaced TI's own gateway error `TI-API-00221: "No API Endpoint Found"` at HTTP 404 on the OAuth token call. The 19A-era guess `https://transact.ti.com/v2/oauth/token` is **not** TI's production OAuth path. Phase 20A.1 fixes the default to TI's documented endpoint and adds operator-safe URL overrides:
+
+- **Default token URL** is now `https://transact.ti.com/v1/oauth/accesstoken` (POST, `Content-Type: application/x-www-form-urlencoded`, body `grant_type=client_credentials&client_id=…&client_secret=…`). The body and method are unchanged from Phase 20A.
+- **`TI_TOKEN_URL`** env var overrides the default — paste a different URL into Cloudflare env vars and redeploy/restart, no code change needed. Same pattern for `TI_PRODUCT_INFO_URL_TEMPLATE`, `TI_PRODUCT_INFO_EXTENDED_URL_TEMPLATE`, and `TI_INVENTORY_PRICING_URL_TEMPLATE`.
+
+`/api/ti/status` now exposes safe URL diagnostics so the operator can confirm at a glance which host + path the adapter is calling — without ever surfacing query strings (which could carry secrets if a misconfigured override pasted them) or any credential value:
+
+```
+diagnostics: {
+  tokenHttpStatus,
+  attemptedTokenHost: "transact.ti.com",
+  attemptedTokenPath: "/v1/oauth/accesstoken",
+  attemptedProductInfoHost: "transact.ti.com",
+  attemptedProductInfoPath: "/v1/products/_placeholder_",
+  attemptedInventoryPricingHost: "transact.ti.com",
+  attemptedInventoryPricingPath: "/v1/store/products/inventory-pricing",
+  tokenUrlOverridden: false,
+  productInfoUrlOverridden: false,
+  inventoryPricingUrlOverridden: false,
+  sanitizedCode, sanitizedMessage,
+}
+```
+
+If a 4xx still shows up after this patch, the operator has the host + path right in the response and can compare to TI's portal docs without grepping the codebase or asking for new env-var docs.
 
 **Example operator probe** (the secret comes from your shell — never paste it):
 
