@@ -1636,6 +1636,7 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     return a !== b
   }
 
+  type TrendConfidence = 'high' | 'medium' | 'low' | 'pending'
   type RowTrend = {
     signal: typeof mouserTrendsRaw.categoryTrends[number]['signal']
     source: 'mouser' | 'nexar' | null
@@ -1649,6 +1650,75 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     sourcesDisagree: boolean
     /** Number of dated snapshots powering the chosen source's trend. */
     observationCount: number
+    /** Phase 17B — confidence framing for the chosen trend label. */
+    trendConfidence: TrendConfidence
+    trendConfidenceReason: string
+    /** 0–100; pending 0–25, low 35–50, medium 60–75, high 80–95. */
+    confidenceScore: number
+  }
+
+  // Resolve confidence for a row's trend. Trend logic itself is unchanged —
+  // this only categorizes the existing signal + source picture.
+  function resolveTrendConfidence(
+    signal: string,
+    sourcesDisagree: boolean,
+    mUsefulHere: boolean,
+    nUsefulHere: boolean,
+    chosenObservationCount: number,
+    mouserSignal: string | null,
+    nexarSignal: string | null,
+  ): { trendConfidence: TrendConfidence; trendConfidenceReason: string; confidenceScore: number } {
+    if (signal === 'insufficient_history') {
+      return {
+        trendConfidence: 'pending',
+        trendConfidenceReason: 'Needs 2 dated snapshots from at least one source.',
+        confidenceScore: 10,
+      }
+    }
+    if (sourcesDisagree) {
+      // Both sources are useful but disagree on direction. Per spec, confidence
+      // is medium or low depending on source coverage; keep at low so the
+      // disagreement is visibly cautious.
+      return {
+        trendConfidence: 'low',
+        trendConfidenceReason:
+          `Sources disagree on direction (Mouser: ${mouserSignal ?? '—'}; Nexar: ${nexarSignal ?? '—'}). Treat as low-confidence.`,
+        confidenceScore: 45,
+      }
+    }
+    if (mUsefulHere && nUsefulHere) {
+      return {
+        trendConfidence: 'high',
+        trendConfidenceReason: 'Both Mouser and Nexar trends agree on direction.',
+        confidenceScore: 85,
+      }
+    }
+    if (mUsefulHere) {
+      return {
+        trendConfidence: 'medium',
+        trendConfidenceReason: 'Mouser backbone trend; Nexar corroboration not yet available for this category.',
+        confidenceScore: 65,
+      }
+    }
+    if (nUsefulHere) {
+      if (chosenObservationCount >= 3) {
+        return {
+          trendConfidence: 'medium',
+          trendConfidenceReason: 'Nexar trend with 3+ dated snapshots; Mouser corroboration not yet available.',
+          confidenceScore: 65,
+        }
+      }
+      return {
+        trendConfidence: 'low',
+        trendConfidenceReason: 'Early Nexar-only trend; Mouser backbone needs another dated snapshot.',
+        confidenceScore: 40,
+      }
+    }
+    return {
+      trendConfidence: 'pending',
+      trendConfidenceReason: 'No usable trend yet.',
+      confidenceScore: 0,
+    }
   }
 
   // Decorate each existing sourceAgreement row with a `trend` object.
@@ -1659,9 +1729,15 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     const nUseful = isTrendUseful(n)
     let trend: RowTrend
     if (mUseful && nUseful) {
-      // Both sources have a usable trend — prefer Mouser (full backbone),
-      // but if signals materially disagree downgrade to 'mixed'.
       const disagree = trendsDisagree(m!.signal, n!.signal)
+      const conf = resolveTrendConfidence(
+        disagree ? 'mixed' : m!.signal,
+        disagree,
+        true, true,
+        m!.observationCount,
+        m!.signal,
+        n!.signal,
+      )
       trend = {
         signal: disagree ? 'mixed' : m!.signal,
         source: 'mouser',
@@ -1673,8 +1749,14 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
         nexarSignal: n!.signal,
         sourcesDisagree: disagree,
         observationCount: m!.observationCount,
+        ...conf,
       }
     } else if (mUseful) {
+      const conf = resolveTrendConfidence(
+        m!.signal, false, true, false,
+        m!.observationCount,
+        m!.signal, null,
+      )
       trend = {
         signal: m!.signal,
         source: 'mouser',
@@ -1686,8 +1768,14 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
         nexarSignal: null,
         sourcesDisagree: false,
         observationCount: m!.observationCount,
+        ...conf,
       }
     } else if (nUseful) {
+      const conf = resolveTrendConfidence(
+        n!.signal, false, false, true,
+        n!.observationCount,
+        null, n!.signal,
+      )
       trend = {
         signal: n!.signal,
         source: 'nexar',
@@ -1699,9 +1787,14 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
         nexarSignal: n!.signal,
         sourcesDisagree: false,
         observationCount: n!.observationCount,
+        ...conf,
       }
     } else {
       // No usable trend yet — needs ≥2 dated snapshots from at least one source.
+      const conf = resolveTrendConfidence(
+        'insufficient_history', false, false, false, 0,
+        m?.signal ?? null, n?.signal ?? null,
+      )
       trend = {
         signal: 'insufficient_history',
         source: null,
@@ -1713,10 +1806,21 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
         nexarSignal: n?.signal ?? null,
         sourcesDisagree: false,
         observationCount: 0,
+        ...conf,
       }
     }
     return { ...row, trend }
   })
+
+  // Phase 17B — top-level confidence histogram for the summary line above the table.
+  const trendConfidenceCounts = sourceAgreementWithTrend.reduce(
+    (acc, r) => {
+      const c = r.trend?.trendConfidence ?? 'pending'
+      acc[c] = (acc[c] ?? 0) + 1
+      return acc
+    },
+    { high: 0, medium: 0, low: 0, pending: 0 } as Record<TrendConfidence, number>,
+  )
 
   // Trend readiness per source — same shape /api/snapshots/trends already returns.
   const trendReadiness = {
@@ -1753,6 +1857,7 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     sourceAgreement: sourceAgreementWithTrend,
     trendReadiness,
     sourceTrendStatus,
+    trendConfidenceCounts,
     legacyToCanonical,
     notes: COMBINED_EVIDENCE_NOTES,
     ...base,

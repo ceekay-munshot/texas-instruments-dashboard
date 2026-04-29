@@ -392,17 +392,30 @@ const TREND_COLOR = {
 };
 function trendCellFor(row) {
   const t = row?.trend;
-  if (!t) return { label: 'Pending', color: '#4a6a8a', tooltip: 'Needs 2 dated snapshots.', source: null };
+  if (!t) return { label: 'Pending', color: '#4a6a8a', tooltip: 'Needs 2 dated snapshots.', source: null, confidence: 'pending', confidenceLabel: 'Pending' };
   const label = TREND_LABEL[t.signal] || 'Pending';
   const color = TREND_COLOR[t.signal] || '#4a6a8a';
-  let tooltip;
-  if (t.signal === 'insufficient_history') {
-    tooltip = 'Needs 2 dated snapshots.';
-  } else {
-    tooltip = `Trend uses dated snapshots, not same-day source comparison. Source: ${t.source || '—'}.`;
-  }
-  return { label, color, tooltip, source: t.source };
+  const confidence = t.trendConfidence || 'pending';
+  const confidenceLabel = CONFIDENCE_LABEL[confidence] || 'Pending';
+  let tooltip = 'Trend uses dated snapshots, not same-day source comparison.';
+  tooltip += ` Confidence: ${confidence}.`;
+  if (t.trendConfidenceReason) tooltip += ` Reason: ${t.trendConfidenceReason}`;
+  return { label, color, tooltip, source: t.source, confidence, confidenceLabel };
 }
+
+// Phase 17B: confidence badge labels and colors.
+const CONFIDENCE_LABEL = {
+  high: 'High confidence',
+  medium: 'Medium confidence',
+  low: 'Low confidence',
+  pending: 'Pending',
+};
+const CONFIDENCE_COLOR = {
+  high: '#4dffc3',
+  medium: '#00c9a7',
+  low: '#f0a84e',
+  pending: '#4a6a8a',
+};
 
 function fmtPrice(v) { return v == null ? '—' : `$${Number(v).toFixed(4)}`; }
 function fmtInv(v) { return v == null ? '—' : Number(v).toLocaleString(); }
@@ -563,6 +576,18 @@ function SourceAgreementTable({ combined, trendMeta }) {
         <span style={{ marginLeft: 10, fontStyle: 'italic', color: '#7a96b8' }}>Trend uses dated snapshots, not same-day source comparison.</span>
       </div>
 
+      {/* Trend confidence histogram (Phase 17B) */}
+      <div style={{ marginTop: 6, fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+        <span style={{ color: '#6b8aa8', letterSpacing: '0.06em', textTransform: 'uppercase', fontSize: '0.6rem', fontWeight: 'bold', marginRight: 6 }}>Trend confidence:</span>
+        <span style={{ color: CONFIDENCE_COLOR.high }}>High: {combined.trendConfidenceCounts?.high ?? 0}</span>
+        <span> · </span>
+        <span style={{ color: CONFIDENCE_COLOR.medium }}>Medium: {combined.trendConfidenceCounts?.medium ?? 0}</span>
+        <span> · </span>
+        <span style={{ color: CONFIDENCE_COLOR.low }}>Low: {combined.trendConfidenceCounts?.low ?? 0}</span>
+        <span> · </span>
+        <span style={{ color: CONFIDENCE_COLOR.pending }}>Pending: {combined.trendConfidenceCounts?.pending ?? 0}</span>
+      </div>
+
       {/* Filter chips */}
       <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid #0d1520', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
         <span style={{ ...label, marginRight: 4 }}>Show:</span>
@@ -629,6 +654,7 @@ function SourceAgreementTable({ combined, trendMeta }) {
                     {tc.label}
                     {tc.source && tc.label !== 'Pending' && <span style={{ color: '#4a6a8a', marginLeft: 4, fontSize: '0.58rem' }}>· {tc.source}</span>}
                     {r?.trend?.sourcesDisagree && <span style={{ color: '#f0a84e', marginLeft: 4, fontSize: '0.58rem' }}>· sources disagree</span>}
+                    <span style={{ color: CONFIDENCE_COLOR[tc.confidence] || '#4a6a8a', marginLeft: 4, fontSize: '0.58rem' }}>· {tc.confidenceLabel}</span>
                   </td>
                 </tr>
               );

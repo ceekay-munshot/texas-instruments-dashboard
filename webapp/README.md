@@ -658,6 +658,42 @@ Trend readiness: Mouser: N snapshots · pending until 2 dated snapshots · Nexar
 
 **Why Mouser preferred?** Mouser is the free full backbone — every category has a Mouser observation daily. Nexar only touches the rotating sample subset (≤ 4 SKUs/day). Mouser-preferred resolution maximizes the number of categories that can ever leave `Pending`. Nexar fallback covers the early window before Mouser has accumulated 2 dated snapshots, and then quietly fades out as Mouser catches up.
 
+#### Trend confidence (Phase 17B)
+
+Phase 17A makes labels appear only where dated history supports them. Phase 17B adds a **confidence band** so a 2-day Nexar-only signal is never read as a fully validated direction call. Each row's `trend` payload now includes:
+
+```
+trend: {
+  ...existing fields,
+  trendConfidence: 'high' | 'medium' | 'low' | 'pending',
+  trendConfidenceReason: '...',          // human-readable explanation
+  confidenceScore: 0..100,               // pending 0–25, low 35–50, medium 60–75, high 80–95
+}
+```
+
+The top-level `trendConfidenceCounts` field is a histogram of the four bands across all 28 canonical subcategories so the UI can show a one-line summary above the table.
+
+**Bands:**
+
+| Confidence | When it fires | Score | Reason copy |
+|---|---|---:|---|
+| `pending` | `signal === 'insufficient_history'` | 10 | "Needs 2 dated snapshots from at least one source." |
+| `low` | Only Nexar useful, `observationCount === 2` (just-enough Nexar history, no Mouser corroboration) | 40 | "Early Nexar-only trend; Mouser backbone needs another dated snapshot." |
+| `low` | Both sources useful but signals materially disagree | 45 | "Sources disagree on direction (Mouser: …; Nexar: …). Treat as low-confidence." |
+| `medium` | Mouser useful, Nexar missing | 65 | "Mouser backbone trend; Nexar corroboration not yet available for this category." |
+| `medium` | Nexar useful with `observationCount ≥ 3`, Mouser missing | 65 | "Nexar trend with 3+ dated snapshots; Mouser corroboration not yet available." |
+| `high` | Both sources useful, signals agree | 85 | "Both Mouser and Nexar trends agree on direction." |
+
+**Why Nexar-only 2-day signals are low confidence.** Two dated points is the absolute minimum for a slope, and Nexar's rotating sample touches each category infrequently — a 2-day Nexar trend can be a real signal *or* the artifact of a single bad observation. We surface it (so divergent days aren't hidden) but tag it `Low confidence` so the customer doesn't read it as conclusive.
+
+**Why Mouser becomes primary after 2 snapshots.** Once Mouser has ≥2 dated snapshots, every canonical subcategory has the same 2-point history at minimum, computed from the full backbone — there is no rotation gap. Per-row resolution prefers Mouser; Nexar then either corroborates (→ `High`), disagrees (→ `Low` and `signal: mixed`), or is silent (→ `Medium`).
+
+**Why mixed signals are not hidden.** When both sources disagree on direction, the row stays visible with `signal: 'mixed'`, `sourcesDisagree: true`, `Low confidence`, and a tooltip naming both source signals. Hiding the disagreement would be worse than showing it cautiously.
+
+**Why pending is not a failure.** Until Mouser hits the 2-snapshot threshold (next daily run after first capture), most rows stay `Pending`. That's the conservative, honest state — not a bug. The Trend confidence summary above the table makes the count visible.
+
+**UI display.** Each Trend cell now renders `<Label> · <source> · <Confidence band>` with the confidence text colored by band (mint = high, teal = medium, amber = low, muted = pending). The hover tooltip on the cell includes `Confidence: <band>. Reason: <trendConfidenceReason>` so the customer can see exactly why the band was assigned.
+
 ## Local Development
 ```bash
 npm install
