@@ -893,6 +893,28 @@ If the probe returns `digikey_product_forbidden` / `digikey_product_not_entitled
    - `diagnostics.productStage.endpointTried` includes both `/products/v4/search/keyword` (POST) and `/products/v4/search/{mpn}/productdetails` (GET) — the adapter automatically falls back to the second on 4xx from the first, so you can see whether either path works.
 9. **What the sanitizer redacts.** Bearer tokens, anything looking like a JWT or long base64 token, the configured client id/secret if they ever appear in a body. Headers are never echoed. The probe response is safe to paste into a bug report.
 
+#### Phase 19A.2 — header alignment with the official sandbox sample
+
+DigiKey's official sandbox `ProductSearch` example calls `GET /products/v4/search/{part}/productdetails` with these headers:
+
+```
+Authorization: Bearer <token>
+X-DIGIKEY-Client-Id: <client id>
+X-DIGIKEY-Customer-Id: 0
+X-DIGIKEY-Locale-Site: US
+X-DIGIKEY-Locale-Language: en
+X-DIGIKEY-Locale-Currency: USD
+```
+
+Phase 19A.1 had removed `X-DIGIKEY-Customer-Id` (sandbox often rejects it as `0` was hand-wavingly excluded). That turned out to be wrong — DigiKey's sandbox **expects** the header. Phase 19A.2 puts it back and adds two diagnostic flags so an operator can confirm at a glance:
+
+- `diagnostics.productStage.customerIdHeaderSent: true` — every product call now includes `X-DIGIKEY-Customer-Id: 0`.
+- `diagnostics.productStage.primaryStrategy` — `digikey_product_number_productdetails` when the input ends in `-ND` (DigiKey product number, e.g. `P5555-ND`); `keyword_search` for manufacturer MPNs (e.g. `TPS7A8300RGWR`); `mixed` when the probe contains both kinds.
+
+The per-input `results[i].diagnostics` carries the same `primaryStrategy` + `customerIdHeaderSent` so it's clear which endpoint was tried first for each MPN and whether the header was present on that call. Headers themselves are never echoed back; only the boolean is exposed.
+
+**If `P5555-ND` still returns 403 after this patch**, the dashboard now matches DigiKey's official sandbox `ProductSearch` sample exactly — header set, primary endpoint, and method. At that point the root cause is on DigiKey's side (entitlement propagation, sandbox app configuration, or backend) rather than the dashboard code, and the next step is to escalate to DigiKey support with the sanitized `diagnostics` block from the probe response.
+
 ## Local Development
 ```bash
 npm install
