@@ -430,42 +430,13 @@ function SourceAgreementTable({ combined, trendMeta }) {
   const wrap = { padding: '14px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const label = { fontSize: '0.6rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
 
-  // Empty / waiting states (graceful) — keep the strip slim, never error.
-  if (!combined) {
-    return (
-      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={label}>▼ Source agreement</span>
-        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>· Waiting for Mouser + Nexar snapshots…</span>
-      </div>
-    );
-  }
-  if (combined.status === 'snapshot_storage_not_configured') {
-    return (
-      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={label}>▼ Source agreement</span>
-        <span style={{ fontSize: '0.7rem', color: '#f0a84e' }}>· Snapshot storage not configured.</span>
-      </div>
-    );
-  }
-  if (combined.status === 'no_snapshots') {
-    return (
-      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={label}>▼ Source agreement</span>
-        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>· Waiting for Mouser + Nexar snapshots.</span>
-      </div>
-    );
-  }
-  if (combined.status === 'mouser_only') {
-    // Mouser backbone exists, Nexar pending — informational, not an error.
-    return (
-      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={label}>▼ Source agreement</span>
-        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>
-          · Mouser backbone active ({combined.latestMouserSnapshotDate}); Nexar corroboration pending.
-        </span>
-      </div>
-    );
-  }
+  // No useful cross-source data → render nothing. The customer doesn't need
+  // a "Waiting for snapshots" placeholder; they get useful content from the
+  // Live signal panel above. A slim status appears in the Insights footer.
+  if (!combined) return null;
+  if (combined.status === 'snapshot_storage_not_configured') return null;
+  if (combined.status === 'no_snapshots') return null;
+  if (combined.status === 'mouser_only') return null;
 
   const rows = combined.sourceAgreement || [];
   const total = rows.length;
@@ -684,6 +655,167 @@ function SourceAgreementTable({ combined, trendMeta }) {
         Single-source rows are not errors — they reflect Nexar's permanent 4-call/day rotating cap. Mouser is the full free backbone covering all 28 canonical subcategories.
       </div>
     </div>
+  );
+}
+
+// ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
+// Shows only what answers the customer's question: are prices moving, by how
+// much, where, and any outliers. Hides empty sections. No operator chrome.
+function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta }) {
+  const sig = useMemo(() => computeSignal(liveData), [liveData]);
+  const fmt = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+
+  // Section styles
+  const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+  const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 10 };
+
+  // Loading / no live data — keep it short and human.
+  if (sig.state === 'waiting') {
+    return (
+      <div style={sectionWrap}>
+        <div style={{ fontSize: '0.8rem', color: '#7a96b8' }}>Loading live prices…</div>
+      </div>
+    );
+  }
+  if (sig.state === 'no-live') {
+    return (
+      <div style={sectionWrap}>
+        <div style={{ fontSize: '0.8rem', color: '#f0a84e' }}>Live prices unavailable. Try Refresh on the Prices tab.</div>
+      </div>
+    );
+  }
+
+  const Tile = ({ name, value, sub, color }) => (
+    <div style={{ minWidth: 130 }}>
+      <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>{name}</div>
+      <div style={{ fontSize: '1.1rem', fontFamily: 'monospace', color: color || '#e0eaf8', lineHeight: 1.2, marginTop: 4 }}>{value}</div>
+      {sub && <div style={{ fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 1 }}>{sub}</div>}
+    </div>
+  );
+
+  const moverColor = (v, up) => up
+    ? (Math.abs(v) >= 5 ? '#4dffc3' : '#00c9a7')
+    : (Math.abs(v) >= 5 ? '#ff7575' : '#f05c5c');
+
+  const hasMovers = sig.topUp.length > 0 || sig.topDown.length > 0;
+  const hasAnomalies = sig.inflationFlags.length > 0 || sig.deflationFlags.length > 0 || sig.outliers.length > 0;
+  const showSourceTable = combinedEvidence?.status === 'ok' || combinedEvidence?.status === 'partial' || combinedEvidence?.status === 'nexar_only';
+
+  return (
+    <>
+      {/* ── Headline: tone + signal sentence ── */}
+      <div style={{ ...sectionWrap, paddingTop: 22, paddingBottom: 22 }}>
+        <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold' }}>
+          Live signal
+          {baselineMeta?.baselinePeriodLabel && <span style={{ color: '#4a6a8a', marginLeft: 8 }}>vs {baselineMeta.baselinePeriodLabel}</span>}
+        </div>
+        <div style={{ fontSize: '1.4rem', fontWeight: 'bold', color: sig.toneColor, fontFamily: 'monospace', marginTop: 8, lineHeight: 1.1 }}>
+          {sig.tone}
+        </div>
+        <div style={{ marginTop: 8, fontSize: '0.8rem', color: '#c4d4e8', lineHeight: 1.55, maxWidth: 880 }}>
+          {sig.interp}
+        </div>
+        {sig.partial && (
+          <div style={{ marginTop: 6, fontSize: '0.66rem', color: '#f0a84e' }}>Partial coverage — {sig.liveCount}/{sig.total} categories live.</div>
+        )}
+      </div>
+
+      {/* ── Headline tiles: Median, Average, Breadth ── */}
+      <div style={sectionWrap}>
+        <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
+          <Tile name="Median" value={fmt(sig.median)} color={sig.median >= 0 ? '#00c9a7' : '#f05c5c'} />
+          <Tile name="Average" value={fmt(sig.mean)} color={sig.mean >= 0 ? '#00c9a7' : '#f05c5c'} />
+          <Tile name="Up vs Total" value={`${sig.upCount} / ${sig.liveCount}`} sub={`${(sig.breadthUp * 100).toFixed(0)}% of basket`} />
+          {Math.abs(sig.strongestGroup.avg) >= 0.5 && (
+            <Tile name="Strongest group" value={sig.strongestGroup.g} sub={fmt(sig.strongestGroup.avg)} color={GC[sig.strongestGroup.g]} />
+          )}
+          {Math.abs(sig.weakestGroup.avg) >= 0.5 && sig.weakestGroup.g !== sig.strongestGroup.g && (
+            <Tile name="Weakest group" value={sig.weakestGroup.g} sub={fmt(sig.weakestGroup.avg)} color={GC[sig.weakestGroup.g]} />
+          )}
+        </div>
+      </div>
+
+      {/* ── Top movers: only when there ARE movers ── */}
+      {hasMovers && (
+        <div style={sectionWrap}>
+          <div style={sectionTitle}>Top movers</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 1fr) minmax(280px, 1fr)', gap: 32 }}>
+            <div>
+              <div style={{ fontSize: '0.66rem', color: '#7a96b8', marginBottom: 6 }}>▲ Up</div>
+              {sig.topUp.length === 0
+                ? <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace' }}>—</div>
+                : <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontFamily: 'monospace', fontSize: '0.78rem' }}>
+                    {sig.topUp.map(d => (
+                      <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, maxWidth: 360 }}>
+                        <span style={{ color: '#c4d4e8' }}>{d.l}</span>
+                        <span style={{ color: moverColor(d.qoqPct, true), fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
+                      </div>
+                    ))}
+                  </div>}
+            </div>
+            <div>
+              <div style={{ fontSize: '0.66rem', color: '#7a96b8', marginBottom: 6 }}>▼ Down</div>
+              {sig.topDown.length === 0
+                ? <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace' }}>—</div>
+                : <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontFamily: 'monospace', fontSize: '0.78rem' }}>
+                    {sig.topDown.map(d => (
+                      <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, maxWidth: 360 }}>
+                        <span style={{ color: '#c4d4e8' }}>{d.l}</span>
+                        <span style={{ color: moverColor(d.qoqPct, false), fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
+                      </div>
+                    ))}
+                  </div>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Anomalies: only when there are any ── */}
+      {hasAnomalies && (
+        <div style={sectionWrap}>
+          <div style={sectionTitle}>Anomalies worth a look</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontFamily: 'monospace', fontSize: '0.74rem' }}>
+            {sig.inflationFlags.length > 0 && (
+              <div style={{ display: 'flex', gap: 12, color: '#4dffc3' }}>
+                <span style={{ minWidth: 22, color: '#4dffc3' }}>⚡</span>
+                <span style={{ minWidth: 180, color: '#c4d4e8' }}>Inflation ≥ +5%</span>
+                <span style={{ color: '#a0b8d0' }}>{sig.inflationFlags.map(d => `${d.l} ${fmt(d.qoqPct)}`).join(' · ')}</span>
+              </div>
+            )}
+            {sig.deflationFlags.length > 0 && (
+              <div style={{ display: 'flex', gap: 12, color: '#ff7575' }}>
+                <span style={{ minWidth: 22, color: '#ff7575' }}>⬇</span>
+                <span style={{ minWidth: 180, color: '#c4d4e8' }}>Deflation ≤ −5%</span>
+                <span style={{ color: '#a0b8d0' }}>{sig.deflationFlags.map(d => `${d.l} ${fmt(d.qoqPct)}`).join(' · ')}</span>
+              </div>
+            )}
+            {sig.outliers.length > 0 && (
+              <div style={{ display: 'flex', gap: 12, color: '#f0a84e' }}>
+                <span style={{ minWidth: 22, color: '#f0a84e' }}>◆</span>
+                <span style={{ minWidth: 180, color: '#c4d4e8' }}>Major outlier |Δ| ≥ 10%</span>
+                <span style={{ color: '#a0b8d0' }}>{sig.outliers.map(d => `${d.l} ${fmt(d.qoqPct)}`).join(' · ')}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Source agreement table — only when both sources have data today ── */}
+      {showSourceTable && <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>}
+
+      {/* ── Slim footer: data freshness summary ── */}
+      <div style={{ padding: '10px 16px', borderTop: '1px solid #0d1520', background: '#050810', fontSize: '0.62rem', color: '#7a96b8', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+        <span>
+          Baseline: {baselineMeta?.baselinePeriodLabel || 'Q1-26 close'} captured {baselineMeta?.baselineDate || '2026-04-28'}
+          {baselineMeta?.baselineAgeDays != null && <span style={{ color: '#4a6a8a' }}> · {baselineMeta.baselineAgeDays}d ago</span>}
+        </span>
+        <span>
+          Sources: Mouser{combinedEvidence?.latestMouserSnapshotDate ? ` (${combinedEvidence.latestMouserSnapshotDate})` : ''}
+          {combinedEvidence?.latestNexarSnapshotDate ? ` · Nexar (${combinedEvidence.latestNexarSnapshotDate})` : ''}
+          {trendMeta?.status === 'ok' && <span style={{ color: '#00c9a7' }}> · trend signal ready</span>}
+        </span>
+      </div>
+    </>
   );
 }
 
@@ -1219,46 +1351,12 @@ function App(){
       </div>
       </>}
 
-      {activeTab==='insights'&&<>
-        {/* ── Operator status lines ── */}
-        <div style={{padding:'12px 16px',borderBottom:`1px solid ${B}`,background:'#050810',display:'flex',flexDirection:'column',gap:6}}>
-          <div style={{fontSize:'0.6rem',color:'#7a96b8',fontFamily:'monospace'}}>
-            <span style={{color:'#6b8aa8',letterSpacing:'0.1em',textTransform:'uppercase',fontSize:'0.55rem',fontWeight:'bold',marginRight:6}}>Snapshot memory:</span>
-            {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}
-            {snapshotMeta&&` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`}
-            {evidenceData?.evidence&&` · source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`}
-            {evidenceData?.coverage&&` · basket: ${evidenceData.coverage.sampledSkuCount} / ${evidenceData.coverage.basketCatalogSkuCount} sampled today${evidenceData.coverage.samplingPolicy==='anchor_plus_rotation'?' · rotating':''}${evidenceData.coverage.estimatedFullCycleDays?` · full cycle ~${evidenceData.coverage.estimatedFullCycleDays}d`:''}`}
-            {trendMeta&&` · trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`}
-          </div>
-          <div style={{fontSize:'0.6rem',color:'#7a96b8',fontFamily:'monospace'}}>
-            <span style={{color:'#6b8aa8',letterSpacing:'0.1em',textTransform:'uppercase',fontSize:'0.55rem',fontWeight:'bold',marginRight:6}}>Taxonomy:</span>
-            28 TI subcategories · Mouser backbone · Nexar rotating corroboration
-            {combinedEvidence?.latestMouserSnapshotDate?` · Mouser snapshot ${combinedEvidence.latestMouserSnapshotDate}`:''}
-            {combinedEvidence?.latestNexarSnapshotDate?` · Nexar snapshot ${combinedEvidence.latestNexarSnapshotDate}`:''}
-          </div>
-        </div>
-
-        {/* ── Source Agreement Table (Phase 16B) ── */}
-        <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>
-
-        {/* ── Signal Summary (full panel) ── */}
-        <SignalSummary liveData={liveData} baselineMeta={baselineMeta}/>
-
-        {/* ── Operator-only basket source check ── */}
-        <div style={{padding:'10px 16px',borderTop:`1px solid #0d1520`,background:'#050810',fontSize:'0.6rem',color:'#7a96b8',fontFamily:'monospace',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-          <span style={{color:'#6b8aa8',letterSpacing:'0.1em',textTransform:'uppercase',fontSize:'0.55rem',fontWeight:'bold'}}>Nexar basket check</span>
-          {basketPreviewData
-            ? <span style={{color:'#3d8ef0'}}>{(basketPreviewData.categories||[]).filter(c=>(c.quotedSkuCount||0)>0).length} cats · {basketPreviewData.cached?'cached':'fresh'} · TTL {basketPreviewData.cacheTtlHours||24}h</span>
-            : <span style={{color:'#4a6a8a'}}>not yet loaded</span>}
-          <button
-            onClick={()=>fetchBasketPreview(true)}
-            disabled={basketLoading}
-            title={basketLoading?'Refreshing…':'Manually refresh Nexar basket source check — uses Nexar eval quota'}
-            style={{background:'none',border:`1px solid ${B}`,borderRadius:3,padding:'3px 9px',fontSize:'0.55rem',color:basketLoading?'#4a6480':'#3d8ef0',cursor:basketLoading?'not-allowed':'pointer',letterSpacing:'0.08em',textTransform:'uppercase',fontFamily:'inherit'}}>
-            ⟳ {basketLoading?'REFRESHING':'REFRESH'}
-          </button>
-        </div>
-      </>}
+      {activeTab==='insights'&&<InsightsPanel
+        liveData={liveData}
+        baselineMeta={baselineMeta}
+        combinedEvidence={combinedEvidence}
+        trendMeta={trendMeta}
+      />}
 
       {/* Tooltip — applies on prices tab when hovering live cells */}
       {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId))&&(
