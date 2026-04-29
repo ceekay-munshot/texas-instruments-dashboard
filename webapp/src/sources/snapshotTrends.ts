@@ -153,6 +153,10 @@ export function computeTrends(snapshots: Snapshot[], windowDays: number): Trends
 
     categoryTrends.push({
       categoryId: catId,
+      // Phase 17A: pass through canonical id so consumers can join by canonical
+      // without consulting the legacy → canonical map. Falls back to
+      // earliest's id if latest doesn't carry it (rolling-back scenario).
+      canonicalCategoryId: l.canonicalCategoryId ?? e?.canonicalCategoryId,
       categoryLabel: l.categoryLabel,
       observationCount: sorted.length,
       firstDate: earliest.snapshotDate,

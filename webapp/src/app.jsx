@@ -373,6 +373,37 @@ function sourceStateFor(row) {
   return { label: 'No data', color: '#4a6a8a' };
 }
 
+// Phase 17A: trend label + color mapping. Order matters for the legend.
+const TREND_LABEL = {
+  possible_shortage: 'Possible shortage',
+  easing_supply: 'Easing supply',
+  tight_but_unpriced: 'Tight inventory',
+  price_pressure_without_stock_signal: 'Price pressure',
+  mixed: 'Mixed',
+  insufficient_history: 'Pending',
+};
+const TREND_COLOR = {
+  possible_shortage: '#f0a84e',
+  easing_supply: '#4dffc3',
+  tight_but_unpriced: '#f0a84e',
+  price_pressure_without_stock_signal: '#f0a84e',
+  mixed: '#7a96b8',
+  insufficient_history: '#4a6a8a',
+};
+function trendCellFor(row) {
+  const t = row?.trend;
+  if (!t) return { label: 'Pending', color: '#4a6a8a', tooltip: 'Needs 2 dated snapshots.', source: null };
+  const label = TREND_LABEL[t.signal] || 'Pending';
+  const color = TREND_COLOR[t.signal] || '#4a6a8a';
+  let tooltip;
+  if (t.signal === 'insufficient_history') {
+    tooltip = 'Needs 2 dated snapshots.';
+  } else {
+    tooltip = `Trend uses dated snapshots, not same-day source comparison. Source: ${t.source || '—'}.`;
+  }
+  return { label, color, tooltip, source: t.source };
+}
+
 function fmtPrice(v) { return v == null ? '—' : `$${Number(v).toFixed(4)}`; }
 function fmtInv(v) { return v == null ? '—' : Number(v).toLocaleString(); }
 function fmtDeltaPct(v) {
@@ -519,6 +550,19 @@ function SourceAgreementTable({ combined, trendMeta }) {
         <Card name="Single-source only" value={counts.singleSource} color="#7a96b8" />
       </div>
 
+      {/* Trend readiness line (Phase 17A) — read-only summary, no extra fetches */}
+      <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+        <span style={{ color: '#6b8aa8', letterSpacing: '0.06em', textTransform: 'uppercase', fontSize: '0.6rem', fontWeight: 'bold', marginRight: 6 }}>Trend readiness:</span>
+        <span>
+          Mouser: {(combined.trendReadiness?.mouser?.observationCount ?? 0)} {(combined.trendReadiness?.mouser?.observationCount === 1) ? 'snapshot' : 'snapshots'}
+          {combined.trendReadiness?.mouser?.status === 'ok' ? <span style={{ color: '#4dffc3' }}> · ready</span> : <span style={{ color: '#7a96b8' }}> · pending until 2 dated snapshots</span>}
+          {' · '}
+          Nexar: {(combined.trendReadiness?.nexar?.observationCount ?? 0)} {(combined.trendReadiness?.nexar?.observationCount === 1) ? 'snapshot' : 'snapshots'}
+          {combined.trendReadiness?.nexar?.status === 'ok' ? <span style={{ color: '#4dffc3' }}> · ready</span> : <span style={{ color: '#7a96b8' }}> · pending until 2 dated snapshots</span>}
+        </span>
+        <span style={{ marginLeft: 10, fontStyle: 'italic', color: '#7a96b8' }}>Trend uses dated snapshots, not same-day source comparison.</span>
+      </div>
+
       {/* Filter chips */}
       <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid #0d1520', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
         <span style={{ ...label, marginRight: 4 }}>Show:</span>
@@ -545,12 +589,13 @@ function SourceAgreementTable({ combined, trendMeta }) {
               <th style={{ ...cellTH, textAlign: 'right' }}>Nexar inventory</th>
               <th style={cellTH}>Agreement</th>
               <th style={cellTH}>Source state</th>
+              <th style={cellTH}>Trend</th>
             </tr>
           </thead>
           <tbody>
             {sortedRows.length === 0 && (
               <tr>
-                <td colSpan={9} style={{ ...cellTD, color: '#7a96b8', textAlign: 'center', padding: '14px 10px' }}>
+                <td colSpan={10} style={{ ...cellTD, color: '#7a96b8', textAlign: 'center', padding: '14px 10px' }}>
                   No rows match this filter.
                 </td>
               </tr>
@@ -566,6 +611,7 @@ function SourceAgreementTable({ combined, trendMeta }) {
                   : Math.abs(r.priceDeltaPct) > 5
                     ? '#00c9a7'
                     : '#4dffc3';
+              const tc = trendCellFor(r);
               return (
                 <tr key={r.canonicalCategoryId} style={{ background: '#080c14' }}>
                   <td style={{ ...cellTD, color: GC[r.groupLabel] || '#a0b8d0' }}>{r.groupLabel}</td>
@@ -579,6 +625,11 @@ function SourceAgreementTable({ combined, trendMeta }) {
                   <td style={cellNum}>{fmtInv(r.nexarTrustedInventory)}</td>
                   <td style={{ ...cellTD, color: aColor, fontWeight: r.agreementStatus === 'divergent' ? 'bold' : 'normal' }}>{aLabel}</td>
                   <td style={{ ...cellTD, color: ss.color }}>{ss.label}</td>
+                  <td style={{ ...cellTD, color: tc.color }} title={tc.tooltip}>
+                    {tc.label}
+                    {tc.source && tc.label !== 'Pending' && <span style={{ color: '#4a6a8a', marginLeft: 4, fontSize: '0.58rem' }}>· {tc.source}</span>}
+                    {r?.trend?.sourcesDisagree && <span style={{ color: '#f0a84e', marginLeft: 4, fontSize: '0.58rem' }}>· sources disagree</span>}
+                  </td>
                 </tr>
               );
             })}

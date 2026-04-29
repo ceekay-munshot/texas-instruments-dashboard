@@ -1472,15 +1472,25 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
       nexarCoverage: null,
       combinedCoverage: null,
       sourceAgreement: [],
+      trendReadiness: {
+        mouser: { status: 'no_data', observationCount: 0, firstDate: null, latestDate: null },
+        nexar: { status: 'no_data', observationCount: 0, firstDate: null, latestDate: null },
+      },
+      sourceTrendStatus: 'pending',
       notes: COMBINED_EVIDENCE_NOTES,
       ...base,
     })
   }
 
-  const [mouserSnap, nexarSnap] = await Promise.all([
-    getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, MOUSER_SOURCE, MOUSER_MODE),
-    getLatestSnapshot(env.SOURCE_SNAPSHOTS_KV),
+  // Phase 17A — fetch RECENT snapshots (windowed) so we can compute trends in
+  // the same call. Two KV list-and-fetch round trips total; no Nexar calls.
+  const TREND_WINDOW_DAYS = 30
+  const [mouserSnaps, nexarSnaps] = await Promise.all([
+    getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, MOUSER_SOURCE, MOUSER_MODE, TREND_WINDOW_DAYS),
+    getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, 'octopart_nexar', 'representative_basket_preview', TREND_WINDOW_DAYS),
   ])
+  const mouserSnap: Snapshot | null = mouserSnaps.length > 0 ? mouserSnaps[mouserSnaps.length - 1] : null
+  const nexarSnap: Snapshot | null = nexarSnaps.length > 0 ? nexarSnaps[nexarSnaps.length - 1] : null
 
   // Build per-canonical lookups.
   const mouserByCanonical = new Map<string, { categoryLabel: string; price: number | null; inventory: number }>()
@@ -1592,6 +1602,145 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     legacyToCanonical[b.categoryId] = b.canonicalCategoryId ?? canonicalCategoryId(b.categoryId)
   }
 
+  // ── Phase 17A — trend computation per source + per-row resolution ────────
+  // Run the existing trend engine over each source's window. Keys are
+  // canonical-id → trend so the consumer (and the Source Agreement Table)
+  // can join without consulting legacyToCanonical.
+  const mouserTrendsRaw = computeTrends(mouserSnaps, TREND_WINDOW_DAYS)
+  const nexarTrendsRaw = computeTrends(nexarSnaps, TREND_WINDOW_DAYS)
+  const buildTrendMap = (trends: typeof mouserTrendsRaw) => {
+    const m = new Map<string, typeof trends.categoryTrends[number]>()
+    for (const t of trends.categoryTrends) {
+      const id = t.canonicalCategoryId ?? canonicalCategoryId(t.categoryId)
+      m.set(id, t)
+    }
+    return m
+  }
+  const mouserTrendByCanonical = buildTrendMap(mouserTrendsRaw)
+  const nexarTrendByCanonical = buildTrendMap(nexarTrendsRaw)
+
+  // A trend is "useful" only when both price AND inventory % changes were
+  // computable from the trend engine (i.e. there were non-null comparable
+  // values at both endpoints). 'insufficient_history' / null Δs are not used.
+  const isTrendUseful = (t: typeof mouserTrendsRaw.categoryTrends[number] | undefined): boolean => {
+    if (!t) return false
+    if (t.signal === 'insufficient_history') return false
+    return t.priceChangePct != null && t.inventoryChangePct != null
+  }
+
+  // "Disagree" only when both have a NON-mixed, NON-insufficient signal that
+  // is materially different. mixed itself is not a disagreement marker.
+  const trendsDisagree = (a: string, b: string): boolean => {
+    const trivial = new Set(['mixed', 'insufficient_history'])
+    if (trivial.has(a) || trivial.has(b)) return false
+    return a !== b
+  }
+
+  type RowTrend = {
+    signal: typeof mouserTrendsRaw.categoryTrends[number]['signal']
+    source: 'mouser' | 'nexar' | null
+    priceChangePct: number | null
+    inventoryChangePct: number | null
+    firstDate: string | null
+    latestDate: string | null
+    /** When both sources produced a usable trend, expose both for tooltip detail. */
+    mouserSignal: string | null
+    nexarSignal: string | null
+    sourcesDisagree: boolean
+    /** Number of dated snapshots powering the chosen source's trend. */
+    observationCount: number
+  }
+
+  // Decorate each existing sourceAgreement row with a `trend` object.
+  const sourceAgreementWithTrend = sourceAgreement.map(row => {
+    const m = mouserTrendByCanonical.get(row.canonicalCategoryId)
+    const n = nexarTrendByCanonical.get(row.canonicalCategoryId)
+    const mUseful = isTrendUseful(m)
+    const nUseful = isTrendUseful(n)
+    let trend: RowTrend
+    if (mUseful && nUseful) {
+      // Both sources have a usable trend — prefer Mouser (full backbone),
+      // but if signals materially disagree downgrade to 'mixed'.
+      const disagree = trendsDisagree(m!.signal, n!.signal)
+      trend = {
+        signal: disagree ? 'mixed' : m!.signal,
+        source: 'mouser',
+        priceChangePct: m!.priceChangePct,
+        inventoryChangePct: m!.inventoryChangePct,
+        firstDate: m!.firstDate,
+        latestDate: m!.latestDate,
+        mouserSignal: m!.signal,
+        nexarSignal: n!.signal,
+        sourcesDisagree: disagree,
+        observationCount: m!.observationCount,
+      }
+    } else if (mUseful) {
+      trend = {
+        signal: m!.signal,
+        source: 'mouser',
+        priceChangePct: m!.priceChangePct,
+        inventoryChangePct: m!.inventoryChangePct,
+        firstDate: m!.firstDate,
+        latestDate: m!.latestDate,
+        mouserSignal: m!.signal,
+        nexarSignal: null,
+        sourcesDisagree: false,
+        observationCount: m!.observationCount,
+      }
+    } else if (nUseful) {
+      trend = {
+        signal: n!.signal,
+        source: 'nexar',
+        priceChangePct: n!.priceChangePct,
+        inventoryChangePct: n!.inventoryChangePct,
+        firstDate: n!.firstDate,
+        latestDate: n!.latestDate,
+        mouserSignal: null,
+        nexarSignal: n!.signal,
+        sourcesDisagree: false,
+        observationCount: n!.observationCount,
+      }
+    } else {
+      // No usable trend yet — needs ≥2 dated snapshots from at least one source.
+      trend = {
+        signal: 'insufficient_history',
+        source: null,
+        priceChangePct: null,
+        inventoryChangePct: null,
+        firstDate: null,
+        latestDate: null,
+        mouserSignal: m?.signal ?? null,
+        nexarSignal: n?.signal ?? null,
+        sourcesDisagree: false,
+        observationCount: 0,
+      }
+    }
+    return { ...row, trend }
+  })
+
+  // Trend readiness per source — same shape /api/snapshots/trends already returns.
+  const trendReadiness = {
+    mouser: {
+      status: mouserTrendsRaw.status,
+      observationCount: mouserTrendsRaw.observationCount,
+      firstDate: mouserTrendsRaw.firstDate,
+      latestDate: mouserTrendsRaw.latestDate,
+    },
+    nexar: {
+      status: nexarTrendsRaw.status,
+      observationCount: nexarTrendsRaw.observationCount,
+      firstDate: nexarTrendsRaw.firstDate,
+      latestDate: nexarTrendsRaw.latestDate,
+    },
+  }
+  const mReady = mouserTrendsRaw.status === 'ok'
+  const nReady = nexarTrendsRaw.status === 'ok'
+  const sourceTrendStatus: 'mouser_ready' | 'nexar_ready' | 'both_ready' | 'pending' =
+    mReady && nReady ? 'both_ready'
+      : mReady ? 'mouser_ready'
+        : nReady ? 'nexar_ready'
+          : 'pending'
+
   return c.json({
     configured: true,
     status,
@@ -1601,7 +1750,9 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     mouserCoverage,
     nexarCoverage,
     combinedCoverage,
-    sourceAgreement,
+    sourceAgreement: sourceAgreementWithTrend,
+    trendReadiness,
+    sourceTrendStatus,
     legacyToCanonical,
     notes: COMBINED_EVIDENCE_NOTES,
     ...base,

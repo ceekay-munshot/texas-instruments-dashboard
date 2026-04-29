@@ -590,6 +590,74 @@ Phase 16A made the combined-evidence data available, but it was hidden inside pe
 - `status: mouser_only` (Mouser captured, Nexar not yet) → "Mouser backbone active (YYYY-MM-DD); Nexar corroboration pending."
 - All rows single-source → table renders normally; this is by design.
 
+### Trend labels and gating (Phase 17A)
+
+The Source Agreement Table tells the customer "do my two sources agree today?". It does not — and must not — answer "is this category in shortage or easing?". Phase 17A adds a separate **Trend** column that does answer that question, but **only** where dated-snapshot history actually supports the answer. Everywhere else it shows `Pending`.
+
+**Strict rules.**
+- **Source agreement is not trend.** Two sources agreeing on today's price says nothing about direction. The Trend column is computed from dated snapshots only.
+- **Need ≥2 distinct UTC-dated snapshots** for the chosen source. With only one snapshot, `Pending`.
+- **No fake history.** The trend engine consumes the actual stored snapshots only. It never synthesizes intermediate dates and never carries values forward.
+
+**Per-row resolution (worker-side, in `/api/snapshots/evidence/combined`):**
+- Compute Mouser trend across the last 30 days of stored Mouser snapshots.
+- Compute Nexar trend across the last 30 days of stored Nexar snapshots.
+- For each canonical subcategory:
+  1. **Prefer Mouser** when Mouser produced both `priceChangePct` and `inventoryChangePct` for the row — Mouser is the full backbone covering all 28 subcategories.
+  2. **Fall back to Nexar** when Mouser has no usable trend (because Mouser still needs ≥2 snapshots, or because that category is missing from one Mouser run). Nexar's rotating sample only covers a handful of canonical subcategories on any given day, so Nexar fallback is sparse by design.
+  3. **If both sources have a usable, materially-disagreeing signal**, the row is downgraded to `Mixed` and the per-row payload includes both `mouserSignal` and `nexarSignal` plus a `sourcesDisagree: true` flag for tooltips.
+  4. **Otherwise** the row stays `Pending` (`signal: 'insufficient_history'`, `source: null`).
+- Trend signals reuse the existing engine in [`snapshotTrends.ts`](webapp/src/sources/snapshotTrends.ts): `possible_shortage`, `easing_supply`, `tight_but_unpriced`, `price_pressure_without_stock_signal`, `mixed`, `insufficient_history`.
+
+**Endpoint additions (Phase 17A) — same `/api/snapshots/evidence/combined`, no new endpoints, no extra fetches from the page.**
+
+```
+{
+  ...existing fields,
+  sourceAgreement: [{
+    ...existing fields,
+    trend: {
+      signal,                        // 'possible_shortage' | 'easing_supply' | 'tight_but_unpriced'
+                                     //   | 'price_pressure_without_stock_signal' | 'mixed' | 'insufficient_history'
+      source,                        // 'mouser' | 'nexar' | null
+      priceChangePct,
+      inventoryChangePct,
+      firstDate, latestDate,
+      mouserSignal, nexarSignal,     // populated when both sources had a usable trend
+      sourcesDisagree,               // true → row downgraded to 'mixed'
+      observationCount               // dated snapshots powering the chosen source's trend
+    }
+  }],
+  trendReadiness: {
+    mouser: { status, observationCount, firstDate, latestDate },
+    nexar:  { status, observationCount, firstDate, latestDate },
+  },
+  sourceTrendStatus: 'mouser_ready' | 'nexar_ready' | 'both_ready' | 'pending',
+}
+```
+
+**UI surface (no redesign).** The Source Agreement Table gains one new column — `Trend` — with values:
+
+| Signal | Label |
+|---|---|
+| `possible_shortage` | Possible shortage |
+| `easing_supply` | Easing supply |
+| `tight_but_unpriced` | Tight inventory |
+| `price_pressure_without_stock_signal` | Price pressure |
+| `mixed` | Mixed |
+| `insufficient_history` | Pending |
+
+Each cell carries the source as a small subtag (`· mouser` / `· nexar`) and an amber `· sources disagree` tag when the resolution had to downgrade to `Mixed` due to source disagreement. Hovering the cell shows `Trend uses dated snapshots, not same-day source comparison.` (or `Needs 2 dated snapshots.` for the `Pending` state).
+
+A small **Trend readiness** line appears just above the table:
+
+```
+Trend readiness: Mouser: N snapshots · pending until 2 dated snapshots · Nexar: M snapshots · ready
+                 Trend uses dated snapshots, not same-day source comparison.
+```
+
+**Why Mouser preferred?** Mouser is the free full backbone — every category has a Mouser observation daily. Nexar only touches the rotating sample subset (≤ 4 SKUs/day). Mouser-preferred resolution maximizes the number of categories that can ever leave `Pending`. Nexar fallback covers the early window before Mouser has accumulated 2 dated snapshots, and then quietly fades out as Mouser catches up.
+
 ## Local Development
 ```bash
 npm install

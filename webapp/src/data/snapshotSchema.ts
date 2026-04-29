@@ -93,6 +93,8 @@ export type SnapshotTrendSignal =
 
 export type CategoryTrend = {
   categoryId: string
+  /** Canonical TI taxonomy id (Phase 17A). Optional — pre-17A trend output omits it. */
+  canonicalCategoryId?: string
   categoryLabel: string
   observationCount: number
   firstDate: string | null
