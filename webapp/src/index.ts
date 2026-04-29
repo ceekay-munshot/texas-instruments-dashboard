@@ -51,6 +51,11 @@ import {
   parseManualSourceParam,
   type ManualSource,
 } from './sources/manualSnapshotImport'
+import {
+  checkDigiKeySandboxConfigured,
+  probeDigiKeySandbox,
+  DIGIKEY_PROBE_MAX_MPNS,
+} from './sources/digikeySandbox'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -60,6 +65,11 @@ type Bindings = {
   SNAPSHOT_CAPTURE_SECRET?: string
   /** Cloudflare KV binding for durable source-memory snapshots. */
   SOURCE_SNAPSHOTS_KV?: SnapshotKV
+  /** Phase 19A — DigiKey sandbox app credentials. SANDBOX ONLY. */
+  DIGIKEY_CLIENT_ID?: string
+  DIGIKEY_CLIENT_SECRET?: string
+  /** Must be exactly 'sandbox' to enable the adapter. Anything else is treated as unsupported. */
+  DIGIKEY_ENV?: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -1540,6 +1550,72 @@ app.get('/api/snapshots/manual/history', async (c) => {
     snapshots: snaps,
     ...base,
   })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 19A — DigiKey sandbox connectivity adapter (NOT customer-facing yet)
+// ─────────────────────────────────────────────────────────────────────────────
+// Read-only status + auth-gated probe. No KV writes, no combined evidence
+// changes, no UI. Exists only to verify the DigiKey sandbox app works before
+// we build a real DigiKey snapshot pipeline in a later phase.
+
+// GET /api/digikey/status — returns whether the adapter is configured.
+// Never returns secret values; only booleans + the env tag.
+app.get('/api/digikey/status', (c) => {
+  const status = checkDigiKeySandboxConfigured(c.env)
+  return c.json({
+    ...status,
+    probeEndpoint: '/api/digikey/sandbox/probe',
+    probeMaxMpns: DIGIKEY_PROBE_MAX_MPNS,
+    notes: [
+      'Sandbox-only adapter. Production DigiKey endpoints are not used.',
+      'Probe is auth-gated by SNAPSHOT_CAPTURE_SECRET; no new secret was added.',
+      'No KV writes in this phase.',
+    ],
+  })
+})
+
+// POST /api/digikey/sandbox/probe — auth-gated. Hits DigiKey sandbox for up to
+// 3 MPNs and returns a normalized result. Never stores anything.
+app.post('/api/digikey/sandbox/probe', async (c) => {
+  const env = c.env
+
+  // Auth — same shared SNAPSHOT_CAPTURE_SECRET as Mouser/Nexar/manual capture.
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking probe.',
+    })
+  }
+  const providedRaw =
+    c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+
+  let payload: any
+  try {
+    payload = await c.req.json()
+  } catch {
+    return c.json({
+      success: false,
+      status: 'invalid_json',
+      errors: [{ code: 'invalid_json', message: 'Body must be valid JSON.' }],
+    }, 400)
+  }
+
+  const mpns = Array.isArray(payload?.mpns) ? payload.mpns : []
+  // The probe driver does its own validation (length cap, env check, etc.).
+  const result = await probeDigiKeySandbox(env, mpns)
+  // 401-style auth failures from DigiKey itself surface as success=false with
+  // status=digikey_auth_failed; payload validation errors return 400.
+  if (result.status === 'invalid_payload' || result.status === 'too_many_mpns') {
+    return c.json(result, 400)
+  }
+  return c.json(result)
 })
 
 // GET /api/snapshots/evidence/latest — current-source evidence layer (Phase 14A).

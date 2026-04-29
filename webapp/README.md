@@ -812,6 +812,69 @@ Hovering the line shows each manual source's price and the price delta vs Mouser
 
 **No paid API dependency.** This adapter ingests data the operator already has access to, on the operator's terms, with explicit provenance.
 
+### DigiKey sandbox adapter (Phase 19A)
+
+A DigiKey **sandbox** application has been provisioned. Phase 19A adds a small, defensive connectivity adapter so we can verify OAuth + product/price/inventory reads against the sandbox before building any DigiKey snapshot pipeline. **The adapter is not customer-facing yet** — it does not write to KV, it does not change combined evidence, and it never runs from page load.
+
+**Sandbox-only.** The adapter refuses to run unless `DIGIKEY_ENV === 'sandbox'`. Production DigiKey endpoints are not touched in this phase.
+
+**Required environment variables** (set on the Cloudflare Pages project, never in `.dev.vars` checked into git):
+
+| Var | Purpose |
+|---|---|
+| `DIGIKEY_CLIENT_ID` | DigiKey sandbox app client id |
+| `DIGIKEY_CLIENT_SECRET` | DigiKey sandbox app client secret |
+| `DIGIKEY_ENV` | Must be exactly `sandbox`. Anything else → adapter refuses to run. |
+
+The adapter never logs the client id, the client secret, or the access token. The probe response also never echoes them back.
+
+**Endpoints.**
+
+| Method | Path | Auth | Behavior |
+|---|---|---|---|
+| `GET` | `/api/digikey/status` | none | Returns `{ configured, env, clientIdConfigured, clientSecretConfigured, sandboxOnly: true, probeEndpoint, probeMaxMpns }`. Booleans only — never returns secret values. |
+| `POST` | `/api/digikey/sandbox/probe` | `X-Capture-Secret` (same shared secret as Mouser/Nexar/manual capture) | Accepts `{ "mpns": ["TPS7A8300RGWR", ...] }`. Max **3** MPNs per probe. Hits the DigiKey sandbox via OAuth client_credentials + v4 keyword search. Returns a normalized result per MPN. **Never stores to KV.** |
+
+**Probe response shape:**
+
+```
+{
+  success: boolean,
+  status: 'ok' | 'partial' | 'no_results' | 'digikey_auth_failed' | 'digikey_env_not_sandbox' | 'digikey_not_configured' | 'invalid_payload' | 'too_many_mpns',
+  env: 'sandbox' | 'missing' | 'unsupported',
+  callsAttempted: number,
+  results: [{
+    mpn,
+    found,
+    rawStatus,           // 'ok' | 'no_match' | 'error' | 'auth_failed' | 'rate_limited'
+    unitPrice,
+    availableInventory,
+    leadTimeDays,
+    currency,
+    distributor: 'DigiKey',
+    warnings: [...]
+  }],
+  errors: [{ code, message }]
+}
+```
+
+**Defensive behavior.** When the DigiKey response shape is unexpected, the adapter records the HTTP status and a warning code (e.g. `digikey_no_products_in_response`, `digikey_no_price_in_response`) rather than crashing. When auth fails, every subsequent MPN is skipped and the overall status becomes `digikey_auth_failed`. **No fabricated success.**
+
+**Example curl** (the secret is read from your shell — never paste it into the README or commit):
+
+```bash
+curl -s "https://texas-instruments-dashboard-final.pages.dev/api/digikey/status"
+
+curl -X POST 'https://texas-instruments-dashboard-final.pages.dev/api/digikey/sandbox/probe' \
+  -H "X-Capture-Secret: $SNAPSHOT_CAPTURE_SECRET" \
+  -H 'Content-Type: application/json' \
+  --data '{"mpns": ["TPS7A8300RGWR", "BQ25896RTWT"]}'
+```
+
+**No page-load calls.** Probe is `POST` only and auth-gated. The browser bundle does not invoke it. No new client-side fetches.
+**No KV writes.** Phase 19A is connectivity verification only.
+**No customer-facing exposure.** Source agreement, trends, manual evidence, and the dashboard UI are unchanged.
+
 ## Local Development
 ```bash
 npm install
