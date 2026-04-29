@@ -661,7 +661,7 @@ function SourceAgreementTable({ combined, trendMeta }) {
 // ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
 // Shows only what answers the customer's question: are prices moving, by how
 // much, where, and any outliers. Hides empty sections. No operator chrome.
-function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta }) {
+function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, tiStatus }) {
   const sig = useMemo(() => computeSignal(liveData), [liveData]);
   const fmt = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
 
@@ -800,6 +800,55 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta }) 
         </div>
       )}
 
+      {/* ── TI Direct API status card (Phase 20A) ── */}
+      {tiStatus && tiStatus.configured && (() => {
+        const productState = tiStatus.productInfoApi?.state;
+        const storeState = tiStatus.storeApi?.state;
+        const productColor = productState === 'ready' ? '#4dffc3' : productState === 'auth_failed' ? '#f0a84e' : '#7a96b8';
+        const storeColor = storeState === 'ready' ? '#4dffc3' : storeState === 'pending_approval' ? '#f0a84e' : storeState === 'auth_failed' ? '#f05c5c' : '#7a96b8';
+        const productLabel = productState === 'ready' ? 'active' : productState === 'auth_failed' ? 'auth failed' : productState === 'not_configured' ? 'not configured' : productState;
+        const storeLabel =
+          storeState === 'ready' ? 'active'
+          : storeState === 'pending_approval' ? 'pending approval'
+          : storeState === 'auth_failed' ? 'auth failed'
+          : storeState === 'disabled' ? 'disabled'
+          : storeState;
+        const refreshAt = tiStatus.lastSuccessfulRefresh
+          ? new Date(tiStatus.lastSuccessfulRefresh).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+          : '—';
+        return (
+          <div style={sectionWrap}>
+            <div style={sectionTitle}>TI Direct API</div>
+            <div style={{ display: 'flex', gap: 28, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              <div style={{ minWidth: 160 }}>
+                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Credentials</div>
+                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: tiStatus.tokenOk ? '#4dffc3' : '#f0a84e', marginTop: 4 }}>
+                  {tiStatus.tokenOk ? 'configured · token ok' : tiStatus.configured ? 'configured · token failed' : 'not configured'}
+                </div>
+              </div>
+              <div style={{ minWidth: 220 }}>
+                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Product Information API</div>
+                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: productColor, marginTop: 4 }}>{productLabel}</div>
+              </div>
+              <div style={{ minWidth: 220 }}>
+                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Store API</div>
+                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: storeColor, marginTop: 4 }}>{storeLabel}</div>
+              </div>
+              <div style={{ minWidth: 200 }}>
+                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Last token refresh</div>
+                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: '#c4d4e8', marginTop: 4 }}>{refreshAt}</div>
+                {tiStatus.tokenFromCache && <div style={{ fontSize: '0.6rem', color: '#7a96b8', marginTop: 2 }}>cached</div>}
+              </div>
+            </div>
+            {storeState === 'pending_approval' && (
+              <div style={{ marginTop: 10, fontSize: '0.66rem', color: '#f0a84e', fontStyle: 'italic' }}>
+                TI Store API approval pending — Product Information API active.
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* ── Source agreement table — only when both sources have data today ── */}
       {showSourceTable && <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>}
 
@@ -844,6 +893,8 @@ function App(){
   // Phase 19B — two-tab UI. 'prices' is the customer-facing default;
   // 'insights' holds source agreement, signal summary, and operator status.
   const [activeTab,setActiveTab]=useState('prices');
+  // Phase 20A — TI direct API status (Product Info active, Store pending).
+  const [tiStatus,setTiStatus]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -983,12 +1034,13 @@ function App(){
     let cancelled = false;
     (async () => {
       try {
-        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes] = await Promise.allSettled([
+        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes, tiStatusRes] = await Promise.allSettled([
           fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/nexar/basket-coverage').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/combined').then(r => r.ok ? r.json() : null),
+          fetch('/api/ti/status').then(r => r.ok ? r.json() : null),
         ]);
         if (cancelled) return;
         if (latestRes.status === 'fulfilled' && latestRes.value) {
@@ -1015,6 +1067,9 @@ function App(){
         }
         if (combinedRes.status === 'fulfilled' && combinedRes.value) {
           setCombinedEvidence(combinedRes.value);
+        }
+        if (tiStatusRes.status === 'fulfilled' && tiStatusRes.value) {
+          setTiStatus(tiStatusRes.value);
         }
       } catch (_) { /* silent */ }
     })();
@@ -1356,6 +1411,7 @@ function App(){
         baselineMeta={baselineMeta}
         combinedEvidence={combinedEvidence}
         trendMeta={trendMeta}
+        tiStatus={tiStatus}
       />}
 
       {/* Tooltip — applies on prices tab when hovering live cells */}

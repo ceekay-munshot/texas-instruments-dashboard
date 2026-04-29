@@ -915,6 +915,90 @@ The per-input `results[i].diagnostics` carries the same `primaryStrategy` + `cus
 
 **If `P5555-ND` still returns 403 after this patch**, the dashboard now matches DigiKey's official sandbox `ProductSearch` sample exactly — header set, primary endpoint, and method. At that point the root cause is on DigiKey's side (entitlement propagation, sandbox app configuration, or backend) rather than the dashboard code, and the next step is to escalate to DigiKey support with the sanitized `diagnostics` block from the probe response.
 
+### Texas Instruments direct API (Phase 20A)
+
+We now have an approved TI Product Information API key. The TI Store API suite (Inventory & Pricing) is in approval. Phase 20A wires both into the dashboard with the same secret-hygiene contract as the DigiKey adapter:
+
+- The OAuth client_credentials flow lives entirely on the worker. **Token is never returned to callers** and never reaches the frontend bundle.
+- Token cached in-memory for **55 minutes** (or sooner if TI's `expires_in` is shorter).
+- The Store API endpoint **refuses to call TI** unless `TI_STORE_API_ENABLED=true` AND the underlying app is approved. Default state is `pending_approval` and the operator flips the flag once TI confirms.
+- All error bodies pass through the same redaction pipeline — Bearer tokens, JWT-shaped strings, the configured client id/secret are all stripped before any string is echoed.
+
+**Required Cloudflare Pages env vars:**
+
+| Var | Purpose |
+|---|---|
+| `TI_CLIENT_ID` | TI Developer Portal app client id |
+| `TI_CLIENT_SECRET` | TI Developer Portal app client secret |
+| `TI_API_ENV` | Must be exactly `production`. Anything else disables the adapter. |
+| `TI_STORE_API_ENABLED` | Operator flag. `true` once TI Store API suite approval lands; otherwise treated as `pending_approval`. |
+
+**Endpoints:**
+
+| Method | Path | Auth | Behavior |
+|---|---|---|---|
+| `GET` | `/api/ti/status` | none | Page-load safe. Performs at most one cached OAuth round-trip per 55 min. Returns `{ configured, tokenOk, productInfoApi, storeApi, lastSuccessfulRefresh }`. **Never returns the token.** |
+| `GET` | `/api/ti/product-info?partNumber=…` | `X-Capture-Secret` | Hits TI Product Information API. Returns the normalized product record with `source: 'Texas Instruments Product Information API'`. |
+| `GET` | `/api/ti/inventory-pricing?partNumber=…` | `X-Capture-Secret` | Until `TI_STORE_API_ENABLED=true`, returns `status: pending_approval` without contacting TI. After enabling, returns the normalized inventory + pricing record with `source: 'Texas Instruments Store API'`. |
+
+**Normalized Product Information shape:**
+
+```
+{
+  source: 'Texas Instruments Product Information API',
+  status: 'ok' | 'no_match' | 'auth_failed' | 'rate_limited' | 'error' | 'token_failed' | 'not_configured',
+  partNumber, genericPartNumber, description, lifecycleStatus, package, datasheetUrl,
+  qualityReliability,                 // pass-through object when TI provides one
+  fetchedAt,
+  warnings,
+  diagnostics: { httpStatus, sanitizedCode, sanitizedMessage }
+}
+```
+
+**Normalized Inventory & Pricing shape (Stage 2):**
+
+```
+{
+  source: 'Texas Instruments Store API',
+  status: 'ok' | 'no_match' | 'pending_approval' | 'auth_failed' | …,
+  partNumber, quantity, pricing[],     // [{breakQuantity, unitPrice, currency}]
+  orderLimit,
+  futureInventory[],                   // [{forecastDate, forecastQuantity}]
+  forecastDate, forecastQuantity,      // earliest forecast row, for convenience
+  fetchedAt, warnings, diagnostics
+}
+```
+
+**UI surface.** The Insights tab gains a small "TI Direct API" card with four columns:
+
+- Credentials — `configured · token ok` / `configured · token failed` / `not configured`
+- Product Information API — `active` / `auth failed` / `not configured`
+- Store API — `active` / `pending approval` / `disabled` / `auth failed`
+- Last token refresh — short timestamp; tags `cached` when the value came from the 55-min cache
+
+When Store API is in `pending approval`, an italic note appears below the card: **"TI Store API approval pending — Product Information API active."** No live product or inventory data is rendered in the customer-facing Prices tab in this phase.
+
+**What does NOT happen in Phase 20A:**
+
+- No KV writes. Per-call results are returned ad-hoc and not stored as snapshots yet.
+- No customer-facing exposure of TI live data — the card is the only visible surface, and it shows status only.
+- No GitHub Actions wiring for TI capture yet — that comes once Store API is live and we know what daily ingest cadence makes sense.
+
+**Example operator probe** (the secret comes from your shell — never paste it):
+
+```bash
+# Status (no auth needed)
+curl -s "https://texas-instruments-dashboard-final.pages.dev/api/ti/status" | python3 -m json.tool
+
+# Product info (auth-gated)
+curl -s "https://texas-instruments-dashboard-final.pages.dev/api/ti/product-info?partNumber=TPS7A8300RGWR" \
+  -H "X-Capture-Secret: $SNAPSHOT_CAPTURE_SECRET" | python3 -m json.tool
+
+# Inventory & pricing (returns pending_approval until TI_STORE_API_ENABLED=true)
+curl -s "https://texas-instruments-dashboard-final.pages.dev/api/ti/inventory-pricing?partNumber=TPS7A8300RGWR" \
+  -H "X-Capture-Secret: $SNAPSHOT_CAPTURE_SECRET" | python3 -m json.tool
+```
+
 ## Local Development
 ```bash
 npm install

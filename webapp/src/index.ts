@@ -56,6 +56,13 @@ import {
   probeDigiKeySandbox,
   DIGIKEY_PROBE_MAX_MPNS,
 } from './sources/digikeySandbox'
+import {
+  checkTiConfigured,
+  fetchTiToken,
+  fetchTiProductInfo,
+  fetchTiInventoryPricing,
+  tokenCacheSnapshot as tiTokenCacheSnapshot,
+} from './sources/tiDirect'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -70,6 +77,14 @@ type Bindings = {
   DIGIKEY_CLIENT_SECRET?: string
   /** Must be exactly 'sandbox' to enable the adapter. Anything else is treated as unsupported. */
   DIGIKEY_ENV?: string
+  /** Phase 20A — Texas Instruments direct API credentials.
+   *  Product Information API suite is approved; Store API suite is pending. */
+  TI_CLIENT_ID?: string
+  TI_CLIENT_SECRET?: string
+  /** Expected: 'production'. Anything else disables the adapter. */
+  TI_API_ENV?: string
+  /** Operator flag — flip to 'true' once TI Store API suite approval lands. */
+  TI_STORE_API_ENABLED?: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -1616,6 +1631,132 @@ app.post('/api/digikey/sandbox/probe', async (c) => {
     return c.json(result, 400)
   }
   return c.json(result)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 20A — Texas Instruments direct API integration
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 1 (live): Product Information API suite — approved.
+// Stage 2 (gated): Store API suite — approval pending. Endpoint exists but
+//                  refuses to hit TI until TI_STORE_API_ENABLED=true.
+//
+// NEVER returns the OAuth token to callers. NEVER logs the client id, the
+// client secret, or the token. NEVER ships secrets in the frontend bundle.
+
+// GET /api/ti/status — page-load callable. Performs at most one cached OAuth
+// round-trip per 55 minutes. Token is never returned to the client.
+app.get('/api/ti/status', async (c) => {
+  const env = c.env
+  const status = checkTiConfigured(env)
+  // Snapshot token cache state BEFORE we call fetchTiToken so the response
+  // can show whether the token came from cache.
+  const cacheBefore = tiTokenCacheSnapshot()
+  let tokenOk = false
+  let tokenHttpStatus: number | null = null
+  let tokenSanitizedCode: string | null = null
+  let tokenSanitizedMessage = ''
+  let tokenFromCache = false
+  let lastSuccessfulRefresh: string | null = null
+  if (status.configured) {
+    const tok = await fetchTiToken(env)
+    if (tok.ok) {
+      tokenOk = true
+      tokenFromCache = tok.fromCache
+      lastSuccessfulRefresh = new Date(tok.fetchedAtMs).toISOString()
+    } else {
+      tokenHttpStatus = tok.httpStatus
+      tokenSanitizedCode = tok.sanitizedCode
+      tokenSanitizedMessage = tok.sanitizedMessage
+    }
+  }
+  return c.json({
+    configured: status.configured,
+    env: status.env,
+    clientIdConfigured: status.clientIdConfigured,
+    clientSecretConfigured: status.clientSecretConfigured,
+    productInfoApi: {
+      ready: status.productInfoApiReady && tokenOk,
+      label: 'Texas Instruments Product Information API',
+      state: status.productInfoApiReady && tokenOk ? 'ready' : status.configured ? 'auth_failed' : 'not_configured',
+    },
+    storeApi: {
+      ready: status.storeApiReady && tokenOk,
+      label: 'Texas Instruments Store API',
+      state:
+        status.storeApiState === 'pending_approval'
+          ? 'pending_approval'
+          : status.storeApiState === 'enabled'
+            ? (tokenOk ? 'ready' : 'auth_failed')
+            : 'disabled',
+      pendingApprovalNote:
+        status.storeApiState === 'pending_approval'
+          ? 'TI Store API approval pending — Product Information API active.'
+          : null,
+    },
+    tokenOk,
+    tokenFromCache,
+    tokenCachedBefore: cacheBefore.hasCache,
+    lastSuccessfulRefresh,
+    diagnostics: {
+      tokenHttpStatus,
+      sanitizedCode: tokenSanitizedCode,
+      sanitizedMessage: tokenSanitizedMessage,
+    },
+    notes: [
+      'OAuth token is cached in-memory for up to 55 minutes and is never returned.',
+      'Store API endpoints refuse to call TI until TI_STORE_API_ENABLED=true.',
+    ],
+  })
+})
+
+// GET /api/ti/product-info?partNumber=XYZ — auth-gated.
+// Hits TI Product Information API and returns a normalized product record.
+// No KV writes. No token in the response.
+app.get('/api/ti/product-info', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const partNumber = (c.req.query('partNumber') || '').trim()
+  if (!partNumber) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required.' }, 400)
+  }
+  const result = await fetchTiProductInfo(env, partNumber)
+  return c.json({ success: result.status === 'ok', ...result })
+})
+
+// GET /api/ti/inventory-pricing?partNumber=XYZ — auth-gated.
+// Until TI Store API approval lands AND operator flips TI_STORE_API_ENABLED,
+// returns status: pending_approval without contacting TI.
+app.get('/api/ti/inventory-pricing', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const partNumber = (c.req.query('partNumber') || '').trim()
+  if (!partNumber) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required.' }, 400)
+  }
+  const result = await fetchTiInventoryPricing(env, partNumber)
+  return c.json({ success: result.status === 'ok', ...result })
 })
 
 // GET /api/snapshots/evidence/latest — current-source evidence layer (Phase 14A).
