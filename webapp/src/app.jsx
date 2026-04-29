@@ -1063,16 +1063,14 @@ function App(){
     <div style={{background:'#080c14',minHeight:'100vh',position:'relative'}}>
       <div style={{position:'fixed',inset:0,backgroundImage:'linear-gradient(rgba(61,142,240,0.012) 1px,transparent 1px),linear-gradient(90deg,rgba(61,142,240,0.012) 1px,transparent 1px)',backgroundSize:'36px 36px',pointerEvents:'none'}}/>
 
-      {/* ── Header ── */}
-      <div style={{position:'sticky',top:0,zIndex:10,background:'#080c14',borderBottom:`1px solid ${B}`,padding:'10px 16px',display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
+      {/* ── Header (Phase 19B+) ── */}
+      <div style={{position:'sticky',top:0,zIndex:10,background:'#080c14',borderBottom:`1px solid ${B}`,padding:'12px 16px',display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
         <div>
-          <div style={{fontSize:'0.57rem',letterSpacing:'0.18em',color:'#2d4a6b',textTransform:'uppercase'}}><span style={{color:'#3d8ef0'}}>TI</span> / PRODUCT PRICE INTELLIGENCE · QoQ % CHANGE</div>
-          <div style={{fontSize:'0.9rem',fontWeight:'bold',color:'#e0eaf8'}}>Semiconductor Price Monitor <span style={{fontSize:'0.57rem',color:'#2d4a6b',fontWeight:'normal',marginLeft:10}}>{CATS.length} categories · {HP.length} verified qtrs + live</span></div>
-          {fetchedAt&&<div style={{fontSize:'0.56rem',color:'#2d4a6b',marginTop:1}}>
-            Live row: <span style={{color:src==='live'?'#00c9a7':'#f0a84e'}}>{src==='live'?'● FRESH':'● CACHED'}</span>
-            {' · '}{new Date(fetchedAt).toLocaleString()}
+          <div style={{fontSize:'1rem',fontWeight:'bold',color:'#e0eaf8',letterSpacing:'-0.01em'}}>TI Semiconductor Prices</div>
+          {fetchedAt&&<div style={{fontSize:'0.65rem',color:'#7a96b8',marginTop:3}}>
+            Updated {new Date(fetchedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
             {fetchCount&&` · ${fetchCount.got}/${fetchCount.total} categories live`}
-            {isRateLimited&&<span style={{color:'#f0a84e',marginLeft:6}}>⚡ partial — rate limited</span>}
+            {isRateLimited&&<span style={{color:'#f0a84e',marginLeft:6}}>· rate limited (auto-retry)</span>}
           </div>}
         </div>
         <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
