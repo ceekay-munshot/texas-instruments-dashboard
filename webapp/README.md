@@ -551,6 +551,45 @@ Each subcategory has a stable canonical id (e.g. `power_ldo`, `mcu_msp430`, `dc_
 
 **GitHub Actions workflow.** [`.github/workflows/ti-snapshot-capture.yml`](.github/workflows/ti-snapshot-capture.yml) now runs Mouser capture *first*, then Nexar capture, in a single daily run (07:30 UTC). Mouser-first ordering means the dashboard always gets a complete daily backbone even if Nexar fails. Both treat `already_exists_for_today` as success. Total Nexar calls per day remains ≤ 4.
 
+### Source Agreement Table (Phase 16B)
+
+Phase 16A made the combined-evidence data available, but it was hidden inside per-cell tooltips and raw JSON. Phase 16B surfaces it as a readable, sortable table at the top of the page so the customer can see — at a glance — where Mouser and Nexar agree, where they diverge, and where coverage is single-source today.
+
+**Where it appears.** Directly below the page legend and above the existing live signal summary. No redesign of the main grid — the table is a self-contained strip that consumes the already-fetched [`/api/snapshots/evidence/combined`](#endpoints-phase-16a) payload (no extra page-load fetch, no Nexar calls).
+
+**What "agreement" means.** For each canonical TI subcategory the worker returns:
+
+- `mouserPrice` — Mouser-direct trusted average for that subcategory today.
+- `nexarTrustedPrice` — Nexar trusted average for the same subcategory today (only present if Nexar's rotating sample touched the subcategory).
+- `priceDeltaPct = (nexar − mouser) / mouser × 100`.
+- `agreementStatus`:
+  - `strong_agreement` — both sources priced; |Δ| ≤ 5%.
+  - `moderate_agreement` — both sources priced; |Δ| ≤ 15%.
+  - `divergent` — both sources priced; |Δ| > 15%.
+  - `single_source_only` — only one of the two sources priced today.
+  - `insufficient_data` — neither source priced today.
+
+**Sort order** (most-actionable first): `divergent` → `moderate_agreement` → `strong_agreement` → `single_source_only` → `insufficient_data`. Ties break alphabetically by canonical id so the order is stable across reloads.
+
+**Filter chips.** Four chips above the table — `All`, `Divergent`, `Agreement` (strong + moderate), `Single-source only` — let the customer narrow to the rows they care about. Counts in chip labels reflect the full result set, not the current filter.
+
+**Summary cards** above the table:
+- `Total categories` (always 28 — the canonical taxonomy)
+- `Both sources` — how many subcategories Mouser AND Nexar priced today
+- `Strong / moderate` — how many of those are within ±15%
+- `Divergent` — how many of those exceed ±15%
+- `Single-source only` — how many are only one of the two sources
+
+**Why single-source rows are not bad.** Nexar runs under a permanent 4-call/day evaluation cap. Even with anchor + UTC-day rotation it can only touch a small subset of the 28 subcategories on any given day. Mouser is the full free backbone — every subcategory has a Mouser observation daily. So the *expected* steady-state is: **most rows are single-source (Mouser only)**, a handful are dual-sourced (Nexar's rotation hit them today), and a few are divergent or in agreement. Single-source is the *normal* mode of operation, not a degraded state.
+
+**Why this is not yet trend direction.** This table answers "do my two sources agree today?" — it deliberately does NOT answer "is supply tightening or easing?". Shortage / easing labels still require ≥2 dated snapshots in the trends endpoint and stay gated in the existing trend-readiness path. The table includes a small italic caveat reinforcing this.
+
+**Graceful empty / partial states.**
+- No `combinedEvidence` yet → "Waiting for Mouser + Nexar snapshots…" (slim header strip).
+- KV not configured → "Snapshot storage not configured." (informational, not an error).
+- `status: mouser_only` (Mouser captured, Nexar not yet) → "Mouser backbone active (YYYY-MM-DD); Nexar corroboration pending."
+- All rows single-source → table renders normally; this is by design.
+
 ## Local Development
 ```bash
 npm install

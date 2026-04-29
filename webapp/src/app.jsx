@@ -338,6 +338,261 @@ function SignalSummary({ liveData, baselineMeta }) {
   );
 }
 
+// ── Source Agreement Table (Phase 16B) ───────────────────────────────────────
+// Customer-facing readable table over /api/snapshots/evidence/combined.
+// Read-only; consumes the already-fetched `combinedEvidence` payload.
+// No new endpoints, no extra page-load fetches.
+const AGREEMENT_ORDER = {
+  divergent: 0,
+  moderate_agreement: 1,
+  strong_agreement: 2,
+  single_source_only: 3,
+  insufficient_data: 4,
+};
+const AGREEMENT_LABEL = {
+  divergent: 'Divergent',
+  moderate_agreement: 'Moderate',
+  strong_agreement: 'Strong',
+  single_source_only: 'Single source',
+  insufficient_data: 'Insufficient',
+};
+const AGREEMENT_COLOR = {
+  strong_agreement: '#4dffc3',
+  moderate_agreement: '#00c9a7',
+  divergent: '#f0a84e',
+  single_source_only: '#7a96b8',
+  insufficient_data: '#4a6a8a',
+};
+
+function sourceStateFor(row) {
+  const m = row.mouserPrice != null;
+  const n = row.nexarTrustedPrice != null;
+  if (m && n) return { label: 'Both sources', color: '#4dffc3' };
+  if (m) return { label: 'Mouser only', color: '#7a96b8' };
+  if (n) return { label: 'Nexar only', color: '#7a96b8' };
+  return { label: 'No data', color: '#4a6a8a' };
+}
+
+function fmtPrice(v) { return v == null ? '—' : `$${Number(v).toFixed(4)}`; }
+function fmtInv(v) { return v == null ? '—' : Number(v).toLocaleString(); }
+function fmtDeltaPct(v) {
+  if (v == null) return '—';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v}%`;
+}
+
+function SourceAgreementTable({ combined, trendMeta }) {
+  const [filter, setFilter] = useState('all');
+  const wrap = { padding: '14px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+  const label = { fontSize: '0.6rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
+
+  // Empty / waiting states (graceful) — keep the strip slim, never error.
+  if (!combined) {
+    return (
+      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={label}>▼ Source agreement</span>
+        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>· Waiting for Mouser + Nexar snapshots…</span>
+      </div>
+    );
+  }
+  if (combined.status === 'snapshot_storage_not_configured') {
+    return (
+      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={label}>▼ Source agreement</span>
+        <span style={{ fontSize: '0.7rem', color: '#f0a84e' }}>· Snapshot storage not configured.</span>
+      </div>
+    );
+  }
+  if (combined.status === 'no_snapshots') {
+    return (
+      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={label}>▼ Source agreement</span>
+        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>· Waiting for Mouser + Nexar snapshots.</span>
+      </div>
+    );
+  }
+  if (combined.status === 'mouser_only') {
+    // Mouser backbone exists, Nexar pending — informational, not an error.
+    return (
+      <div style={{ ...wrap, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={label}>▼ Source agreement</span>
+        <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>
+          · Mouser backbone active ({combined.latestMouserSnapshotDate}); Nexar corroboration pending.
+        </span>
+      </div>
+    );
+  }
+
+  const rows = combined.sourceAgreement || [];
+  const total = rows.length;
+  const counts = {
+    bothSources: rows.filter(r => r.mouserPrice != null && r.nexarTrustedPrice != null).length,
+    strongOrModerate: rows.filter(r => r.agreementStatus === 'strong_agreement' || r.agreementStatus === 'moderate_agreement').length,
+    divergent: rows.filter(r => r.agreementStatus === 'divergent').length,
+    singleSource: rows.filter(r => r.agreementStatus === 'single_source_only').length,
+    insufficient: rows.filter(r => r.agreementStatus === 'insufficient_data').length,
+  };
+
+  // Filter chips
+  const visibleRows = rows.filter(r => {
+    if (filter === 'all') return true;
+    if (filter === 'divergent') return r.agreementStatus === 'divergent';
+    if (filter === 'agreement') return r.agreementStatus === 'strong_agreement' || r.agreementStatus === 'moderate_agreement';
+    if (filter === 'single') return r.agreementStatus === 'single_source_only';
+    return true;
+  });
+
+  // Sort: divergent → moderate → strong → single_source → insufficient.
+  // Stable: ties by canonicalCategoryId.
+  const sortedRows = visibleRows.slice().sort((a, b) => {
+    const oa = AGREEMENT_ORDER[a.agreementStatus] ?? 99;
+    const ob = AGREEMENT_ORDER[b.agreementStatus] ?? 99;
+    if (oa !== ob) return oa - ob;
+    return (a.canonicalCategoryId || '').localeCompare(b.canonicalCategoryId || '');
+  });
+
+  const headerLabel = '▼ Source agreement — Mouser backbone + Nexar rotating corroboration';
+
+  const Card = ({ name, value, color }) => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 110 }}>
+      <div style={label}>{name}</div>
+      <div style={{ fontSize: '1rem', fontFamily: 'monospace', color: color || '#e0eaf8', lineHeight: 1.1, fontWeight: 'bold' }}>{value}</div>
+    </div>
+  );
+
+  const Chip = ({ value, name, count }) => {
+    const on = filter === value;
+    return (
+      <button
+        onClick={() => setFilter(value)}
+        style={{
+          background: on ? '#1565c0' : 'none',
+          border: `1px solid ${on ? '#3d8ef0' : '#1a2740'}`,
+          borderRadius: 3,
+          padding: '3px 9px',
+          fontSize: '0.66rem',
+          color: on ? '#fff' : '#7a96b8',
+          fontFamily: 'monospace',
+          cursor: 'pointer',
+          letterSpacing: '0.04em',
+        }}>
+        {name}{typeof count === 'number' ? ` (${count})` : ''}
+      </button>
+    );
+  };
+
+  const cellTH = { padding: '6px 10px', textAlign: 'left', borderBottom: '1px solid #1a2740', color: '#6b8aa8', fontWeight: 'normal', fontSize: '0.6rem', letterSpacing: '0.06em', textTransform: 'uppercase' };
+  const cellTD = { padding: '5px 10px', borderBottom: '1px solid #0d1520', fontFamily: 'monospace', fontSize: '0.7rem', color: '#c4d4e8', whiteSpace: 'nowrap' };
+  const cellNum = { ...cellTD, textAlign: 'right' };
+
+  const trendReady = trendMeta?.status === 'ok';
+
+  return (
+    <div style={wrap}>
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
+        <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+          <div style={label}>{headerLabel}</div>
+          <div style={{ marginTop: 6, fontSize: '0.74rem', color: '#c4d4e8', lineHeight: 1.5, maxWidth: 880 }}>
+            Mouser is the full free backbone. Nexar is rotating corroboration under a 4-call daily cap.
+            Agreement is <span style={{ color: '#ffd700' }}>source agreement</span>, not a shortage/easing signal.
+            {!trendReady && <span style={{ color: '#7a96b8', fontStyle: 'italic' }}> Shortage/easing labels remain gated until ≥2 dated snapshots.</span>}
+          </div>
+        </div>
+        <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontFamily: 'monospace', textAlign: 'right', minWidth: 220 }}>
+          <div style={{ ...label, color: '#6b8aa8', textAlign: 'right' }}>Latest snapshots</div>
+          <div style={{ marginTop: 3, color: '#c4d4e8', fontSize: '0.74rem' }}>
+            Mouser {combined.latestMouserSnapshotDate || '—'}
+          </div>
+          <div style={{ marginTop: 1, color: '#c4d4e8', fontSize: '0.74rem' }}>
+            Nexar {combined.latestNexarSnapshotDate || '—'}
+          </div>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ marginTop: 14, display: 'flex', gap: 28, flexWrap: 'wrap', alignItems: 'flex-start', paddingTop: 12, borderTop: '1px solid #0d1520' }}>
+        <Card name="Total categories" value={total} />
+        <Card name="Both sources" value={counts.bothSources} color="#4dffc3" />
+        <Card name="Strong / moderate" value={counts.strongOrModerate} color="#00c9a7" />
+        <Card name="Divergent" value={counts.divergent} color={counts.divergent > 0 ? '#f0a84e' : '#7a96b8'} />
+        <Card name="Single-source only" value={counts.singleSource} color="#7a96b8" />
+      </div>
+
+      {/* Filter chips */}
+      <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid #0d1520', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+        <span style={{ ...label, marginRight: 4 }}>Show:</span>
+        <Chip value="all" name="All" count={total} />
+        <Chip value="divergent" name="Divergent" count={counts.divergent} />
+        <Chip value="agreement" name="Agreement" count={counts.strongOrModerate} />
+        <Chip value="single" name="Single-source only" count={counts.singleSource} />
+        <span style={{ marginLeft: 'auto', fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+          {sortedRows.length} of {total} shown
+        </span>
+      </div>
+
+      {/* Table */}
+      <div style={{ marginTop: 10, overflowX: 'auto' }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 720 }}>
+          <thead>
+            <tr style={{ background: '#07090f' }}>
+              <th style={cellTH}>Group</th>
+              <th style={cellTH}>Subcategory</th>
+              <th style={{ ...cellTH, textAlign: 'right' }}>Mouser price</th>
+              <th style={{ ...cellTH, textAlign: 'right' }}>Nexar price</th>
+              <th style={{ ...cellTH, textAlign: 'right' }}>Price Δ %</th>
+              <th style={{ ...cellTH, textAlign: 'right' }}>Mouser inventory</th>
+              <th style={{ ...cellTH, textAlign: 'right' }}>Nexar inventory</th>
+              <th style={cellTH}>Agreement</th>
+              <th style={cellTH}>Source state</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedRows.length === 0 && (
+              <tr>
+                <td colSpan={9} style={{ ...cellTD, color: '#7a96b8', textAlign: 'center', padding: '14px 10px' }}>
+                  No rows match this filter.
+                </td>
+              </tr>
+            )}
+            {sortedRows.map(r => {
+              const ss = sourceStateFor(r);
+              const aColor = AGREEMENT_COLOR[r.agreementStatus] || '#4a6a8a';
+              const aLabel = AGREEMENT_LABEL[r.agreementStatus] || r.agreementStatus;
+              const deltaColor = r.priceDeltaPct == null
+                ? '#7a96b8'
+                : Math.abs(r.priceDeltaPct) > 15
+                  ? '#f0a84e'
+                  : Math.abs(r.priceDeltaPct) > 5
+                    ? '#00c9a7'
+                    : '#4dffc3';
+              return (
+                <tr key={r.canonicalCategoryId} style={{ background: '#080c14' }}>
+                  <td style={{ ...cellTD, color: GC[r.groupLabel] || '#a0b8d0' }}>{r.groupLabel}</td>
+                  <td style={cellTD}>{r.categoryLabel}</td>
+                  <td style={cellNum}>{fmtPrice(r.mouserPrice)}</td>
+                  <td style={cellNum}>{fmtPrice(r.nexarTrustedPrice)}</td>
+                  <td style={{ ...cellNum, color: deltaColor, fontWeight: r.priceDeltaPct != null && Math.abs(r.priceDeltaPct) > 15 ? 'bold' : 'normal' }}>
+                    {fmtDeltaPct(r.priceDeltaPct)}
+                  </td>
+                  <td style={cellNum}>{fmtInv(r.mouserInventory)}</td>
+                  <td style={cellNum}>{fmtInv(r.nexarTrustedInventory)}</td>
+                  <td style={{ ...cellTD, color: aColor, fontWeight: r.agreementStatus === 'divergent' ? 'bold' : 'normal' }}>{aLabel}</td>
+                  <td style={{ ...cellTD, color: ss.color }}>{ss.label}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ marginTop: 10, fontSize: '0.62rem', color: '#7a96b8', fontStyle: 'italic' }}>
+        Single-source rows are not errors — they reflect Nexar's permanent 4-call/day rotating cap. Mouser is the full free backbone covering all 28 canonical subcategories.
+      </div>
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 function App(){
   const [liveData,setLiveData]=useState(null);
@@ -763,6 +1018,9 @@ function App(){
         <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{evidenceData?.evidence?` · Source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`:''}{evidenceData?.coverage?` · Basket coverage: ${evidenceData.coverage.sampledSkuCount} / ${evidenceData.coverage.basketCatalogSkuCount} sampled today${evidenceData.coverage.samplingPolicy==='anchor_plus_rotation'?' · rotating coverage':''}${evidenceData.coverage.estimatedFullCycleDays?` · full cycle ~${evidenceData.coverage.estimatedFullCycleDays} days`:''}`:''}{trendMeta?` · Trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
         <span style={{color:'#7a96b8',marginLeft:6}}>· Taxonomy: 28 TI subcategories · Mouser backbone · Nexar rotating corroboration{combinedEvidence?.latestMouserSnapshotDate?` · Mouser snapshot ${combinedEvidence.latestMouserSnapshotDate}`:''}{combinedEvidence?.latestNexarSnapshotDate?` · Nexar snapshot ${combinedEvidence.latestNexarSnapshotDate}`:''}</span>
       </div>
+
+      {/* ── Source Agreement Table (Phase 16B) ── */}
+      <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>
 
       {/* ── Signal Summary ── */}
       <SignalSummary liveData={liveData} baselineMeta={baselineMeta}/>
