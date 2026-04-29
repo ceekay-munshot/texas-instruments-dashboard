@@ -694,6 +694,124 @@ The top-level `trendConfidenceCounts` field is a histogram of the four bands acr
 
 **UI display.** Each Trend cell now renders `<Label> · <source> · <Confidence band>` with the confidence text colored by band (mint = high, teal = medium, amber = low, muted = pending). The hover tooltip on the cell includes `Confidence: <band>. Reason: <trendConfidenceReason>` so the customer can see exactly why the band was assigned.
 
+### Manual distributor evidence import (Phase 18A)
+
+Nexar will not be paid-tier and aggressive scraping is off the table — but the customer still wants DigiKey, Arrow, and TI.com pricing alongside Mouser. Phase 18A adds a **manual import adapter** so an operator can paste or upload distributor data from a portal/export and land it as a normalized `Snapshot` with explicit provenance metadata. This is observed evidence, not synthesized history.
+
+**Why it exists.** It unblocks DigiKey/Arrow/TI evidence today without adding a paid API dependency or a brittle scraper. The cost is a manual operator step; the upside is full provenance and zero quota risk.
+
+**Accepted manual sources.**
+
+| `source` | KV prefix |
+|---|---|
+| `digikey_manual` | `source-snapshots/texas_instruments/digikey_manual/manual_distributor_snapshot/YYYY-MM-DD` |
+| `arrow_manual` | `source-snapshots/texas_instruments/arrow_manual/manual_distributor_snapshot/YYYY-MM-DD` |
+| `ti_manual` | `source-snapshots/texas_instruments/ti_manual/manual_distributor_snapshot/YYYY-MM-DD` |
+| `other_manual` | `source-snapshots/texas_instruments/other_manual/manual_distributor_snapshot/YYYY-MM-DD` |
+
+**Endpoints.**
+
+| Method | Path | Behavior |
+|---|---|---|
+| `POST` | `/api/snapshots/manual/import` | Validates and stores one snapshot per `(source, snapshotDate)`. Auth: `X-Capture-Secret` (same as Mouser/Nexar capture). Idempotent per UTC date; `?overwrite=true` replaces. |
+| `GET` | `/api/snapshots/manual/latest?source=digikey_manual` | Latest stored manual snapshot for the given source. |
+| `GET` | `/api/snapshots/manual/history?source=digikey_manual&days=30` | Window of stored manual snapshots (max 90 days). |
+| `GET` | `/api/snapshots/evidence/combined` | Now also reads the latest manual snapshots and joins them per canonical subcategory; see "Combined evidence changes" below. |
+
+**JSON payload shape.**
+
+```json
+{
+  "source": "digikey_manual",
+  "snapshotDate": "2026-04-30",
+  "capturedAt": "2026-04-30T12:34:56Z",
+  "provenance": {
+    "importedBy": "operator",
+    "sourceUrl": "https://www.digikey.com/...",
+    "sourceFileName": "digikey-export-20260430.csv",
+    "notes": "exported via DigiKey customer portal"
+  },
+  "rows": [
+    {
+      "canonicalCategoryId": "power_ldo",
+      "legacyPartMapId": "pm_ldo",
+      "categoryLabel": "LDO Regulators",
+      "mpn": "TPS7A8300RGWR",
+      "distributor": "DigiKey",
+      "unitPrice": 7.12,
+      "availableInventory": 4521,
+      "leadTimeDays": 84,
+      "currency": "USD",
+      "observedAt": "2026-04-30T12:30:00Z",
+      "confidence": "manual_operator_import"
+    }
+  ]
+}
+```
+
+**Mapping rules** (per row):
+1. If `canonicalCategoryId` is present, use it.
+2. Else map `legacyPartMapId` via `LEGACY_TO_CANONICAL`.
+3. Else look up the MPN in `PART_MAP` to find its category.
+4. Otherwise the row is kept under `categoryId: 'manual_unmapped'` with a warning. We never silently drop rows.
+
+**Validation rules.** `source` must be allowed; `rows` is required and ≤ 500; per row `mpn` and `distributor` are required strings; `unitPrice`, `availableInventory`, `leadTimeDays` must be numbers or null; negatives are rejected; `currency` defaults to `USD`. Errors come back as `{ code, message }` with HTTP 400 — no stack traces.
+
+**Confidence handling.** Each manual observation is tagged `confidence: 'manual_operator_import'` (unless the operator explicitly marks it `authorized_or_core`). Manual rows do **not** flow into the trusted-available signal pool by default — they're carried as additional `sourceObservations` only. This is what protects the Mouser backbone from being silently overridden by paste-from-screen data.
+
+**Example curl.** The capture secret is read from your shell — never paste it into the README or commit.
+
+```bash
+curl -X POST 'https://texas-instruments-dashboard-final.pages.dev/api/snapshots/manual/import' \
+  -H "X-Capture-Secret: $SNAPSHOT_CAPTURE_SECRET" \
+  -H 'Content-Type: application/json' \
+  --data @digikey-2026-04-30.json
+```
+
+**Combined evidence changes.** `/api/snapshots/evidence/combined` now also returns:
+
+```
+{
+  ...existing fields,
+  manualSources: {
+    digikey_manual: { latestSnapshotDate, categoryCount, skuCount } | null,
+    arrow_manual:   { latestSnapshotDate, categoryCount, skuCount } | null,
+    ti_manual:      { latestSnapshotDate, categoryCount, skuCount } | null,
+    other_manual:   { latestSnapshotDate, categoryCount, skuCount } | null
+  },
+  manualSourceStatus: 'manual_sources_available' | 'no_manual_sources',
+  sourceAgreement: [{
+    ...existing fields,
+    manualEvidence: [{
+      source, distributor,
+      unitPrice, availableInventory, leadTimeDays, observedAt,
+      priceDeltaVsMouserPct, inventoryDeltaVsMouserPct
+    }],
+    agreementCorroboration: {
+      corroboratingSourceCount,           // |Δ| ≤ 5% vs Mouser
+      divergentManualSourceCount,         // |Δ| > 15% vs Mouser
+      manualSourcesPresent,               // ['digikey_manual', ...]
+      warning                             // 'manual_source_divergence' | null
+    }
+  }]
+}
+```
+
+**Manual evidence does not override Mouser backbone.** The existing `agreementStatus`, `trend`, and `trendConfidence` fields are unchanged by manual sources. Manual rows only add per-row context plus the optional `manual_source_divergence` warning.
+
+**UI surface (no redesign).** Below the Source State cell, a small subtext line appears when manual evidence exists for a row:
+
+```
+Manual evidence: 1 source (digikey)              ← muted
+Manual evidence: 2 sources (digikey, arrow) · manual divergence   ← amber tag if divergent
+```
+
+Hovering the line shows each manual source's price and the price delta vs Mouser.
+
+**No page-load capture.** Manual import is `POST` only and gated by `SNAPSHOT_CAPTURE_SECRET`. The browser bundle never invokes it. No new client-side fetches were added.
+
+**No paid API dependency.** This adapter ingests data the operator already has access to, on the operator's terms, with explicit provenance.
+
 ## Local Development
 ```bash
 npm install

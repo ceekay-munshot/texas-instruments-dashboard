@@ -42,6 +42,15 @@ import {
   summarizeTaxonomyCoverage,
 } from './data/tiTaxonomy'
 import { captureMouserSnapshot } from './sources/mouserSnapshotCapture'
+import {
+  ALLOWED_MANUAL_SOURCES,
+  MANUAL_MODE,
+  buildManualSnapshot,
+  manualSnapshotKey,
+  normalizeManualSourceInput,
+  parseManualSourceParam,
+  type ManualSource,
+} from './sources/manualSnapshotImport'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -1353,6 +1362,186 @@ app.get('/api/snapshots/mouser/trends', async (c) => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 18A — Manual distributor evidence import (operator-supplied data)
+// ─────────────────────────────────────────────────────────────────────────────
+// Allows operators to POST distributor data (DigiKey/Arrow/TI/other) as JSON.
+// One snapshot per (manual source × UTC date). Never called from the browser.
+// Auth: same SNAPSHOT_CAPTURE_SECRET as the Mouser/Nexar capture endpoints.
+
+// POST /api/snapshots/manual/import
+app.post('/api/snapshots/manual/import', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const overwrite = c.req.query('overwrite') === 'true'
+
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      success: false,
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      message: 'Bind SOURCE_SNAPSHOTS_KV before invoking manual import.',
+      ...base,
+    })
+  }
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      configured: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking manual import.',
+      ...base,
+    })
+  }
+  const providedRaw =
+    c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+
+  let payload: unknown
+  try {
+    payload = await c.req.json()
+  } catch (e: any) {
+    return c.json({
+      success: false,
+      status: 'invalid_json',
+      errors: [{ code: 'invalid_json', message: 'Body must be valid JSON.' }],
+    }, 400)
+  }
+
+  const { errors, normalized } = normalizeManualSourceInput(payload)
+  if (errors.length > 0 || !normalized) {
+    return c.json({
+      success: false,
+      status: 'validation_failed',
+      errors,
+    }, 400)
+  }
+
+  const built = buildManualSnapshot(normalized)
+  const key = manualSnapshotKey(normalized.source, normalized.snapshotDate)
+
+  if (!overwrite) {
+    const existing = await env.SOURCE_SNAPSHOTS_KV.get(key)
+    if (existing) {
+      return c.json({
+        success: false,
+        configured: true,
+        status: 'already_exists_for_today',
+        message: 'A manual snapshot already exists for that source + date; pass ?overwrite=true to replace.',
+        source: normalized.source,
+        snapshotDate: normalized.snapshotDate,
+        key,
+        ...base,
+      })
+    }
+  }
+
+  await env.SOURCE_SNAPSHOTS_KV.put(key, JSON.stringify(built.snapshot))
+
+  return c.json({
+    success: true,
+    configured: true,
+    status: 'stored',
+    source: normalized.source,
+    snapshotDate: normalized.snapshotDate,
+    stored: true,
+    overwritten: overwrite,
+    key,
+    categoryCount: built.snapshot.categoryCount,
+    skuCount: built.snapshot.skuCount,
+    rowCount: built.rowCount,
+    unmappedRowCount: built.unmappedRowCount,
+    warnings: built.warnings,
+    noPaidQuotaRequired: true,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/manual/latest?source=digikey_manual
+app.get('/api/snapshots/manual/latest', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const source = parseManualSourceParam(c.req.query('source'))
+  if (!source) {
+    return c.json({
+      configured: !!env.SOURCE_SNAPSHOTS_KV,
+      status: 'invalid_source',
+      message: `source query param required; allowed: ${ALLOWED_MANUAL_SOURCES.join(', ')}.`,
+      ...base,
+    }, 400)
+  }
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      source,
+      latestSnapshotDate: null,
+      snapshot: null,
+      ...base,
+    })
+  }
+  const snap = await getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, source, MANUAL_MODE)
+  if (!snap) {
+    return c.json({
+      configured: true,
+      status: 'no_snapshots',
+      source,
+      latestSnapshotDate: null,
+      snapshot: null,
+      ...base,
+    })
+  }
+  return c.json({
+    configured: true,
+    status: 'ok',
+    source,
+    latestSnapshotDate: snap.snapshotDate,
+    snapshot: snap,
+    ...base,
+  })
+})
+
+// GET /api/snapshots/manual/history?source=digikey_manual&days=30
+app.get('/api/snapshots/manual/history', async (c) => {
+  const env = c.env
+  const base = snapshotMemoryBaseEnv(env)
+  const source = parseManualSourceParam(c.req.query('source'))
+  if (!source) {
+    return c.json({
+      configured: !!env.SOURCE_SNAPSHOTS_KV,
+      status: 'invalid_source',
+      message: `source query param required; allowed: ${ALLOWED_MANUAL_SOURCES.join(', ')}.`,
+      ...base,
+    }, 400)
+  }
+  const days = clampHistoryDays(c.req.query('days'))
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      source,
+      windowDays: days,
+      snapshotCount: 0,
+      snapshots: [],
+      ...base,
+    })
+  }
+  const snaps = await getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, source, MANUAL_MODE, days)
+  return c.json({
+    configured: true,
+    status: snaps.length > 0 ? 'ok' : 'no_snapshots',
+    source,
+    windowDays: days,
+    snapshotCount: snaps.length,
+    snapshots: snaps,
+    ...base,
+  })
+})
+
 // GET /api/snapshots/evidence/latest — current-source evidence layer (Phase 14A).
 // Reads the latest snapshot only. Never calls Nexar, never triggers capture.
 // Pairs with /api/snapshots/trends so the UI can show evidence today AND keep
@@ -1477,6 +1666,8 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
         nexar: { status: 'no_data', observationCount: 0, firstDate: null, latestDate: null },
       },
       sourceTrendStatus: 'pending',
+      manualSources: { digikey_manual: null, arrow_manual: null, ti_manual: null, other_manual: null },
+      manualSourceStatus: 'no_manual_sources',
       notes: COMBINED_EVIDENCE_NOTES,
       ...base,
     })
@@ -1484,13 +1675,25 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
 
   // Phase 17A — fetch RECENT snapshots (windowed) so we can compute trends in
   // the same call. Two KV list-and-fetch round trips total; no Nexar calls.
+  // Phase 18A — also pull the latest snapshot per manual source (one KV op
+  // each via `getLatestSnapshotFor`'s internal list+get; KV is cheap).
   const TREND_WINDOW_DAYS = 30
-  const [mouserSnaps, nexarSnaps] = await Promise.all([
+  const [mouserSnaps, nexarSnaps, dkManualSnap, arManualSnap, tiManualSnap, otManualSnap] = await Promise.all([
     getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, MOUSER_SOURCE, MOUSER_MODE, TREND_WINDOW_DAYS),
     getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, 'octopart_nexar', 'representative_basket_preview', TREND_WINDOW_DAYS),
+    getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'digikey_manual', MANUAL_MODE),
+    getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'arrow_manual', MANUAL_MODE),
+    getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'ti_manual', MANUAL_MODE),
+    getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'other_manual', MANUAL_MODE),
   ])
   const mouserSnap: Snapshot | null = mouserSnaps.length > 0 ? mouserSnaps[mouserSnaps.length - 1] : null
   const nexarSnap: Snapshot | null = nexarSnaps.length > 0 ? nexarSnaps[nexarSnaps.length - 1] : null
+  const manualSnaps: Record<ManualSource, Snapshot | null> = {
+    digikey_manual: dkManualSnap,
+    arrow_manual: arManualSnap,
+    ti_manual: tiManualSnap,
+    other_manual: otManualSnap,
+  }
 
   // Build per-canonical lookups.
   const mouserByCanonical = new Map<string, { categoryLabel: string; price: number | null; inventory: number }>()
@@ -1812,8 +2015,128 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     return { ...row, trend }
   })
 
+  // ── Phase 18A — manual evidence join + corroboration tags ────────────────
+  // Manual sources are NOT used to override Mouser trend or change
+  // agreementStatus — they only ADD context per row plus a top-level summary.
+  type ManualEvidenceRow = {
+    source: ManualSource
+    distributor: string | null
+    unitPrice: number | null
+    availableInventory: number | null
+    leadTimeDays: number | null
+    observedAt: string | null
+    priceDeltaVsMouserPct: number | null
+    inventoryDeltaVsMouserPct: number | null
+  }
+  type AgreementCorroboration = {
+    corroboratingSourceCount: number
+    divergentManualSourceCount: number
+    manualSourcesPresent: ManualSource[]
+    warning: string | null
+  }
+  // Build per-canonical lookup tables for each manual source's category-level
+  // price + inventory + first observation. We pick the category whose
+  // canonicalCategoryId matches; manual snapshots already populate it via
+  // `aggregateCategory` in manualSnapshotImport.ts.
+  function manualByCanonical(snap: Snapshot | null): Map<string, { distributor: string | null; price: number | null; inventory: number; leadTimeDays: number | null; observedAt: string | null }> {
+    const m = new Map<string, { distributor: string | null; price: number | null; inventory: number; leadTimeDays: number | null; observedAt: string | null }>()
+    if (!snap) return m
+    for (const cat of snap.categories ?? []) {
+      const id = cat.canonicalCategoryId ?? canonicalCategoryId(cat.categoryId)
+      // Pick first SKU's first observation for distributor + observedAt + lead time;
+      // use the category's avg price as the row representative price.
+      const sku0 = cat.skus?.[0]
+      const obs0 = sku0?.sourceObservations?.[0] ?? null
+      m.set(id, {
+        distributor: obs0?.distributor ?? null,
+        price: cat.avgBestTrustedAvailableUnitPrice ?? cat.medianBestTrustedAvailableUnitPrice ?? sku0?.bestAnyUnitPrice ?? obs0?.unitPrice ?? null,
+        inventory: cat.totalTrustedAvailableInventory ?? 0,
+        leadTimeDays: obs0?.leadTimeDays ?? null,
+        observedAt: obs0?.observedAt ?? snap.capturedAt ?? null,
+      })
+    }
+    return m
+  }
+  const manualLookups: Record<ManualSource, ReturnType<typeof manualByCanonical>> = {
+    digikey_manual: manualByCanonical(manualSnaps.digikey_manual),
+    arrow_manual: manualByCanonical(manualSnaps.arrow_manual),
+    ti_manual: manualByCanonical(manualSnaps.ti_manual),
+    other_manual: manualByCanonical(manualSnaps.other_manual),
+  }
+
+  const sourceAgreementWithManual = sourceAgreementWithTrend.map(row => {
+    const mouserPrice = row.mouserPrice
+    const mouserInventory = row.mouserInventory ?? 0
+    const manualEvidence: ManualEvidenceRow[] = []
+    let corroborating = 0
+    let divergent = 0
+    const presentSources: ManualSource[] = []
+    for (const src of ALLOWED_MANUAL_SOURCES) {
+      const hit = manualLookups[src].get(row.canonicalCategoryId)
+      if (!hit) continue
+      presentSources.push(src)
+      let priceDelta: number | null = null
+      if (mouserPrice != null && hit.price != null && mouserPrice > 0) {
+        priceDelta = Math.round(((hit.price - mouserPrice) / mouserPrice) * 1000) / 10
+      }
+      let inventoryDelta: number | null = null
+      if (mouserInventory > 0 && typeof hit.inventory === 'number') {
+        inventoryDelta = Math.round(((hit.inventory - mouserInventory) / mouserInventory) * 1000) / 10
+      }
+      manualEvidence.push({
+        source: src,
+        distributor: hit.distributor,
+        unitPrice: hit.price,
+        availableInventory: hit.inventory,
+        leadTimeDays: hit.leadTimeDays,
+        observedAt: hit.observedAt,
+        priceDeltaVsMouserPct: priceDelta,
+        inventoryDeltaVsMouserPct: inventoryDelta,
+      })
+      // Corroboration tagging vs Mouser only — Nexar's sparse rotation
+      // already has its own treatment in `agreementStatus`.
+      if (priceDelta != null) {
+        if (Math.abs(priceDelta) <= 5) corroborating++
+        else if (Math.abs(priceDelta) > 15) divergent++
+      }
+    }
+    const agreementCorroboration: AgreementCorroboration = {
+      corroboratingSourceCount: corroborating,
+      divergentManualSourceCount: divergent,
+      manualSourcesPresent: presentSources,
+      warning: divergent > 0 ? 'manual_source_divergence' : null,
+    }
+    return { ...row, manualEvidence, agreementCorroboration }
+  })
+
+  // Top-level summary block per manual source (latest dates + counts).
+  const manualSources: Record<ManualSource, { latestSnapshotDate: string; categoryCount: number; skuCount: number } | null> = {
+    digikey_manual: manualSnaps.digikey_manual ? {
+      latestSnapshotDate: manualSnaps.digikey_manual.snapshotDate,
+      categoryCount: manualSnaps.digikey_manual.categoryCount,
+      skuCount: manualSnaps.digikey_manual.skuCount,
+    } : null,
+    arrow_manual: manualSnaps.arrow_manual ? {
+      latestSnapshotDate: manualSnaps.arrow_manual.snapshotDate,
+      categoryCount: manualSnaps.arrow_manual.categoryCount,
+      skuCount: manualSnaps.arrow_manual.skuCount,
+    } : null,
+    ti_manual: manualSnaps.ti_manual ? {
+      latestSnapshotDate: manualSnaps.ti_manual.snapshotDate,
+      categoryCount: manualSnaps.ti_manual.categoryCount,
+      skuCount: manualSnaps.ti_manual.skuCount,
+    } : null,
+    other_manual: manualSnaps.other_manual ? {
+      latestSnapshotDate: manualSnaps.other_manual.snapshotDate,
+      categoryCount: manualSnaps.other_manual.categoryCount,
+      skuCount: manualSnaps.other_manual.skuCount,
+    } : null,
+  }
+  const manualSourceStatus: 'manual_sources_available' | 'no_manual_sources' =
+    Object.values(manualSources).some(v => v != null) ? 'manual_sources_available' : 'no_manual_sources'
+
   // Phase 17B — top-level confidence histogram for the summary line above the table.
-  const trendConfidenceCounts = sourceAgreementWithTrend.reduce(
+  const trendConfidenceCounts = sourceAgreementWithManual.reduce(
     (acc, r) => {
       const c = r.trend?.trendConfidence ?? 'pending'
       acc[c] = (acc[c] ?? 0) + 1
@@ -1854,10 +2177,12 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     mouserCoverage,
     nexarCoverage,
     combinedCoverage,
-    sourceAgreement: sourceAgreementWithTrend,
+    sourceAgreement: sourceAgreementWithManual,
     trendReadiness,
     sourceTrendStatus,
     trendConfidenceCounts,
+    manualSources,
+    manualSourceStatus,
     legacyToCanonical,
     notes: COMBINED_EVIDENCE_NOTES,
     ...base,

@@ -11,6 +11,7 @@ export type SnapshotSourceConfidence =
   | 'authorized_or_core'
   | 'marketplace_or_broker'
   | 'unknown'
+  | 'manual_operator_import'
 
 export type SnapshotSourceObservation = {
   /** Stable source id, e.g. 'octopart_nexar', 'mouser_direct', 'digikey_direct'. */
@@ -68,8 +69,22 @@ export type Snapshot = {
   dashboard: 'texas_instruments'
   /** Source family for this row of snapshots. Today only octopart_nexar is
    * populated; future sources land as separate KV key prefixes. */
-  source: 'octopart_nexar' | 'mouser_direct' | 'digikey_direct' | 'arrow_direct' | 'ti_direct'
-  mode: 'representative_basket_preview' | 'full_basket' | 'full_mouser_category_snapshot'
+  source:
+    | 'octopart_nexar'
+    | 'mouser_direct'
+    | 'digikey_direct'
+    | 'arrow_direct'
+    | 'ti_direct'
+    // Phase 18A — operator-imported distributor evidence (no scraping, no paid API).
+    | 'digikey_manual'
+    | 'arrow_manual'
+    | 'ti_manual'
+    | 'other_manual'
+  mode:
+    | 'representative_basket_preview'
+    | 'full_basket'
+    | 'full_mouser_category_snapshot'
+    | 'manual_distributor_snapshot'
   categoryCount: number
   skuCount: number
   callsUsed: number

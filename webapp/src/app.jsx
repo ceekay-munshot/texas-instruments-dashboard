@@ -649,7 +649,24 @@ function SourceAgreementTable({ combined, trendMeta }) {
                   <td style={cellNum}>{fmtInv(r.mouserInventory)}</td>
                   <td style={cellNum}>{fmtInv(r.nexarTrustedInventory)}</td>
                   <td style={{ ...cellTD, color: aColor, fontWeight: r.agreementStatus === 'divergent' ? 'bold' : 'normal' }}>{aLabel}</td>
-                  <td style={{ ...cellTD, color: ss.color }}>{ss.label}</td>
+                  <td style={{ ...cellTD, color: ss.color }}>
+                    {ss.label}
+                    {Array.isArray(r?.manualEvidence) && r.manualEvidence.length > 0 && (() => {
+                      const sources = r.manualEvidence.map(e => e.source.replace(/_manual$/,''));
+                      const tooltip = r.manualEvidence.map(e => {
+                        const dp = e.priceDeltaVsMouserPct == null ? '—' : `${e.priceDeltaVsMouserPct > 0 ? '+' : ''}${e.priceDeltaVsMouserPct}%`;
+                        return `${e.source.replace(/_manual$/,'')}: ${e.unitPrice == null ? '—' : '$' + Number(e.unitPrice).toFixed(4)} (Δ ${dp})`;
+                      }).join(' · ');
+                      return (
+                        <div style={{ color: '#7a96b8', fontSize: '0.58rem', marginTop: 2 }} title={tooltip}>
+                          Manual evidence: {r.manualEvidence.length} source{r.manualEvidence.length === 1 ? '' : 's'} ({sources.join(', ')})
+                          {r?.agreementCorroboration?.warning === 'manual_source_divergence' && (
+                            <span style={{ color: '#f0a84e', marginLeft: 4 }}>· manual divergence</span>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  </td>
                   <td style={{ ...cellTD, color: tc.color }} title={tc.tooltip}>
                     {tc.label}
                     {tc.source && tc.label !== 'Pending' && <span style={{ color: '#4a6a8a', marginLeft: 4, fontSize: '0.58rem' }}>· {tc.source}</span>}
