@@ -60,6 +60,7 @@ import {
   checkTiConfigured,
   fetchTiToken,
   fetchTiProductInfo,
+  fetchTiProductInfoDebug,
   fetchTiInventoryPricing,
   tokenCacheSnapshot as tiTokenCacheSnapshot,
   tiAttemptedEndpoints,
@@ -1745,6 +1746,33 @@ app.get('/api/ti/product-info', async (c) => {
   }
   const result = await fetchTiProductInfo(env, partNumber)
   return c.json({ success: result.status === 'ok', ...result })
+})
+
+// GET /api/ti/product-info-debug?partNumber=XYZ — auth-gated. Returns
+// SANITIZED shape information for both the basic and extended TI product
+// endpoints. Never returns the raw response body, the OAuth token, the
+// Authorization header, or the client id/secret. Used to diagnose parser
+// gaps without exposing the production TI payload.
+app.get('/api/ti/product-info-debug', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const partNumber = (c.req.query('partNumber') || '').trim()
+  if (!partNumber) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required.' }, 400)
+  }
+  const report = await fetchTiProductInfoDebug(env, partNumber)
+  return c.json({ success: report.basic.success || report.extended.success, ...report })
 })
 
 // GET /api/ti/inventory-pricing?partNumber=XYZ — auth-gated.

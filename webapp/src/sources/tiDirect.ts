@@ -258,24 +258,43 @@ export async function fetchTiToken(env: TiEnv): Promise<TiTokenSuccess | TiToken
 export type TiProductInfo = {
   source: 'Texas Instruments Product Information API'
   status: 'ok' | 'no_match' | 'error' | 'auth_failed' | 'rate_limited' | 'token_failed' | 'not_configured'
+  /** What the caller asked for (may be a generic part number / GPN). */
+  requestedPartNumber: string
+  /** What we actually queried — may differ from `requestedPartNumber` if a
+   *  GPN→OPN fallback was used. */
+  resolvedPartNumber: string | null
+  /** True iff `requestedPartNumber` was mapped to a different OPN before the call. */
+  fallbackUsed: boolean
   partNumber: string
   genericPartNumber: string | null
   description: string | null
   lifecycleStatus: string | null
   package: string | null
   datasheetUrl: string | null
+  /** Phase 20A.2 — surfaced when TI returns them. */
+  leadTimeWeeks: number | null
+  inventoryStatus: string | null
+  okayToOrder: boolean | null
   qualityReliability: Record<string, unknown> | null
+  parametric: Record<string, unknown> | null
   fetchedAt: string
   warnings: string[]
   diagnostics: {
     httpStatus: number | null
     sanitizedCode: string | null
     sanitizedMessage: string
+    /** Which TI endpoints actually got hit during this call. */
+    basicEndpointHit: boolean
+    extendedEndpointHit: boolean
+    /** True when the extended call filled in fields the basic call left null. */
+    extendedFilledGaps: boolean
   }
 }
 
 function buildProductError(
-  partNumber: string,
+  requestedPartNumber: string,
+  resolvedPartNumber: string | null,
+  fallbackUsed: boolean,
   status: TiProductInfo['status'],
   diag: TiProductInfo['diagnostics'],
   warnings: string[],
@@ -283,13 +302,20 @@ function buildProductError(
   return {
     source: 'Texas Instruments Product Information API',
     status,
-    partNumber,
+    requestedPartNumber,
+    resolvedPartNumber,
+    fallbackUsed,
+    partNumber: resolvedPartNumber ?? requestedPartNumber,
     genericPartNumber: null,
     description: null,
     lifecycleStatus: null,
     package: null,
     datasheetUrl: null,
+    leadTimeWeeks: null,
+    inventoryStatus: null,
+    okayToOrder: null,
     qualityReliability: null,
+    parametric: null,
     fetchedAt: new Date().toISOString(),
     warnings,
     diagnostics: diag,
@@ -303,126 +329,618 @@ function pickString(...vals: unknown[]): string | null {
   return null
 }
 
-export async function fetchTiProductInfo(
-  env: TiEnv,
-  partNumber: string,
-): Promise<TiProductInfo> {
-  const cleaned = (partNumber || '').trim()
-  if (!cleaned) {
-    return buildProductError('', 'error', {
-      httpStatus: null,
-      sanitizedCode: 'invalid_partnumber',
-      sanitizedMessage: 'partNumber is required.',
-    }, ['ti_invalid_partnumber'])
+function pickNumber(...vals: unknown[]): number | null {
+  for (const v of vals) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v
+    if (typeof v === 'string' && v.trim()) {
+      const n = Number(v)
+      if (Number.isFinite(n)) return n
+    }
   }
-  const config = checkTiConfigured(env)
-  if (!config.configured) {
-    return buildProductError(cleaned, 'not_configured', {
-      httpStatus: null,
-      sanitizedCode: 'not_configured',
-      sanitizedMessage: 'TI adapter not configured.',
-    }, ['ti_not_configured'])
+  return null
+}
+
+function pickBool(...vals: unknown[]): boolean | null {
+  for (const v of vals) {
+    if (typeof v === 'boolean') return v
+    if (typeof v === 'string') {
+      const s = v.trim().toLowerCase()
+      if (s === 'true' || s === 'yes' || s === 'y') return true
+      if (s === 'false' || s === 'no' || s === 'n') return false
+    }
   }
-  const tok = await fetchTiToken(env)
-  if (!tok.ok) {
-    return buildProductError(cleaned, 'token_failed', {
-      httpStatus: tok.httpStatus,
-      sanitizedCode: tok.sanitizedCode,
-      sanitizedMessage: tok.sanitizedMessage,
-    }, [tok.status])
+  return null
+}
+
+function pickObject(...vals: unknown[]): Record<string, unknown> | null {
+  for (const v of vals) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>
   }
+  return null
+}
+
+// ── GPN → OPN fallback map (Phase 20A.2) ────────────────────────────────────
+// TI's Product Information API returns 404 for generic part numbers. The
+// frontend / customer often only knows the GPN. We hold a small static map
+// from GPN to one canonical OPN so a 404 can be retried automatically with
+// the resolved OPN. Add more entries here as we discover them.
+const GPN_TO_OPN: Record<string, string> = {
+  AFE7799: 'AFE7799IABJ',
+}
+
+function resolveOpnFromGpn(input: string): { opn: string; mapped: boolean } {
+  const upper = (input || '').trim().toUpperCase()
+  const opn = GPN_TO_OPN[upper]
+  if (opn) return { opn, mapped: true }
+  return { opn: input, mapped: false }
+}
+
+// ── Response shape resolver (Phase 20A.2) ───────────────────────────────────
+// TI's response can land in any of five shapes (A–E from the spec). Resolve
+// to a canonical { product, quality, parametric } trio so the field extractor
+// only has to know one shape.
+function extractProductObject(data: any): {
+  product: Record<string, unknown> | null
+  quality: Record<string, unknown> | null
+  parametric: Record<string, unknown> | null
+} {
+  if (!data) return { product: null, quality: null, parametric: null }
+  // E) bare array → first element
+  if (Array.isArray(data)) {
+    return {
+      product: (data[0] && typeof data[0] === 'object') ? data[0] : null,
+      quality: null,
+      parametric: null,
+    }
+  }
+  if (typeof data !== 'object') return { product: null, quality: null, parametric: null }
+  // D) wrapper with products[]
+  if (Array.isArray((data as any).products) && (data as any).products.length > 0) {
+    const p = (data as any).products[0]
+    return {
+      product: p && typeof p === 'object' ? p : null,
+      quality: pickObject((data as any).Quality, (data as any).ProductQuality, (data as any).QualityReliability),
+      parametric: pickObject((data as any).Parametric, (data as any).Parameters),
+    }
+  }
+  if (Array.isArray((data as any).Products) && (data as any).Products.length > 0) {
+    const p = (data as any).Products[0]
+    return {
+      product: p && typeof p === 'object' ? p : null,
+      quality: pickObject((data as any).Quality, (data as any).ProductQuality, (data as any).QualityReliability),
+      parametric: pickObject((data as any).Parametric, (data as any).Parameters),
+    }
+  }
+  // C) wrapper with `data` — recurse one level
+  if ((data as any).data && typeof (data as any).data === 'object' && !Array.isArray((data as any).data)) {
+    const inner = (data as any).data
+    if (inner.Product || inner.product) {
+      return {
+        product: pickObject(inner.Product, inner.product),
+        quality: pickObject(inner.Quality, inner.ProductQuality, inner.QualityReliability),
+        parametric: pickObject(inner.Parametric, inner.Parameters),
+      }
+    }
+    return {
+      product: inner,
+      quality: pickObject(inner.Quality, inner.ProductQuality, inner.QualityReliability),
+      parametric: pickObject(inner.Parametric, inner.Parameters),
+    }
+  }
+  // B) wrapper with `Product` + sibling Quality/Parametric
+  if ((data as any).Product || (data as any).product) {
+    return {
+      product: pickObject((data as any).Product, (data as any).product),
+      quality: pickObject((data as any).Quality, (data as any).ProductQuality, (data as any).QualityReliability),
+      parametric: pickObject((data as any).Parametric, (data as any).Parameters),
+    }
+  }
+  // `productDetails` wrapper sometimes appears
+  if ((data as any).productDetails && typeof (data as any).productDetails === 'object') {
+    return {
+      product: (data as any).productDetails as Record<string, unknown>,
+      quality: pickObject((data as any).Quality, (data as any).ProductQuality, (data as any).QualityReliability),
+      parametric: pickObject((data as any).Parametric, (data as any).Parameters),
+    }
+  }
+  // A) the data object IS the product
+  return {
+    product: data as Record<string, unknown>,
+    quality: pickObject((data as any).Quality, (data as any).ProductQuality, (data as any).QualityReliability),
+    parametric: pickObject((data as any).Parametric, (data as any).Parameters),
+  }
+}
+
+type ExtractedFields = {
+  partNumber: string | null
+  genericPartNumber: string | null
+  description: string | null
+  lifecycleStatus: string | null
+  package: string | null
+  datasheetUrl: string | null
+  leadTimeWeeks: number | null
+  inventoryStatus: string | null
+  okayToOrder: boolean | null
+}
+
+function extractFields(p: Record<string, unknown> | null): ExtractedFields {
+  if (!p) {
+    return {
+      partNumber: null, genericPartNumber: null, description: null, lifecycleStatus: null,
+      package: null, datasheetUrl: null, leadTimeWeeks: null, inventoryStatus: null, okayToOrder: null,
+    }
+  }
+  const a: any = p
+  // Package: prefer IndustryPackageType; otherwise compose from PackageGroup + PackageType.
+  let pkg = pickString(a.IndustryPackageType, a.industryPackageType, a.Package, a.package)
+  const grp = pickString(a.PackageGroup, a.packageGroup)
+  const typ = pickString(a.PackageType, a.packageType, a.PackageName, a.packageName)
+  if (!pkg && grp && typ) pkg = `${grp}/${typ}`
+  else if (!pkg && (grp || typ)) pkg = grp || typ
+  // Datasheet URL: prefer DatasheetUrl; only accept Url if it looks like a datasheet.
+  let datasheetUrl = pickString(a.DatasheetUrl, a.datasheetUrl, a.dataSheetUrl, a.datasheet)
+  if (!datasheetUrl) {
+    const u = pickString(a.Url, a.url)
+    if (u && /datasheet|\.pdf(\?|$)/i.test(u)) datasheetUrl = u
+  }
+  return {
+    partNumber: pickString(a.Identifier, a.identifier, a.tiPartNumber, a.partNumber, a.opn, a.OPN, a.productId),
+    genericPartNumber: pickString(
+      a.GenericProductIdentifier,
+      a.genericProductIdentifier,
+      a.genericPartNumber,
+      a.GenericPartNumber,
+      a.baseProductNumber,
+      a.BaseProductNumber,
+      a.familyName,
+      a.productFamily,
+    ),
+    description: pickString(a.Description, a.description, a.productDescription, a.shortDescription, a.LongDescription),
+    lifecycleStatus: pickString(
+      a.LifeCycleStatus,
+      a.lifeCycleStatus,
+      a.lifecycleStatus,
+      a.lifecycle,
+      a.productStatus,
+      a.ProductStatus,
+    ),
+    package: pkg,
+    datasheetUrl,
+    leadTimeWeeks: pickNumber(a.LeadTimeWeeks, a.leadTimeWeeks),
+    inventoryStatus: pickString(a.InventoryStatus, a.inventoryStatus),
+    okayToOrder: pickBool(a.OkayToOrder, a.okayToOrder),
+  }
+}
+
+function fieldsHaveGaps(f: ExtractedFields): boolean {
+  // Considered "sparse" if the most-customer-visible fields are still null.
+  return !f.description || !f.lifecycleStatus || !f.package || !f.datasheetUrl
+}
+
+function mergeFields(base: ExtractedFields, extra: ExtractedFields): ExtractedFields {
+  return {
+    partNumber: base.partNumber ?? extra.partNumber,
+    genericPartNumber: base.genericPartNumber ?? extra.genericPartNumber,
+    description: base.description ?? extra.description,
+    lifecycleStatus: base.lifecycleStatus ?? extra.lifecycleStatus,
+    package: base.package ?? extra.package,
+    datasheetUrl: base.datasheetUrl ?? extra.datasheetUrl,
+    leadTimeWeeks: base.leadTimeWeeks ?? extra.leadTimeWeeks,
+    inventoryStatus: base.inventoryStatus ?? extra.inventoryStatus,
+    okayToOrder: base.okayToOrder ?? extra.okayToOrder,
+  }
+}
+
+// ── Single product GET — used by both fetcher and debug endpoint ────────────
+
+type ProductCallResult =
+  | { kind: 'ok'; data: any; httpStatus: number; url: string }
+  | { kind: 'no_match'; httpStatus: number; url: string }
+  | { kind: 'http_error'; httpStatus: number; bodyText: string; url: string }
+  | { kind: 'unreachable'; message: string; url: string }
+  | { kind: 'invalid_json'; httpStatus: number; url: string }
+
+async function fetchProductJson(token: string, url: string): Promise<ProductCallResult> {
   let res: Response
-  const productUrl = resolveProductInfoUrl(env, cleaned)
   try {
-    res = await fetch(productUrl, {
+    res = await fetch(url, {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${tok.token}`,
+        Authorization: `Bearer ${token}`,
         Accept: 'application/json',
       },
     })
   } catch (e: any) {
-    return buildProductError(cleaned, 'error', {
-      httpStatus: null,
-      sanitizedCode: 'unreachable',
-      sanitizedMessage: sanitizeMessage(e?.message || 'unknown error', env),
-    }, ['ti_unreachable'])
+    return { kind: 'unreachable', message: String(e?.message || 'unknown error'), url }
   }
-  if (res.status === 429) {
-    return buildProductError(cleaned, 'rate_limited', {
-      httpStatus: 429,
-      sanitizedCode: 'rate_limited',
-      sanitizedMessage: 'TI API rate limit hit.',
-    }, ['ti_rate_limited'])
-  }
-  if (res.status === 401 || res.status === 403) {
-    return buildProductError(cleaned, 'auth_failed', {
-      httpStatus: res.status,
-      sanitizedCode: 'unauthorized',
-      sanitizedMessage:
-        res.status === 401
-          ? 'TI rejected the token. Re-check credentials and that Product Information API access is approved.'
-          : 'TI returned 403. Verify the app is entitled for the Product Information API suite.',
-    }, [`ti_http_${res.status}`])
-  }
-  if (res.status === 404) {
-    return buildProductError(cleaned, 'no_match', {
-      httpStatus: 404,
-      sanitizedCode: 'not_found',
-      sanitizedMessage: 'TI Product Information API returned 404 for that part number.',
-    }, ['ti_not_found'])
-  }
+  if (res.status === 404) return { kind: 'no_match', httpStatus: 404, url }
   let bodyText = ''
   try { bodyText = await res.text() } catch { bodyText = '' }
-  if (!res.ok) {
-    const ext = tryExtractTiError(bodyText)
-    return buildProductError(cleaned, 'error', {
-      httpStatus: res.status,
-      sanitizedCode: ext.code ?? `http_${res.status}`,
-      sanitizedMessage: sanitizeMessage(ext.message ?? bodyText, env),
-    }, [`ti_http_${res.status}`])
+  if (!res.ok) return { kind: 'http_error', httpStatus: res.status, bodyText, url }
+  try {
+    const data = JSON.parse(bodyText)
+    return { kind: 'ok', data, httpStatus: res.status, url }
+  } catch {
+    return { kind: 'invalid_json', httpStatus: res.status, url }
   }
-  let data: any
-  try { data = JSON.parse(bodyText) } catch {
-    return buildProductError(cleaned, 'error', {
-      httpStatus: res.status,
-      sanitizedCode: 'invalid_json',
-      sanitizedMessage: 'Product response was not valid JSON.',
-    }, ['ti_invalid_json'])
+}
+
+export async function fetchTiProductInfo(
+  env: TiEnv,
+  partNumber: string,
+): Promise<TiProductInfo> {
+  const requested = (partNumber || '').trim()
+  if (!requested) {
+    return buildProductError('', null, false, 'error', {
+      httpStatus: null, sanitizedCode: 'invalid_partnumber',
+      sanitizedMessage: 'partNumber is required.',
+      basicEndpointHit: false, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, ['ti_invalid_partnumber'])
   }
-  // TI response shape: defensive — accept several plausible field names. The
-  // payload may be the product object itself or wrapped under `product` / `data`.
-  const p = data?.product ?? data?.data ?? data
-  const matchedPartNumber =
-    pickString(p?.tiPartNumber, p?.partNumber, p?.opn, p?.productId) ?? cleaned
+  const config = checkTiConfigured(env)
+  if (!config.configured) {
+    return buildProductError(requested, null, false, 'not_configured', {
+      httpStatus: null, sanitizedCode: 'not_configured',
+      sanitizedMessage: 'TI adapter not configured.',
+      basicEndpointHit: false, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, ['ti_not_configured'])
+  }
+  const tok = await fetchTiToken(env)
+  if (!tok.ok) {
+    return buildProductError(requested, null, false, 'token_failed', {
+      httpStatus: tok.httpStatus, sanitizedCode: tok.sanitizedCode,
+      sanitizedMessage: tok.sanitizedMessage,
+      basicEndpointHit: false, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [tok.status])
+  }
+
+  // Try the basic endpoint with the input as-is first. If it 404s, try the
+  // GPN→OPN fallback map and retry once.
   const warnings: string[] = []
-  if (!p || typeof p !== 'object') {
-    warnings.push('ti_unexpected_response_shape')
+  let resolved = requested
+  let fallbackUsed = false
+
+  let basic = await fetchProductJson(tok.token, resolveProductInfoUrl(env, resolved))
+  if (basic.kind === 'no_match') {
+    const { opn, mapped } = resolveOpnFromGpn(requested)
+    if (mapped && opn !== resolved) {
+      warnings.push(`ti_gpn_to_opn_fallback:${requested}=>${opn}`)
+      resolved = opn
+      fallbackUsed = true
+      basic = await fetchProductJson(tok.token, resolveProductInfoUrl(env, resolved))
+    }
   }
-  const out: TiProductInfo = {
+
+  // Map basic-call results to outcomes. We may either:
+  //  - Return early on hard failures (auth, rate-limit, unreachable, etc.)
+  //  - Continue to extended-merge on a 200 result.
+  if (basic.kind === 'http_error' && basic.httpStatus === 429) {
+    return buildProductError(requested, resolved, fallbackUsed, 'rate_limited', {
+      httpStatus: 429, sanitizedCode: 'rate_limited',
+      sanitizedMessage: 'TI API rate limit hit.',
+      basicEndpointHit: true, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [...warnings, 'ti_rate_limited'])
+  }
+  if (basic.kind === 'http_error' && (basic.httpStatus === 401 || basic.httpStatus === 403)) {
+    return buildProductError(requested, resolved, fallbackUsed, 'auth_failed', {
+      httpStatus: basic.httpStatus, sanitizedCode: 'unauthorized',
+      sanitizedMessage:
+        basic.httpStatus === 401
+          ? 'TI rejected the token. Re-check credentials and that Product Information API access is approved.'
+          : 'TI returned 403. Verify the app is entitled for the Product Information API suite.',
+      basicEndpointHit: true, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [...warnings, `ti_http_${basic.httpStatus}`])
+  }
+  if (basic.kind === 'http_error') {
+    const ext = tryExtractTiError(basic.bodyText)
+    return buildProductError(requested, resolved, fallbackUsed, 'error', {
+      httpStatus: basic.httpStatus,
+      sanitizedCode: ext.code ?? `http_${basic.httpStatus}`,
+      sanitizedMessage: sanitizeMessage(ext.message ?? basic.bodyText, env),
+      basicEndpointHit: true, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [...warnings, `ti_http_${basic.httpStatus}`])
+  }
+  if (basic.kind === 'unreachable') {
+    return buildProductError(requested, resolved, fallbackUsed, 'error', {
+      httpStatus: null, sanitizedCode: 'unreachable',
+      sanitizedMessage: sanitizeMessage(basic.message, env),
+      basicEndpointHit: true, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [...warnings, 'ti_unreachable'])
+  }
+  if (basic.kind === 'invalid_json') {
+    return buildProductError(requested, resolved, fallbackUsed, 'error', {
+      httpStatus: basic.httpStatus, sanitizedCode: 'invalid_json',
+      sanitizedMessage: 'Product response was not valid JSON.',
+      basicEndpointHit: true, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [...warnings, 'ti_invalid_json'])
+  }
+  if (basic.kind === 'no_match') {
+    return buildProductError(requested, resolved, fallbackUsed, 'no_match', {
+      httpStatus: 404, sanitizedCode: 'not_found',
+      sanitizedMessage: fallbackUsed
+        ? 'TI Product Information API returned 404 for the input and the GPN→OPN fallback.'
+        : 'TI Product Information API returned 404 for that part number.',
+      basicEndpointHit: true, extendedEndpointHit: false, extendedFilledGaps: false,
+    }, [...warnings, 'ti_not_found'])
+  }
+
+  // basic.kind === 'ok'. Parse + extract.
+  const basicResolved = extractProductObject(basic.data)
+  let fields = extractFields(basicResolved.product)
+  let quality = basicResolved.quality
+  let parametric = basicResolved.parametric
+  let extendedEndpointHit = false
+  let extendedFilledGaps = false
+
+  // If important fields are still missing, try the extended endpoint and
+  // merge whatever new fields it provides.
+  if (fieldsHaveGaps(fields) || !quality || !parametric) {
+    const ext = await fetchProductJson(tok.token, resolveProductInfoExtendedUrl(env, resolved))
+    extendedEndpointHit = true
+    if (ext.kind === 'ok') {
+      const extResolved = extractProductObject(ext.data)
+      const extFields = extractFields(extResolved.product)
+      const merged = mergeFields(fields, extFields)
+      // Did extended actually add anything?
+      const filled =
+        (!fields.description && !!merged.description) ||
+        (!fields.lifecycleStatus && !!merged.lifecycleStatus) ||
+        (!fields.package && !!merged.package) ||
+        (!fields.datasheetUrl && !!merged.datasheetUrl) ||
+        (!fields.genericPartNumber && !!merged.genericPartNumber)
+      if (filled) extendedFilledGaps = true
+      fields = merged
+      quality = quality ?? extResolved.quality
+      parametric = parametric ?? extResolved.parametric
+    } else if (ext.kind === 'http_error' && (ext.httpStatus === 401 || ext.httpStatus === 403)) {
+      // Don't fail the call — extended is best-effort.
+      warnings.push(`ti_extended_http_${ext.httpStatus}`)
+    } else if (ext.kind === 'http_error') {
+      warnings.push(`ti_extended_http_${ext.httpStatus}`)
+    } else if (ext.kind !== 'no_match') {
+      warnings.push(`ti_extended_${ext.kind}`)
+    }
+  }
+
+  return {
     source: 'Texas Instruments Product Information API',
     status: 'ok',
-    partNumber: matchedPartNumber,
-    genericPartNumber: pickString(p?.genericPartNumber, p?.genericProductId, p?.familyName, p?.productFamily),
-    description: pickString(p?.description, p?.productDescription, p?.shortDescription),
-    lifecycleStatus: pickString(p?.lifecycleStatus, p?.lifecycle, p?.productStatus),
-    package: pickString(p?.package, p?.packageType, p?.packagingType, p?.packageName),
-    datasheetUrl: pickString(p?.datasheetUrl, p?.dataSheetUrl, p?.datasheet),
-    qualityReliability:
-      p?.qualityReliability && typeof p.qualityReliability === 'object'
-        ? (p.qualityReliability as Record<string, unknown>)
-        : p?.quality && typeof p.quality === 'object'
-          ? (p.quality as Record<string, unknown>)
-          : null,
+    requestedPartNumber: requested,
+    resolvedPartNumber: resolved,
+    fallbackUsed,
+    partNumber: fields.partNumber ?? resolved,
+    genericPartNumber: fields.genericPartNumber,
+    description: fields.description,
+    lifecycleStatus: fields.lifecycleStatus,
+    package: fields.package,
+    datasheetUrl: fields.datasheetUrl,
+    leadTimeWeeks: fields.leadTimeWeeks,
+    inventoryStatus: fields.inventoryStatus,
+    okayToOrder: fields.okayToOrder,
+    qualityReliability: quality,
+    parametric,
     fetchedAt: new Date().toISOString(),
     warnings,
     diagnostics: {
-      httpStatus: res.status,
+      httpStatus: basic.httpStatus,
       sanitizedCode: null,
       sanitizedMessage: '',
+      basicEndpointHit: true,
+      extendedEndpointHit,
+      extendedFilledGaps,
     },
   }
-  return out
+}
+
+// ── Debug endpoint helper (Phase 20A.2) ─────────────────────────────────────
+// Returns sanitized shape information for both the basic and extended TI
+// product endpoints so the operator can see exactly which paths exist in
+// TI's response without ever leaking the raw body, the token, or the headers.
+
+export type TiProductDebugReport = {
+  label: 'basic' | 'extended'
+  attemptedHost: string
+  attemptedPath: string
+  httpStatus: number | null
+  success: boolean
+  topLevelKeys: string[]
+  /** First-level child keys for objects directly under the root. */
+  nestedKeys: Record<string, string[]>
+  /** Length for any first-level array on the root. */
+  arrayLengths: Record<string, number>
+  /** For each well-known field path, whether a non-empty value exists. */
+  sampleFieldPaths: Record<string, 'present' | 'absent'>
+  /** Whether the canonical extractor could find a product object at all. */
+  productResolved: boolean
+  sanitizedCode: string | null
+  sanitizedMessage: string
+}
+
+const SAMPLE_FIELD_PATHS = [
+  'Identifier',
+  'Description',
+  'GenericProductIdentifier',
+  'LifeCycleStatus',
+  'DatasheetUrl',
+  'Url',
+  'IndustryPackageType',
+  'PackageGroup',
+  'PackageType',
+  'OkayToOrder',
+  'LeadTimeWeeks',
+  'InventoryStatus',
+  'Product.Identifier',
+  'Product.Description',
+  'Product.GenericProductIdentifier',
+  'Product.LifeCycleStatus',
+  'Product.DatasheetUrl',
+  'Product.IndustryPackageType',
+  'Product.PackageGroup',
+  'Product.PackageType',
+  'Quality',
+  'Parametric',
+  'data.Identifier',
+  'data.Description',
+  'data.Product.Identifier',
+  'products[0].Identifier',
+  'products[0].Description',
+  'productDetails.Identifier',
+  'productDetails.Description',
+] as const
+
+function getPath(obj: any, path: string): unknown {
+  if (obj == null) return undefined
+  // Support tokens like 'products[0]' and 'data.Product'
+  let cursor: any = obj
+  const parts = path.split('.')
+  for (const part of parts) {
+    if (cursor == null) return undefined
+    const m = part.match(/^([^\[\]]+)\[(\d+)\]$/)
+    if (m) {
+      const key = m[1]
+      const idx = parseInt(m[2], 10)
+      cursor = cursor[key]
+      if (!Array.isArray(cursor)) return undefined
+      cursor = cursor[idx]
+    } else {
+      cursor = cursor[part]
+    }
+  }
+  return cursor
+}
+
+function summarizeShape(label: 'basic' | 'extended', url: string, call: ProductCallResult, env: TiEnv): TiProductDebugReport {
+  const summary = safeUrlSummary(url)
+  const base: TiProductDebugReport = {
+    label,
+    attemptedHost: summary.host,
+    attemptedPath: summary.path,
+    httpStatus: null,
+    success: false,
+    topLevelKeys: [],
+    nestedKeys: {},
+    arrayLengths: {},
+    sampleFieldPaths: {},
+    productResolved: false,
+    sanitizedCode: null,
+    sanitizedMessage: '',
+  }
+  if (call.kind === 'unreachable') {
+    return { ...base, sanitizedCode: 'unreachable', sanitizedMessage: sanitizeMessage(call.message, env) }
+  }
+  if (call.kind === 'no_match') {
+    return { ...base, httpStatus: 404, sanitizedCode: 'not_found', sanitizedMessage: 'TI returned 404.' }
+  }
+  if (call.kind === 'http_error') {
+    const ext = tryExtractTiError(call.bodyText)
+    return {
+      ...base,
+      httpStatus: call.httpStatus,
+      sanitizedCode: ext.code ?? `http_${call.httpStatus}`,
+      sanitizedMessage: sanitizeMessage(ext.message ?? call.bodyText, env),
+    }
+  }
+  if (call.kind === 'invalid_json') {
+    return { ...base, httpStatus: call.httpStatus, sanitizedCode: 'invalid_json', sanitizedMessage: 'Response was not valid JSON.' }
+  }
+  // ok
+  const data = call.data
+  const topLevelKeys = data && typeof data === 'object' && !Array.isArray(data)
+    ? Object.keys(data)
+    : Array.isArray(data) ? ['(array)']
+      : []
+  const nestedKeys: Record<string, string[]> = {}
+  const arrayLengths: Record<string, number> = {}
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    for (const k of topLevelKeys) {
+      const v = (data as any)[k]
+      if (Array.isArray(v)) {
+        arrayLengths[k] = v.length
+        if (v.length > 0 && v[0] && typeof v[0] === 'object' && !Array.isArray(v[0])) {
+          nestedKeys[`${k}[0]`] = Object.keys(v[0]).slice(0, 50)
+        }
+      } else if (v && typeof v === 'object') {
+        nestedKeys[k] = Object.keys(v).slice(0, 50)
+      }
+    }
+  } else if (Array.isArray(data) && data.length > 0 && data[0] && typeof data[0] === 'object') {
+    arrayLengths['(root)'] = data.length
+    nestedKeys['[0]'] = Object.keys(data[0]).slice(0, 50)
+  }
+  const sampleFieldPaths: Record<string, 'present' | 'absent'> = {}
+  for (const path of SAMPLE_FIELD_PATHS) {
+    const v = getPath(data, path)
+    sampleFieldPaths[path] = (v === undefined || v === null || (typeof v === 'string' && v.trim() === ''))
+      ? 'absent' : 'present'
+  }
+  const resolved = extractProductObject(data)
+  return {
+    ...base,
+    httpStatus: call.httpStatus,
+    success: true,
+    topLevelKeys,
+    nestedKeys,
+    arrayLengths,
+    sampleFieldPaths,
+    productResolved: !!resolved.product,
+  }
+}
+
+export async function fetchTiProductInfoDebug(
+  env: TiEnv,
+  partNumber: string,
+): Promise<{
+  requestedPartNumber: string
+  resolvedPartNumber: string
+  fallbackUsed: boolean
+  basic: TiProductDebugReport
+  extended: TiProductDebugReport
+}> {
+  const requested = (partNumber || '').trim()
+  const tok = await fetchTiToken(env)
+  if (!tok.ok) {
+    const fail: TiProductDebugReport = {
+      label: 'basic',
+      attemptedHost: '',
+      attemptedPath: '',
+      httpStatus: tok.httpStatus,
+      success: false,
+      topLevelKeys: [],
+      nestedKeys: {},
+      arrayLengths: {},
+      sampleFieldPaths: {},
+      productResolved: false,
+      sanitizedCode: tok.sanitizedCode,
+      sanitizedMessage: tok.sanitizedMessage,
+    }
+    return {
+      requestedPartNumber: requested,
+      resolvedPartNumber: requested,
+      fallbackUsed: false,
+      basic: { ...fail, label: 'basic' },
+      extended: { ...fail, label: 'extended' },
+    }
+  }
+  // Try requested first; if 404 and we have a GPN→OPN map, retry with the OPN.
+  let resolved = requested
+  let fallbackUsed = false
+  let basicCall = await fetchProductJson(tok.token, resolveProductInfoUrl(env, resolved))
+  if (basicCall.kind === 'no_match') {
+    const { opn, mapped } = resolveOpnFromGpn(requested)
+    if (mapped && opn !== resolved) {
+      resolved = opn
+      fallbackUsed = true
+      basicCall = await fetchProductJson(tok.token, resolveProductInfoUrl(env, resolved))
+    }
+  }
+  const extendedCall = await fetchProductJson(tok.token, resolveProductInfoExtendedUrl(env, resolved))
+  return {
+    requestedPartNumber: requested,
+    resolvedPartNumber: resolved,
+    fallbackUsed,
+    basic: summarizeShape('basic', resolveProductInfoUrl(env, resolved), basicCall, env),
+    extended: summarizeShape('extended', resolveProductInfoExtendedUrl(env, resolved), extendedCall, env),
+  }
 }
 
 // ── Store API: Inventory & Pricing (gated until approval lands) ─────────────
