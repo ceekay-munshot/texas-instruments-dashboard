@@ -709,6 +709,9 @@ function App(){
   const [coverageData,setCoverageData]=useState(null);
   // Phase 16A: combined Mouser + Nexar evidence (read-only, no Nexar calls).
   const [combinedEvidence,setCombinedEvidence]=useState(null);
+  // Phase 19B — two-tab UI. 'prices' is the customer-facing default;
+  // 'insights' holds source agreement, signal summary, and operator status.
+  const [activeTab,setActiveTab]=useState('prices');
   const { toasts, push, dismiss } = useToasts();
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
@@ -1092,6 +1095,35 @@ function App(){
         </div>
       </div>
 
+      {/* ── Tab strip (Phase 19B) ── */}
+      <div style={{display:'flex',gap:0,borderBottom:`1px solid ${B}`,background:'#050810',padding:'0 12px'}}>
+        {[
+          {id:'prices', label:'Prices'},
+          {id:'insights', label:'Insights'},
+        ].map(t=>{
+          const on=activeTab===t.id;
+          return(
+            <button key={t.id} onClick={()=>setActiveTab(t.id)}
+              style={{
+                background:'none',
+                border:'none',
+                borderBottom: on?'2px solid #3d8ef0':'2px solid transparent',
+                padding:'9px 18px',
+                fontSize:'0.66rem',
+                letterSpacing:'0.16em',
+                textTransform:'uppercase',
+                color: on?'#e0eaf8':'#4a6a8a',
+                cursor:'pointer',
+                fontFamily:'monospace',
+                fontWeight: on?'bold':'normal',
+              }}>
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {activeTab==='prices'&&<>
       {/* ── Group toggles ── */}
       <div style={{display:'flex',gap:5,padding:'7px 16px',borderBottom:`1px solid ${B}`,flexWrap:'wrap',alignItems:'center',background:'#050810'}}>
         <span style={{fontSize:'0.57rem',color:'#2d4a6b',letterSpacing:'0.1em'}}>SHOW:</span>
@@ -1102,22 +1134,13 @@ function App(){
         })}
       </div>
 
-      {/* ── Legend ── */}
-      <div style={{display:'flex',gap:10,padding:'3px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.57rem',color:'#2d4a6b',flexWrap:'wrap',background:'#050810'}}>
-        <span style={{color:'#00c9a7'}}>■ positive</span><span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
-        <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ bold ≥5%</span><span>·</span>
-        <span style={{color:'#ffd700'}}>Historical rows = QoQ price change vs prior quarter / captured period · ★ Live = Mouser qty=1 spot vs latest baseline · same SKU &amp; qty break · L superscript = live Mouser datapoint · early-warning monitor, not a finalized quarterly row · hover for detail</span>
-        <span style={{color:'#f0a84e',marginLeft:6}}>· LMG3650 tracks reel/2000 price (no unit break on Mouser)</span>
-        <span style={{color:'#3d8ef0',marginLeft:6}}>· NX marker = Nexar trusted basket preview available for that category (tiny sample only; broker inventory excluded from core signal)</span>
-        <span style={{color:'#7a96b8',marginLeft:6}}>· Snapshot memory: {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}{snapshotMeta?` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`:''}{evidenceData?.evidence?` · Source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`:''}{evidenceData?.coverage?` · Basket coverage: ${evidenceData.coverage.sampledSkuCount} / ${evidenceData.coverage.basketCatalogSkuCount} sampled today${evidenceData.coverage.samplingPolicy==='anchor_plus_rotation'?' · rotating coverage':''}${evidenceData.coverage.estimatedFullCycleDays?` · full cycle ~${evidenceData.coverage.estimatedFullCycleDays} days`:''}`:''}{trendMeta?` · Trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`:''}</span>
-        <span style={{color:'#7a96b8',marginLeft:6}}>· Taxonomy: 28 TI subcategories · Mouser backbone · Nexar rotating corroboration{combinedEvidence?.latestMouserSnapshotDate?` · Mouser snapshot ${combinedEvidence.latestMouserSnapshotDate}`:''}{combinedEvidence?.latestNexarSnapshotDate?` · Nexar snapshot ${combinedEvidence.latestNexarSnapshotDate}`:''}</span>
+      {/* ── Simplified legend (Phase 19B) ── */}
+      <div style={{display:'flex',gap:14,padding:'5px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.6rem',color:'#7a96b8',flexWrap:'wrap',background:'#050810',alignItems:'center'}}>
+        <span style={{color:'#00c9a7'}}>■ positive</span>
+        <span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
+        <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ ≥5%</span>
+        <span style={{color:'#4a6a8a'}}>· Historical = QoQ %; Live row = Mouser qty=1 vs latest baseline · hover any cell for detail</span>
       </div>
-
-      {/* ── Source Agreement Table (Phase 16B) ── */}
-      <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>
-
-      {/* ── Signal Summary ── */}
-      <SignalSummary liveData={liveData} baselineMeta={baselineMeta}/>
 
       {/* ── Table ── */}
       <div style={{overflowX:'auto',position:'relative',zIndex:1}}>
@@ -1149,22 +1172,12 @@ function App(){
               );
             })}
 
-            {/* Divider */}
+            {/* Divider — slim, customer-facing copy only */}
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
-                <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'3px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ LIVE PRICE MONITOR — MOUSER QTY=1 SPOT vs LATEST BASELINE · Q1-26 CLOSE CAPTURED 28-APR-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
+                <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
+                  <span>▼ LIVE — MOUSER QTY=1 vs LATEST BASELINE · Q1-26 CLOSE CAPTURED 28-APR-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
                   {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
-                  <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8}}>
-                    {basketPreviewData&&<span style={{color:'#3d8ef0'}}>NX: {(basketPreviewData.categories||[]).filter(c=>(c.quotedSkuCount||0)>0).length} cats · {basketPreviewData.cached?'cached':'fresh'} · TTL {basketPreviewData.cacheTtlHours||24}h</span>}
-                    <button
-                      onClick={()=>fetchBasketPreview(true)}
-                      disabled={basketLoading}
-                      title={basketLoading?'Refreshing…':'Manually refresh Nexar basket source check — uses Nexar eval quota'}
-                      style={{background:'none',border:`1px solid ${B}`,borderRadius:3,padding:'2px 7px',fontSize:'0.5rem',color:basketLoading?'#4a6480':'#3d8ef0',cursor:basketLoading?'not-allowed':'pointer',letterSpacing:'0.08em',textTransform:'uppercase',fontFamily:'inherit'}}>
-                      ⟳ {basketLoading?'REFRESHING':'REFRESH BASKET SOURCE CHECK'}
-                    </button>
-                  </span>
                 </div>
               </td>
             </tr>
@@ -1206,9 +1219,51 @@ function App(){
           </tbody>
         </table>
       </div>
+      </>}
 
-      {/* Tooltip */}
-      {tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId))&&(
+      {activeTab==='insights'&&<>
+        {/* ── Operator status lines ── */}
+        <div style={{padding:'12px 16px',borderBottom:`1px solid ${B}`,background:'#050810',display:'flex',flexDirection:'column',gap:6}}>
+          <div style={{fontSize:'0.6rem',color:'#7a96b8',fontFamily:'monospace'}}>
+            <span style={{color:'#6b8aa8',letterSpacing:'0.1em',textTransform:'uppercase',fontSize:'0.55rem',fontWeight:'bold',marginRight:6}}>Snapshot memory:</span>
+            {snapshotMeta?(snapshotMeta.configured?'configured':'not configured'):'…'}
+            {snapshotMeta&&` · latest snapshot: ${snapshotMeta.latestSnapshotDate||'none'}`}
+            {evidenceData?.evidence&&` · source evidence: ${({strong_current_evidence:'strong',moderate_current_evidence:'moderate',weak_current_evidence:'weak',insufficient_current_evidence:'insufficient'})[evidenceData.evidence.overallEvidenceStatus]||'pending'} (${evidenceData.evidence.overallSourceConfidenceScore}/100)`}
+            {evidenceData?.coverage&&` · basket: ${evidenceData.coverage.sampledSkuCount} / ${evidenceData.coverage.basketCatalogSkuCount} sampled today${evidenceData.coverage.samplingPolicy==='anchor_plus_rotation'?' · rotating':''}${evidenceData.coverage.estimatedFullCycleDays?` · full cycle ~${evidenceData.coverage.estimatedFullCycleDays}d`:''}`}
+            {trendMeta&&` · trend signal: ${trendMeta.status==='ok'?'ready':trendMeta.status==='insufficient_history'?'pending until 2 daily snapshots':trendMeta.status==='no_data'?'no data':trendMeta.status==='snapshot_storage_not_configured'?'not configured':trendMeta.status}`}
+          </div>
+          <div style={{fontSize:'0.6rem',color:'#7a96b8',fontFamily:'monospace'}}>
+            <span style={{color:'#6b8aa8',letterSpacing:'0.1em',textTransform:'uppercase',fontSize:'0.55rem',fontWeight:'bold',marginRight:6}}>Taxonomy:</span>
+            28 TI subcategories · Mouser backbone · Nexar rotating corroboration
+            {combinedEvidence?.latestMouserSnapshotDate?` · Mouser snapshot ${combinedEvidence.latestMouserSnapshotDate}`:''}
+            {combinedEvidence?.latestNexarSnapshotDate?` · Nexar snapshot ${combinedEvidence.latestNexarSnapshotDate}`:''}
+          </div>
+        </div>
+
+        {/* ── Source Agreement Table (Phase 16B) ── */}
+        <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>
+
+        {/* ── Signal Summary (full panel) ── */}
+        <SignalSummary liveData={liveData} baselineMeta={baselineMeta}/>
+
+        {/* ── Operator-only basket source check ── */}
+        <div style={{padding:'10px 16px',borderTop:`1px solid #0d1520`,background:'#050810',fontSize:'0.6rem',color:'#7a96b8',fontFamily:'monospace',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
+          <span style={{color:'#6b8aa8',letterSpacing:'0.1em',textTransform:'uppercase',fontSize:'0.55rem',fontWeight:'bold'}}>Nexar basket check</span>
+          {basketPreviewData
+            ? <span style={{color:'#3d8ef0'}}>{(basketPreviewData.categories||[]).filter(c=>(c.quotedSkuCount||0)>0).length} cats · {basketPreviewData.cached?'cached':'fresh'} · TTL {basketPreviewData.cacheTtlHours||24}h</span>
+            : <span style={{color:'#4a6a8a'}}>not yet loaded</span>}
+          <button
+            onClick={()=>fetchBasketPreview(true)}
+            disabled={basketLoading}
+            title={basketLoading?'Refreshing…':'Manually refresh Nexar basket source check — uses Nexar eval quota'}
+            style={{background:'none',border:`1px solid ${B}`,borderRadius:3,padding:'3px 9px',fontSize:'0.55rem',color:basketLoading?'#4a6480':'#3d8ef0',cursor:basketLoading?'not-allowed':'pointer',letterSpacing:'0.08em',textTransform:'uppercase',fontFamily:'inherit'}}>
+            ⟳ {basketLoading?'REFRESHING':'REFRESH'}
+          </button>
+        </div>
+      </>}
+
+      {/* Tooltip — applies on prices tab when hovering live cells */}
+      {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId))&&(
         <div className="tt" style={{top:tooltip.y+14,left:Math.min(tooltip.x+14,window.innerWidth-360)}}>
           <TT catId={tooltip.catId}/>
         </div>
@@ -1219,8 +1274,9 @@ function App(){
         {toasts.map(t => <ToastShell key={t.id} toast={t} onDismiss={dismiss}/>)}
       </div>
 
-      <div style={{padding:'8px 16px 16px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
-        <span>Historical rows: QoQ product price changes (Jun-22→Mar-26) · Live row (★): current Mouser qty=1 spot vs latest baseline · Latest baseline: Q1-26 close captured 28-Apr-26 · L = live datapoint · same SKU &amp; qty break · USD · INR→USD ₹83.5/$ · Early-warning monitor, not a finalized quarterly row</span>
+      {/* Slim global footer */}
+      <div style={{padding:'8px 16px 14px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
+        <span>USD · qty=1 · {HP.length} verified quarters + live</span>
         <span>TI Product Price Intelligence · Professional use only</span>
       </div>
     </div>
