@@ -658,6 +658,229 @@ function SourceAgreementTable({ combined, trendMeta }) {
   );
 }
 
+// ── TI Watched Parts Universe (Phase 20B) ───────────────────────────────────
+// Public surface shows the static watched-parts catalog (basket / generic part /
+// orderable part / display name / priority / thesis). The live Product
+// Information API fields (description, lifecycle, package, lead time, etc.)
+// require an X-Capture-Secret round trip; the secret is held only in
+// component memory — never persisted, never written to localStorage, never
+// sent on GET query strings, and never shipped in the static bundle.
+function TiWatchedPartsUniverse() {
+  const [catalog, setCatalog] = useState(null);
+  const [livePayload, setLivePayload] = useState(null);
+  const [secret, setSecret] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [showSecret, setShowSecret] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/ti/watched-parts/catalog')
+      .then(r => r.ok ? r.json() : null)
+      .then(j => { if (!cancelled && j) setCatalog(j); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  async function fetchLive() {
+    if (!secret.trim()) {
+      setError('Capture secret required.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/ti/watched-parts/product-info', {
+        headers: { 'X-Capture-Secret': secret.trim() },
+      });
+      const json = await res.json().catch(() => null);
+      if (!json) {
+        setError(`Server returned ${res.status} (no JSON).`);
+      } else if (json.status === 'unauthorized') {
+        setError('Unauthorized — check the capture secret.');
+      } else if (json.status === 'capture_secret_not_configured') {
+        setError('Capture secret is not configured on the server.');
+      } else if (!json.configured) {
+        setError(json.notConfiguredReason || 'TI adapter not configured.');
+        setLivePayload(json);
+      } else {
+        setLivePayload(json);
+      }
+    } catch (e) {
+      setError(e?.message || 'Failed to reach server.');
+    }
+    setBusy(false);
+  }
+
+  const liveByGenericPart = useMemo(() => {
+    const m = new Map();
+    if (livePayload && Array.isArray(livePayload.parts)) {
+      for (const p of livePayload.parts) m.set(p.genericPartNumber, p);
+    }
+    return m;
+  }, [livePayload]);
+
+  const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+  const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 4 };
+  const tinyLabel = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
+
+  // Summary cards — show static values from the catalog when no live payload
+  // is available yet. The brief calls for five cards (total, active, longest
+  // lead time, okay to order, baskets covered).
+  const totalParts = catalog?.totalParts ?? '—';
+  const basketsCovered = livePayload?.summary?.basketsCovered ?? catalog?.baskets?.length ?? '—';
+  const activeParts = livePayload?.summary?.activeParts ?? null;
+  const okayToOrder = livePayload?.summary?.partsOkayToOrder ?? null;
+  const longestLeadWeeks = livePayload?.summary?.longestLeadTimeWeeks ?? null;
+  const longestLeadLabel = livePayload?.summary?.longestLeadTimePart ?? null;
+  const generatedAt = livePayload?.generatedAt
+    ? new Date(livePayload.generatedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : null;
+
+  const SummaryCard = ({ label, value, sub }) => (
+    <div style={{ minWidth: 150, padding: '10px 14px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+      <div style={tinyLabel}>{label}</div>
+      <div style={{ fontSize: '1.1rem', fontFamily: 'monospace', color: '#e0eaf8', marginTop: 4 }}>{value}</div>
+      {sub && <div style={{ fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+
+  const cellTH = { padding: '6px 8px', textAlign: 'left', borderBottom: '1px solid #1a2740', color: '#6b8aa8', fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.12em', fontWeight: 'bold', whiteSpace: 'nowrap' };
+  const cellTD = { padding: '5px 8px', borderBottom: '1px solid #0d1520', fontSize: '0.7rem', color: '#c4d4e8', verticalAlign: 'top' };
+  const cellMono = { ...cellTD, fontFamily: 'monospace' };
+
+  const lifecycleColor = lc => {
+    if (!lc) return '#7a96b8';
+    const u = String(lc).toUpperCase();
+    if (u.startsWith('ACTIVE') || u === 'PRODUCTION' || u === 'PRODUCT' || u === 'AVAILABLE') return '#4dffc3';
+    if (u.includes('NRND') || u.includes('NOT RECOMMENDED')) return '#f0a84e';
+    if (u.includes('OBSOLETE') || u.includes('DISCONTIN')) return '#f05c5c';
+    return '#c4d4e8';
+  };
+  const okayColor = v => v === true ? '#4dffc3' : v === false ? '#f0a84e' : '#7a96b8';
+
+  // Derive the list of rows to render — always from the static catalog so
+  // the table is populated even before the operator runs a live fetch.
+  const rows = useMemo(() => {
+    if (!catalog || !Array.isArray(catalog.parts)) return [];
+    return catalog.parts.map(c => ({ catalog: c, live: liveByGenericPart.get(c.genericPartNumber) || null }));
+  }, [catalog, liveByGenericPart]);
+
+  return (
+    <div style={sectionWrap}>
+      <div style={{ ...sectionTitle, marginBottom: 2 }}>TI Watched Parts Universe</div>
+      <div style={{ fontSize: '0.72rem', color: '#a0b8d0', marginBottom: 14, lineHeight: 1.5, maxWidth: 920 }}>
+        Product metadata live via Texas Instruments Product Information API. Inventory and pricing signal pending TI Store API approval.
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
+        <SummaryCard label="Total watched parts" value={totalParts} />
+        <SummaryCard label="Active parts" value={activeParts == null ? '—' : activeParts} sub={livePayload ? 'lifecycle = active' : 'pending fetch'} />
+        <SummaryCard
+          label="Longest lead time"
+          value={longestLeadWeeks == null ? '—' : `${longestLeadWeeks} wk`}
+          sub={longestLeadLabel || (livePayload ? 'no lead time reported' : 'pending fetch')}
+        />
+        <SummaryCard label="Parts okay to order" value={okayToOrder == null ? '—' : okayToOrder} sub={livePayload ? 'TI flag' : 'pending fetch'} />
+        <SummaryCard label="Baskets covered" value={basketsCovered} sub={`of ${catalog?.baskets?.length ?? '—'}`} />
+      </div>
+
+      {/* Operator fetch control — secret never touches the bundle */}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+        <div style={{ fontSize: '0.7rem', color: '#7a96b8' }}>
+          {livePayload
+            ? <span>Live data fetched <span style={{ color: '#c4d4e8' }}>{generatedAt}</span>{livePayload.summary?.failedFetches > 0 ? <span style={{ color: '#f0a84e' }}> · {livePayload.summary.failedFetches} failed</span> : null}</span>
+            : 'Operator: enter X-Capture-Secret to populate live Product Information API fields.'}
+        </div>
+        <input
+          type={showSecret ? 'text' : 'password'}
+          value={secret}
+          onChange={e => setSecret(e.target.value)}
+          placeholder="X-Capture-Secret"
+          autoComplete="off"
+          style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
+        />
+        <button
+          type="button"
+          onClick={() => setShowSecret(s => !s)}
+          style={{ background: 'transparent', border: '1px solid #1a2740', color: '#7a96b8', padding: '5px 8px', fontSize: '0.66rem', borderRadius: 3, cursor: 'pointer' }}
+        >
+          {showSecret ? 'hide' : 'show'}
+        </button>
+        <button
+          type="button"
+          onClick={fetchLive}
+          disabled={busy || !secret.trim()}
+          style={{ background: busy ? '#1a2740' : '#0f2540', border: '1px solid #2c4a70', color: '#e0eaf8', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() ? 'not-allowed' : 'pointer' }}
+        >
+          {busy ? 'Fetching…' : livePayload ? 'Refresh live data' : 'Fetch live data'}
+        </button>
+        {error && <span style={{ fontSize: '0.7rem', color: '#f05c5c' }}>{error}</span>}
+      </div>
+
+      {/* Table */}
+      {rows.length === 0 ? (
+        <div style={{ fontSize: '0.74rem', color: '#7a96b8' }}>Loading watched-parts catalog…</div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ borderCollapse: 'collapse', minWidth: 1100, width: '100%' }}>
+            <thead>
+              <tr>
+                <th style={cellTH}>Basket</th>
+                <th style={cellTH}>Generic Part</th>
+                <th style={cellTH}>Orderable Part</th>
+                <th style={cellTH}>Description</th>
+                <th style={cellTH}>Lifecycle</th>
+                <th style={cellTH}>Package</th>
+                <th style={cellTH}>Lead Time</th>
+                <th style={cellTH}>Inventory Status</th>
+                <th style={cellTH}>Okay to Order</th>
+                <th style={cellTH}>Source</th>
+                <th style={cellTH}>Last Fetched</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(({ catalog: c, live }) => {
+                const desc = live?.description || '—';
+                const lc = live?.lifecycleStatus || '—';
+                const pkg = live?.package || '—';
+                const lead = (live && typeof live.leadTimeWeeks === 'number') ? `${live.leadTimeWeeks} wk` : '—';
+                const inv = live?.inventoryStatus || '—';
+                const ok = live?.okayToOrder == null ? '—' : (live.okayToOrder ? 'yes' : 'no');
+                const source = live?.source || (live ? '—' : '');
+                const fetched = live?.fetchedAt
+                  ? new Date(live.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+                  : '—';
+                const basketLabel = catalog?.baskets?.find(b => b.basket === c.basket)?.basketLabel || c.basket;
+                return (
+                  <tr key={c.genericPartNumber}>
+                    <td style={{ ...cellTD, color: '#a0b8d0' }} title={c.thesisReason}>{basketLabel}</td>
+                    <td style={cellMono}>{c.genericPartNumber}</td>
+                    <td style={cellMono}>{c.preferredOrderablePartNumber}</td>
+                    <td style={{ ...cellTD, maxWidth: 280 }}>{desc}</td>
+                    <td style={{ ...cellMono, color: lifecycleColor(live?.lifecycleStatus) }}>{lc}</td>
+                    <td style={cellMono}>{pkg}</td>
+                    <td style={cellMono}>{lead}</td>
+                    <td style={cellMono}>{inv}</td>
+                    <td style={{ ...cellMono, color: okayColor(live?.okayToOrder) }}>{ok}</td>
+                    <td style={{ ...cellTD, color: '#7a96b8', fontSize: '0.62rem' }}>{source ? 'TI Product Info API' : '—'}</td>
+                    <td style={{ ...cellMono, color: '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12, fontSize: '0.62rem', color: '#7a96b8', fontStyle: 'italic' }}>
+        Inventory and pricing depth — including price breaks and forecasted availability — are part of the TI Store API suite, which is currently pending TI approval. Once approved, those fields will populate alongside the metadata above.
+      </div>
+    </div>
+  );
+}
+
 // ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
 // Shows only what answers the customer's question: are prices moving, by how
 // much, where, and any outliers. Hides empty sections. No operator chrome.
@@ -669,19 +892,26 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
   const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 10 };
 
-  // Loading / no live data — keep it short and human.
+  // Loading / no live data — keep it short and human, but still surface the
+  // TI watched-parts universe (which doesn't depend on Mouser live signal).
   if (sig.state === 'waiting') {
     return (
-      <div style={sectionWrap}>
-        <div style={{ fontSize: '0.8rem', color: '#7a96b8' }}>Loading live prices…</div>
-      </div>
+      <>
+        <div style={sectionWrap}>
+          <div style={{ fontSize: '0.8rem', color: '#7a96b8' }}>Loading live prices…</div>
+        </div>
+        <TiWatchedPartsUniverse />
+      </>
     );
   }
   if (sig.state === 'no-live') {
     return (
-      <div style={sectionWrap}>
-        <div style={{ fontSize: '0.8rem', color: '#f0a84e' }}>Live prices unavailable. Try Refresh on the Prices tab.</div>
-      </div>
+      <>
+        <div style={sectionWrap}>
+          <div style={{ fontSize: '0.8rem', color: '#f0a84e' }}>Live prices unavailable. Try Refresh on the Prices tab.</div>
+        </div>
+        <TiWatchedPartsUniverse />
+      </>
     );
   }
 
@@ -848,6 +1078,13 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
           </div>
         );
       })()}
+
+      {/* ── TI Watched Parts Universe (Phase 20B) ── */}
+      {/* Always rendered — the static catalog is useful even before live
+          Product Information API fetches happen. The live data block only
+          populates after a successful X-Capture-Secret round trip. */}
+      <TiWatchedPartsUniverse />
+
 
       {/* ── Source agreement table — only when both sources have data today ── */}
       {showSourceTable && <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>}

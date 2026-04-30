@@ -65,6 +65,11 @@ import {
   tokenCacheSnapshot as tiTokenCacheSnapshot,
   tiAttemptedEndpoints,
 } from './sources/tiDirect'
+import {
+  fetchWatchedPartsProductInfo,
+  TI_WATCHED_PARTS,
+  summarizeWatchedBaskets,
+} from './sources/tiWatchedParts'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -1773,6 +1778,55 @@ app.get('/api/ti/product-info-debug', async (c) => {
   }
   const report = await fetchTiProductInfoDebug(env, partNumber)
   return c.json({ success: report.basic.success || report.extended.success, ...report })
+})
+
+// GET /api/ti/watched-parts/product-info — auth-gated (Phase 20B).
+// Iterates the TI watched-parts universe (webapp/src/sources/tiWatchedParts.ts),
+// calling the Product Information API for each part and returning a normalized
+// dashboard-ready bundle. Does NOT call the Store API — that suite remains
+// pending approval and disabled. Token, secrets, and raw TI bodies never
+// reach the response.
+app.get('/api/ti/watched-parts/product-info', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const bundle = await fetchWatchedPartsProductInfo(env)
+  return c.json({
+    success: bundle.configured && bundle.parts.length > 0,
+    storeApiState: 'pending_approval',
+    storeApiNote: 'TI Store API approval pending — inventory and pricing signals are intentionally not fetched.',
+    ...bundle,
+  })
+})
+
+// GET /api/ti/watched-parts/catalog — public, secret-free metadata about the
+// watched-parts universe. Useful for the UI to show basket counts before any
+// authenticated fetch. NEVER returns TI data — only the static config.
+app.get('/api/ti/watched-parts/catalog', (c) => {
+  return c.json({
+    totalParts: TI_WATCHED_PARTS.length,
+    baskets: summarizeWatchedBaskets(),
+    parts: TI_WATCHED_PARTS.map(p => ({
+      genericPartNumber: p.genericPartNumber,
+      preferredOrderablePartNumber: p.preferredOrderablePartNumber,
+      displayName: p.displayName,
+      basket: p.basket,
+      dashboardPriority: p.dashboardPriority,
+      thesisReason: p.thesisReason,
+      demandProxyType: p.demandProxyType,
+    })),
+  })
 })
 
 // GET /api/ti/inventory-pricing?partNumber=XYZ — auth-gated.
