@@ -277,7 +277,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
   },
   {
     genericPartNumber: 'DRV8323',
-    preferredOrderablePartNumber: 'DRV8323RSRTAR',
+    preferredOrderablePartNumber: 'DRV8323HRTAR',
     displayName: 'DRV8323 BLDC Gate Driver',
     basket: 'industrial',
     dashboardPriority: 'high',
@@ -333,7 +333,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
   },
   {
     genericPartNumber: 'LMG3522R030',
-    preferredOrderablePartNumber: 'LMG3522R030RQZR',
+    preferredOrderablePartNumber: 'LMG3522R030RQSR',
     displayName: 'LMG3522R030 GaN Power Stage',
     basket: 'data_center_server_power',
     dashboardPriority: 'medium',
@@ -371,7 +371,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
   },
   {
     genericPartNumber: 'LMK04832',
-    preferredOrderablePartNumber: 'LMK04832BRTQT',
+    preferredOrderablePartNumber: 'LMK04832NKDT',
     displayName: 'LMK04832 Clock Jitter Cleaner',
     basket: 'wireless_infra_rf',
     dashboardPriority: 'medium',
