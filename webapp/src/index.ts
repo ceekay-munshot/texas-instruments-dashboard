@@ -2369,10 +2369,9 @@ app.get('/api/ti/inventory/signals/latest', async (c) => {
   }
   decorated.sort((a, b) => (order[a.signalType] ?? 9) - (order[b.signalType] ?? 9) || a.partNumber.localeCompare(b.partNumber))
   // Summary using same shape as /api/ti/inventory/signals so the UI can
-  // share render code.
-  const summary = summarizeSignals(
-    decorated.map(d => ({ signalType: d.signalType } as any)),
-  )
+  // share render code. Phase 21A.3 — pass the full row shape so the
+  // summary can compute priceUnavailableCount + inventoryOnlySignalCount.
+  const summary = summarizeSignals(decorated)
   const backend: 'd1' | 'kv' | 'none' = env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'
   return c.json({
     success: true,

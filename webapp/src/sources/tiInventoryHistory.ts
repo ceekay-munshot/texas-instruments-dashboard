@@ -650,7 +650,14 @@ export function computeInventoryPriceSignal(rows: HistoryRow[]): InventorySignal
 
   let signalType: InventorySignalType = 'normal'
   let signalStrength: InventorySignalStrength = 'low'
-  let explanation = 'Inventory and pricing within typical bounds.'
+  // Phase 21A.3 — when pricing wasn't returned by the TI Store API, the
+  // default "Inventory and pricing within typical bounds" line implied we
+  // analysed pricing and found it unremarkable. Be explicit instead.
+  let explanation = priceMissing
+    ? (inv7 == null || Math.abs(inv7) < 1
+        ? 'Inventory unchanged; pricing unavailable from current TI Store API response.'
+        : 'Inventory signal only — pricing unavailable from current TI Store API response.')
+    : 'Inventory and pricing within typical bounds.'
   let confidence = 0.3
 
   if (inv7 != null && inv7 <= -25 && price7 != null && price7 >= 5) {
@@ -663,7 +670,7 @@ export function computeInventoryPriceSignal(rows: HistoryRow[]): InventorySignal
     signalType = 'inventory_tightening'
     signalStrength = inv7 <= -50 ? 'medium' : 'low'
     explanation = priceMissing
-      ? `Inventory ${inv7.toFixed(1)}% over 7d; price unavailable so shortage status is provisional.`
+      ? `Inventory ${inv7.toFixed(1)}% over 7d; pricing unavailable from current TI Store API response.`
       : `Inventory ${inv7.toFixed(1)}% over 7d with price flat — tightening but no clear price pressure yet.`
     confidence = priceMissing ? 0.4 : 0.55
   } else if (inv7 != null && inv7 >= 50 && price7 != null && price7 <= -5) {
@@ -675,7 +682,7 @@ export function computeInventoryPriceSignal(rows: HistoryRow[]): InventorySignal
     signalType = 'supply_easing'
     signalStrength = inv7 >= 100 ? 'medium' : 'low'
     explanation = priceMissing
-      ? `Inventory ${inv7.toFixed(1)}% over 7d; price unavailable so easing status is provisional.`
+      ? `Inventory ${inv7.toFixed(1)}% over 7d; pricing unavailable from current TI Store API response.`
       : `Inventory ${inv7.toFixed(1)}% over 7d with price flat — supply easing.`
     confidence = priceMissing ? 0.4 : 0.55
   } else if (price7 != null && price7 >= 5 && (inv7 == null || inv7 >= 0)) {
@@ -732,7 +739,16 @@ export function computeWatchedSignals(history: Map<string, HistoryRow[]>): Inven
   })
 }
 
-export function summarizeSignals(signals: InventorySignal[]): {
+// Phase 21A.3 — accept either the in-memory InventorySignal shape or the
+// persisted/public shape (which carries latestNormalizedUnitPrice). Two new
+// counts surface how much of the universe is reasoning on inventory only.
+export type SummarizableSignal = {
+  signalType: InventorySignalType | string
+  latestNormalizedUnitPrice?: number | null
+  pricePctDelta?: number | null
+}
+
+export function summarizeSignals(signals: SummarizableSignal[]): {
   total: number
   shortagePressure: number
   oversupplyPressure: number
@@ -741,6 +757,8 @@ export function summarizeSignals(signals: InventorySignal[]): {
   priceOnlyPressure: number
   normal: number
   insufficientHistory: number
+  priceUnavailableCount: number
+  inventoryOnlySignalCount: number
 } {
   const counts = {
     total: signals.length,
@@ -751,7 +769,10 @@ export function summarizeSignals(signals: InventorySignal[]): {
     priceOnlyPressure: 0,
     normal: 0,
     insufficientHistory: 0,
+    priceUnavailableCount: 0,
+    inventoryOnlySignalCount: 0,
   }
+  const inventoryOnlyTypes = new Set(['inventory_tightening', 'supply_easing'])
   for (const s of signals) {
     switch (s.signalType) {
       case 'shortage_pressure': counts.shortagePressure += 1; break
@@ -761,6 +782,12 @@ export function summarizeSignals(signals: InventorySignal[]): {
       case 'price_only_pressure': counts.priceOnlyPressure += 1; break
       case 'normal': counts.normal += 1; break
       default: counts.insufficientHistory += 1; break
+    }
+    const priceUnavailable =
+      (s.latestNormalizedUnitPrice == null) && (s.pricePctDelta == null)
+    if (priceUnavailable) counts.priceUnavailableCount += 1
+    if (priceUnavailable && inventoryOnlyTypes.has(String(s.signalType))) {
+      counts.inventoryOnlySignalCount += 1
     }
   }
   return counts
@@ -805,6 +832,15 @@ function signalRowFromCompute(
   const latest = rows[rows.length - 1] ?? null
   const previous = rows.length >= 2 ? rows[rows.length - 2] : null
   const id = `${s.orderablePartNumber}:${s.asOf}`
+  // Phase 21A.3 — persisted deltas are "latest vs immediately-previous
+  // capture", which is what the dashboard surfaces and what Task 4 spells
+  // out. Previously we used the rolling 1d/7d window deltas, which were
+  // null whenever no row existed at the exact lookback point — making
+  // unchanged inventory look like missing data instead of a real zero.
+  const latestQty = latest?.quantityAvailable ?? null
+  const previousQty = previous?.quantityAvailable ?? null
+  const latestPrice = latest?.normalizedUnitPrice ?? null
+  const previousPrice = previous?.normalizedUnitPrice ?? null
   return {
     id,
     orderablePartNumber: s.orderablePartNumber,
@@ -812,14 +848,14 @@ function signalRowFromCompute(
     basket: s.basket ?? hint.basket ?? null,
     displayName: hint.displayName ?? latest?.displayName ?? null,
     asOf: s.asOf,
-    latestQuantityAvailable: latest?.quantityAvailable ?? null,
-    previousQuantityAvailable: previous?.quantityAvailable ?? null,
-    inventoryDelta: s.inventoryDelta1d ?? s.inventoryDelta7d ?? null,
-    inventoryPctDelta: s.inventoryPctDelta1d ?? s.inventoryPctDelta7d ?? null,
-    latestNormalizedUnitPrice: latest?.normalizedUnitPrice ?? null,
-    previousNormalizedUnitPrice: previous?.normalizedUnitPrice ?? null,
-    priceDelta: s.priceDelta1d ?? s.priceDelta7d ?? null,
-    pricePctDelta: s.pricePctDelta1d ?? s.pricePctDelta7d ?? null,
+    latestQuantityAvailable: latestQty,
+    previousQuantityAvailable: previousQty,
+    inventoryDelta: absDelta(latestQty, previousQty),
+    inventoryPctDelta: pctDelta(latestQty, previousQty),
+    latestNormalizedUnitPrice: latestPrice,
+    previousNormalizedUnitPrice: previousPrice,
+    priceDelta: absDelta(latestPrice, previousPrice),
+    pricePctDelta: pctDelta(latestPrice, previousPrice),
     observationsCount: s.observationCount,
     signalType: s.signalType,
     signalStrength: s.signalStrength,
