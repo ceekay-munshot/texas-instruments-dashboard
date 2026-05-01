@@ -1,8 +1,8 @@
 name: TI Watched-Parts Inventory Capture
 
-# Daily scheduled capture of the TI watched-parts universe via the existing
-# /api/ti/inventory/capture endpoint. Phase 21K — see ti-snapshot-capture.yml
-# for the prior pattern this mirrors.
+# Phase 21B — daily scheduled capture of the TI watched-parts universe via
+# the existing /api/ti/inventory/capture endpoint, with strict per-batch and
+# post-capture validation. Inherits the four-batch pattern from Phase 21K.
 #
 # Why GitHub Actions and not a wrangler.jsonc cron trigger:
 #   Cloudflare Pages projects ignore `triggers.crons` in wrangler.jsonc (it's
@@ -17,10 +17,14 @@ name: TI Watched-Parts Inventory Capture
 #   POST /api/ti/inventory/capture?offset=8&limit=8
 #   POST /api/ti/inventory/capture?offset=16&limit=8
 #   POST /api/ti/inventory/capture?offset=24&limit=8
+#   GET  /api/ti/inventory/latest                  — sanity
+#   GET  /api/ti/inventory/history/summary         — D1 depth + signal counts
+#   GET  /api/ti/inventory/signals/latest          — persisted signals
 #
 # Each POST captures one batch and merges into the persisted snapshot. The
-# server appends one history row per part to D1 on every batch. NEVER calls
-# /capture-all and NEVER calls /v2/store/products/catalog.
+# server appends one history row per part to D1 on every batch and recomputes
+# the persisted signal table. NEVER calls /capture-all and NEVER calls
+# /v2/store/products/catalog.
 #
 # Required GitHub Actions secret:
 #   SNAPSHOT_CAPTURE_SECRET — same secret used by ti-snapshot-capture.yml.
@@ -37,6 +41,12 @@ permissions:
 concurrency:
   group: ti-inventory-capture
   cancel-in-progress: false
+
+env:
+  BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+  EXPECTED_TOTAL_PARTS: '32'
+  EXPECTED_BASKETS: '7'
+  EXPECTED_BATCH_SIZE: '8'
 
 jobs:
   capture:
@@ -57,20 +67,30 @@ jobs:
           fi
           echo "Secret is configured (value not printed)."
 
-      - name: Run four watched-parts batches sequentially
+      - name: Snapshot pre-capture latestCapturedAt
+        id: pre
+        run: |
+          set -uo pipefail
+          before_at=$(curl -sS "${BASE_URL}/api/ti/inventory/history/summary" | jq -r '.latestCapturedAt // ""')
+          echo "Pre-capture latestCapturedAt: ${before_at}"
+          echo "before_at=${before_at}" >> "$GITHUB_OUTPUT"
+
+      - name: Run four watched-parts batches sequentially with strict validation
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
-          BASE_URL: https://texas-instruments-dashboard-final.pages.dev
         run: |
           set -uo pipefail
 
           OVERALL_FAILED=0
           TOTAL_CAPTURED=0
           TOTAL_FAILED=0
+          TOTAL_STALE=0
+          TOTAL_ROWS_INSERTED=0
+          TOTAL_SIGNALS_PERSISTED=0
 
           for OFF in 0 8 16 24; do
             response_file="$(mktemp)"
-            url="${BASE_URL}/api/ti/inventory/capture?offset=${OFF}&limit=8"
+            url="${BASE_URL}/api/ti/inventory/capture?offset=${OFF}&limit=${EXPECTED_BATCH_SIZE}"
 
             echo "POST ${url}"
 
@@ -85,65 +105,255 @@ jobs:
               echo "::error::Batch offset=${OFF} returned non-JSON (HTTP ${http_status})."
               head -c 500 "$response_file" || true
               OVERALL_FAILED=1
+              sleep 3
               continue
             fi
 
-            # Print only safe fields. Never echo the secret or any TI bodies.
+            # Print only safe, sanitized fields. Never echo the secret or any TI bodies.
             jq -c '{
               success, status, message,
               offset, limit, attemptedThisBatch, capturedThisBatch,
               failedThisBatch, staleThisBatch, nextOffset, done,
               capturedAt,
-              summary: (.summary // {}),
-              "diagnostics.history": (.diagnostics.history // null)
+              "diagnostics.history": (.diagnostics.history // null),
+              "diagnostics.signals": (.diagnostics.signals // null)
             }' < "$response_file"
 
             success=$(jq -r '.success // empty' < "$response_file")
-            captured_this=$(jq -r '.capturedThisBatch // 0' < "$response_file")
-            failed_this=$(jq -r '.failedThisBatch // 0' < "$response_file")
             status=$(jq -r '.status // empty' < "$response_file")
+            attempted=$(jq -r '.attemptedThisBatch // 0' < "$response_file")
+            captured=$(jq -r '.capturedThisBatch // 0' < "$response_file")
+            failed=$(jq -r '.failedThisBatch // 0' < "$response_file")
+            stale=$(jq -r '.staleThisBatch // 0' < "$response_file")
+            history_errors=$(jq -r '(.diagnostics.history.errors // []) | length' < "$response_file")
+            signals_persisted=$(jq -r '.diagnostics.signals.persisted // 0' < "$response_file")
+            signals_errors=$(jq -r '(.diagnostics.signals.errors // []) | length' < "$response_file")
+            rows_appended=$(jq -r '.diagnostics.history.rowsAppended // 0' < "$response_file")
+            history_backend=$(jq -r '.diagnostics.history.backend // empty' < "$response_file")
 
-            TOTAL_CAPTURED=$((TOTAL_CAPTURED + captured_this))
-            TOTAL_FAILED=$((TOTAL_FAILED + failed_this))
+            TOTAL_CAPTURED=$((TOTAL_CAPTURED + captured))
+            TOTAL_FAILED=$((TOTAL_FAILED + failed))
+            TOTAL_STALE=$((TOTAL_STALE + stale))
+            TOTAL_ROWS_INSERTED=$((TOTAL_ROWS_INSERTED + rows_appended))
+            TOTAL_SIGNALS_PERSISTED=$((TOTAL_SIGNALS_PERSISTED + signals_persisted))
+
+            # Phase 21B Task 4 — strict per-batch validation. Any one failure
+            # aborts the workflow run.
+            BATCH_FAILED=0
 
             if [ "${success}" != "true" ]; then
               case "${status}" in
                 unauthorized)
                   echo "::error::Batch offset=${OFF} refused (unauthorized) — verify SNAPSHOT_CAPTURE_SECRET."
-                  OVERALL_FAILED=1
                   ;;
                 snapshot_storage_not_configured)
                   echo "::error::SOURCE_SNAPSHOTS_KV namespace is not bound on the Cloudflare Pages project."
-                  OVERALL_FAILED=1
                   ;;
                 capture_secret_not_configured)
                   echo "::error::SNAPSHOT_CAPTURE_SECRET is not set on the Cloudflare Pages project."
-                  OVERALL_FAILED=1
                   ;;
                 *)
-                  echo "::warning::Batch offset=${OFF} returned success=${success} status=${status} http=${http_status}"
-                  OVERALL_FAILED=1
+                  echo "::error::Batch offset=${OFF} success=${success} status=${status} http=${http_status}"
                   ;;
               esac
+              BATCH_FAILED=1
+            fi
+
+            if [ "${attempted}" != "${EXPECTED_BATCH_SIZE}" ]; then
+              echo "::error::Batch offset=${OFF} attemptedThisBatch=${attempted} (expected ${EXPECTED_BATCH_SIZE})."
+              BATCH_FAILED=1
+            fi
+            if [ "${captured}" != "${EXPECTED_BATCH_SIZE}" ]; then
+              echo "::error::Batch offset=${OFF} capturedThisBatch=${captured} (expected ${EXPECTED_BATCH_SIZE})."
+              BATCH_FAILED=1
+            fi
+            if [ "${failed}" != "0" ]; then
+              echo "::error::Batch offset=${OFF} failedThisBatch=${failed} (expected 0)."
+              BATCH_FAILED=1
+            fi
+            if [ "${stale}" != "0" ]; then
+              echo "::error::Batch offset=${OFF} staleThisBatch=${stale} (expected 0)."
+              BATCH_FAILED=1
+            fi
+            if [ "${history_errors}" != "0" ]; then
+              echo "::error::Batch offset=${OFF} diagnostics.history.errors length=${history_errors} (expected 0)."
+              jq -c '.diagnostics.history.errors // []' < "$response_file"
+              BATCH_FAILED=1
+            fi
+            if [ "${signals_errors}" != "0" ]; then
+              echo "::error::Batch offset=${OFF} diagnostics.signals.errors length=${signals_errors} (expected 0)."
+              jq -c '.diagnostics.signals.errors // []' < "$response_file"
+              BATCH_FAILED=1
+            fi
+            if [ "${signals_persisted}" != "${EXPECTED_BATCH_SIZE}" ]; then
+              echo "::error::Batch offset=${OFF} diagnostics.signals.persisted=${signals_persisted} (expected ${EXPECTED_BATCH_SIZE})."
+              BATCH_FAILED=1
+            fi
+            if [ -n "${history_backend}" ] && [ "${history_backend}" != "d1" ]; then
+              echo "::error::Batch offset=${OFF} diagnostics.history.backend=${history_backend} (expected d1)."
+              BATCH_FAILED=1
+            fi
+
+            if [ "${BATCH_FAILED}" = "1" ]; then
+              OVERALL_FAILED=1
             fi
 
             # Light pacing between batches; mirrors the operator UI loop.
             sleep 3
           done
 
-          echo "Total captured across batches: ${TOTAL_CAPTURED}"
-          echo "Total failed   across batches: ${TOTAL_FAILED}"
+          echo "─── Batch totals ───"
+          echo "  captured:           ${TOTAL_CAPTURED} (expected $((4 * EXPECTED_BATCH_SIZE)))"
+          echo "  failed:             ${TOTAL_FAILED}"
+          echo "  stale:              ${TOTAL_STALE}"
+          echo "  rowsInserted:       ${TOTAL_ROWS_INSERTED}"
+          echo "  signalsPersisted:   ${TOTAL_SIGNALS_PERSISTED}"
+
+          # Persist totals for the verify step to read.
+          {
+            echo "TOTAL_CAPTURED=${TOTAL_CAPTURED}"
+            echo "TOTAL_FAILED=${TOTAL_FAILED}"
+            echo "TOTAL_STALE=${TOTAL_STALE}"
+            echo "TOTAL_ROWS_INSERTED=${TOTAL_ROWS_INSERTED}"
+            echo "TOTAL_SIGNALS_PERSISTED=${TOTAL_SIGNALS_PERSISTED}"
+          } >> "$GITHUB_ENV"
 
           if [ "${OVERALL_FAILED}" = "1" ]; then
             exit 1
           fi
 
-      - name: Verify post-capture state
-        env:
-          BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+      - name: Verify /api/ti/inventory/latest (Task 5)
         run: |
           set -uo pipefail
-          curl -sS "${BASE_URL}/api/ti/inventory/latest" \
-            | jq -c '{status, capturedAt, summary}'
+          tmp="$(mktemp)"
+          curl -sS "${BASE_URL}/api/ti/inventory/latest" -o "$tmp"
+          if ! jq -e . < "$tmp" > /dev/null 2>&1; then
+            echo "::error::/api/ti/inventory/latest returned non-JSON."
+            head -c 500 "$tmp" || true
+            exit 1
+          fi
+          jq -c '{
+            success, status, capturedAt,
+            "len(parts)": (.parts // [] | length),
+            summary: (.summary // {})
+          }' < "$tmp"
+
+          parts_len=$(jq -r '(.parts // []) | length' < "$tmp")
+          total_parts=$(jq -r '.summary.totalParts // 0' < "$tmp")
+          captured_parts=$(jq -r '.summary.capturedParts // 0' < "$tmp")
+          failed_parts=$(jq -r '.summary.failedParts // 0' < "$tmp")
+          stale_parts=$(jq -r '.summary.staleParts // 0' < "$tmp")
+
+          FAIL=0
+          if [ "${total_parts}" != "${EXPECTED_TOTAL_PARTS}" ]; then
+            echo "::error::/inventory/latest summary.totalParts=${total_parts} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ "${captured_parts}" != "${EXPECTED_TOTAL_PARTS}" ]; then
+            echo "::error::/inventory/latest summary.capturedParts=${captured_parts} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ "${failed_parts}" != "0" ]; then
+            echo "::error::/inventory/latest summary.failedParts=${failed_parts} (expected 0)."; FAIL=1
+          fi
+          if [ "${stale_parts}" != "0" ]; then
+            echo "::error::/inventory/latest summary.staleParts=${stale_parts} (expected 0)."; FAIL=1
+          fi
+          if [ "${parts_len}" != "${EXPECTED_TOTAL_PARTS}" ]; then
+            echo "::error::/inventory/latest len(parts)=${parts_len} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          fi
+
+          [ "${FAIL}" = "0" ]
+
+      - name: Verify /api/ti/inventory/history/summary (Task 6)
+        env:
+          BEFORE_AT: ${{ steps.pre.outputs.before_at }}
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp)"
+          curl -sS "${BASE_URL}/api/ti/inventory/history/summary" -o "$tmp"
+          if ! jq -e . < "$tmp" > /dev/null 2>&1; then
+            echo "::error::/history/summary returned non-JSON."
+            head -c 500 "$tmp" || true
+            exit 1
+          fi
+          jq -c '{
+            success, backend,
+            totalTrackedParts, partsWithHistory, totalSnapshots, latestCapturedAt,
+            partsWith2PlusObservations, partsWith3PlusObservations,
+            shortagePressureCount, oversupplyPressureCount,
+            inventoryTighteningCount, supplyEasingCount,
+            priceOnlyPressureCount, normalCount, insufficientHistoryCount
+          }' < "$tmp"
+
+          backend=$(jq -r '.backend // empty' < "$tmp")
+          parts_with_history=$(jq -r '.partsWithHistory // 0' < "$tmp")
+          latest_at=$(jq -r '.latestCapturedAt // ""' < "$tmp")
+
+          FAIL=0
+          if [ "${backend}" != "d1" ]; then
+            echo "::error::/history/summary backend=${backend} (expected d1)."; FAIL=1
+          fi
+          if [ "${parts_with_history}" != "${EXPECTED_TOTAL_PARTS}" ]; then
+            echo "::error::/history/summary partsWithHistory=${parts_with_history} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ -n "${BEFORE_AT}" ] && [ "${latest_at}" = "${BEFORE_AT}" ]; then
+            echo "::error::/history/summary latestCapturedAt did not advance (still ${latest_at} after capture)."; FAIL=1
+          fi
+          echo "  pre  latestCapturedAt: ${BEFORE_AT}"
+          echo "  post latestCapturedAt: ${latest_at}"
+
+          [ "${FAIL}" = "0" ]
+
+      - name: Verify /api/ti/inventory/signals/latest (Task 7)
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp)"
+          curl -sS "${BASE_URL}/api/ti/inventory/signals/latest" -o "$tmp"
+          if ! jq -e . < "$tmp" > /dev/null 2>&1; then
+            echo "::error::/signals/latest returned non-JSON."
+            head -c 500 "$tmp" || true
+            exit 1
+          fi
+          jq -c '{
+            success, backend,
+            summary: (.summary // {}),
+            "len(signals)": (.signals // [] | length)
+          }' < "$tmp"
+
+          backend=$(jq -r '.backend // empty' < "$tmp")
+          summary_total=$(jq -r '.summary.total // 0' < "$tmp")
+          rows_len=$(jq -r '(.signals // []) | length' < "$tmp")
+
+          FAIL=0
+          if [ "${backend}" != "d1" ]; then
+            echo "::error::/signals/latest backend=${backend} (expected d1)."; FAIL=1
+          fi
+          if [ "${summary_total}" != "${EXPECTED_TOTAL_PARTS}" ]; then
+            echo "::error::/signals/latest summary.total=${summary_total} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ "${rows_len}" -lt 1 ]; then
+            echo "::error::/signals/latest returned 0 signal rows."; FAIL=1
+          fi
+
+          # Defensive secret-shape scan. The endpoint should never return any
+          # of these strings; if it does, something on the server is leaking.
+          for needle in "TI_CLIENT_SECRET" "TI_CLIENT_ID" "Bearer " "access_token" "SNAPSHOT_CAPTURE_SECRET" "X-Capture-Secret" "transact.ti.com"; do
+            if grep -F "${needle}" < "$tmp" > /dev/null; then
+              echo "::error::/signals/latest payload contains forbidden token '${needle}'."; FAIL=1
+            fi
+          done
+
+          [ "${FAIL}" = "0" ]
+
+      - name: Print schedule/status summary
+        run: |
+          set -uo pipefail
           curl -sS "${BASE_URL}/api/ti/inventory/schedule/status" \
-            | jq -c '{success, lastScheduledCaptureAt, lastScheduledCaptureStatus, cumulativeRowsInserted, backend, offsetsCovered}'
+            | jq -c '{
+                success, backend,
+                cumulativeRowsInserted,
+                lastCaptureAt,
+                lastExternalCaptureAt,
+                lastExternalCaptureStatus,
+                lastExternalCaptureSource,
+                lastExternalRunBySource: (.lastExternalRunBySource // {})
+              }'

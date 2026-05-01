@@ -1997,6 +1997,7 @@ app.post('/api/ti/inventory/capture', async (c) => {
     stale: batch.staleThisBatch,
     rowsInsertedToHistory: history.rowsAppended,
     historyBackend: history.backend,
+    signalsPersisted: signalRecompute.persisted,
     status: batch.failedThisBatch === 0 ? 'ok' : 'partial',
   })
 
@@ -3134,6 +3135,11 @@ export type ExternalCaptureRunRecord = {
   stale: number
   rowsInsertedToHistory: number
   historyBackend: 'd1' | 'kv' | 'none'
+  /** Phase 21B — number of persisted signal rows rewritten by this batch.
+   *  Lets schedule/status surface signal-pipeline health alongside the
+   *  history-write counters. Older records (pre-21B) won't have this field;
+   *  consumers should treat null/undefined as "not reported". */
+  signalsPersisted?: number
   status: 'ok' | 'partial' | 'error'
 }
 

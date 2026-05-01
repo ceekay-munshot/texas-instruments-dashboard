@@ -1035,6 +1035,91 @@ curl -s "https://texas-instruments-dashboard-final.pages.dev/api/ti/inventory-pr
   -H "X-Capture-Secret: $SNAPSHOT_CAPTURE_SECRET" | python3 -m json.tool
 ```
 
+### TI watched-parts inventory capture (Phase 21B)
+
+The 32-part TI watched universe is captured once a day by GitHub Actions —
+[`.github/workflows/ti-inventory-capture.yml`](../.github/workflows/ti-inventory-capture.yml).
+The workflow runs four separate `POST /api/ti/inventory/capture?offset={0,8,16,24}&limit=8`
+requests against production, then verifies `/inventory/latest`,
+`/history/summary`, and `/signals/latest` before passing.
+
+**Schedule:** `15 7 * * *` (07:15 UTC daily). The workflow also has
+`workflow_dispatch` so an operator can trigger an ad-hoc run.
+
+**Required GitHub repo secret:** `SNAPSHOT_CAPTURE_SECRET` — must match the
+same-named env var on the Cloudflare Pages project. Add it under
+**Settings → Secrets and variables → Actions → New repository secret**. The
+workflow refuses to run if the secret is missing, and never echoes its value.
+
+**Manual trigger:**
+
+```bash
+# From a clone with the gh CLI authenticated:
+gh workflow run ti-inventory-capture.yml --ref main
+
+# Or in the browser:
+# Repo → Actions → "TI Watched-Parts Inventory Capture" → Run workflow
+```
+
+**Expected success output (per batch, ×4):** the workflow prints a one-line
+JSON for each `POST /capture`:
+
+```jsonc
+{
+  "success": true,
+  "status": "ok",
+  "offset": 0,
+  "limit": 8,
+  "attemptedThisBatch": 8,
+  "capturedThisBatch": 8,
+  "failedThisBatch": 0,
+  "staleThisBatch": 0,
+  "diagnostics.history": { "backend": "d1", "rowsAppended": 8, "errors": [] },
+  "diagnostics.signals": { "computed": 8, "persisted": 8, "errors": [] }
+}
+```
+
+…then a totals line:
+
+```
+─── Batch totals ───
+  captured:           32 (expected 32)
+  failed:             0
+  stale:              0
+  rowsInserted:       32
+  signalsPersisted:   32
+```
+
+…and three post-capture verify steps. The run is green only when every
+batch and every verify passes.
+
+**Failure modes (sorted by frequency):**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `unauthorized` on every batch | repo secret mismatch with Cloudflare Pages | sync `SNAPSHOT_CAPTURE_SECRET` in both places |
+| `staleThisBatch > 0` | TI Store API rate-limited or 5xx | re-run `workflow_dispatch`; if it persists, check TI status |
+| `diagnostics.history.errors` contains `d1:rich_insert_unsupported_falling_back_to_basic_until_migration_0002_applied` | one of the 9 extended snapshot columns is missing in production D1 | run `SELECT name FROM pragma_table_info('ti_inventory_price_snapshot');` in the D1 Console and `ALTER TABLE … ADD COLUMN …` for any missing column from migration `0002_signals_and_extended_snapshot.sql` |
+| `diagnostics.signals.errors` contains `D1_ERROR: no such table: ti_inventory_price_signal` | `ti_inventory_price_signal` table is not yet created in production D1 | run the `CREATE TABLE IF NOT EXISTS ti_inventory_price_signal …` block from migration `0002` in the D1 Console |
+| `latestCapturedAt did not advance` | response read from a stale D1 read replica before propagation | re-fetch `/history/summary` 30 seconds later; if it stays stale, re-run the workflow |
+| `Batch offset=… returned non-JSON` | Pages Function deploy in flight or 5xx | wait for the active deploy to finish, then re-run |
+
+**Hard restrictions (do not change in this phase):**
+
+- The workflow uses the four-batch path. Do **not** switch the production
+  path to `POST /api/ti/inventory/capture-all` — the batched path keeps
+  per-call payloads small, lets one bad batch fail without poisoning the
+  others, and matches the operator-UI loop.
+- The workflow never calls `POST /v2/store/products/catalog`. The TI
+  catalog universe expansion is out of scope for Phase 21B.
+- The 32-part watched universe is the only thing the workflow ever sweeps
+  through. Universe expansion is a separate phase.
+- The TI Product Info adapter and the TI Store Inventory adapter are
+  considered stable. Don't refactor them as part of this workflow change.
+- The workflow must never echo `SNAPSHOT_CAPTURE_SECRET` or any TI
+  Bearer / `transact.ti.com` URL. The verify step also does a defensive
+  `grep -F` over `/signals/latest` for forbidden tokens.
+
 ## Local Development
 ```bash
 npm install
