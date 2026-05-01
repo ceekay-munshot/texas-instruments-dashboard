@@ -3101,6 +3101,12 @@ const SCHEDULED_OFFSET_BY_CRON: Record<string, number> = {
 
 const SCHEDULED_BATCH_LIMIT = 8
 
+// Phase 21B.1 — number of distinct offsets that make up a complete daily
+// cycle (matches the four-batch GitHub Actions workflow). Used by the
+// schedule/status aggregator to decide when an external daily run is
+// "complete" (offsetsCovered === this value).
+const SCHEDULED_DAILY_OFFSET_COUNT = Object.keys(SCHEDULED_OFFSET_BY_CRON).length
+
 type ScheduledCaptureRunRecord = {
   cron: string
   scheduledAt: string
@@ -3143,16 +3149,54 @@ export type ExternalCaptureRunRecord = {
   status: 'ok' | 'partial' | 'error'
 }
 
+// Phase 21B.1 — aggregate of all batches in a single multi-batch external
+// daily run (e.g. the four offsets the GitHub Action POSTs sequentially).
+// Holds running totals plus a per-batch trail for debug visibility. A new
+// aggregate replaces the previous one for the same source whenever a batch
+// arrives with offset === 0 (the daily-run reset signal).
+export type ExternalDailyRunBatchSummary = {
+  offset: number
+  limit: number
+  finishedAt: string
+  attempted: number
+  captured: number
+  failed: number
+  stale: number
+  rowsInsertedToHistory: number
+  signalsPersisted: number
+  historyBackend: 'd1' | 'kv' | 'none'
+  status: 'ok' | 'partial' | 'error'
+}
+
+export type ExternalDailyRunAggregate = {
+  source: 'github_actions_daily' | 'operator_ui' | 'unknown_external'
+  startedAt: string
+  finishedAt: string
+  offsetsCovered: number
+  attempted: number
+  captured: number
+  failed: number
+  stale: number
+  rowsInsertedToHistory: number
+  signalsPersisted: number
+  historyBackend: 'd1' | 'kv' | 'none'
+  status: 'ok' | 'partial' | 'error' | 'in_progress'
+  batches: ExternalDailyRunBatchSummary[]
+}
+
 type ScheduledCaptureState = {
   lastRunByCron: Record<string, ScheduledCaptureRunRecord>
   lastRun: ScheduledCaptureRunRecord | null
   cumulativeRowsInserted: number
-  /** Phase 21K.2 — most recent external-runner capture (GitHub Actions or
-   *  operator UI). The `lastRun` field above stays scheduled-only so the
-   *  operator can distinguish in-Cloudflare cron from external sources. */
+  /** Phase 21K.2 — most recent external-runner batch (GitHub Actions or
+   *  operator UI). Kept for back-compat with pre-21B.1 readers; new code
+   *  should prefer the aggregate below. */
   lastExternalRun: ExternalCaptureRunRecord | null
-  /** Per-source most-recent records for finer-grained diagnostics. */
-  lastExternalRunBySource: Record<string, ExternalCaptureRunRecord>
+  /** Phase 21B.1 — per-source aggregate of the most recent multi-batch
+   *  daily run. Replaces the prior single-batch lastExternalRunBySource
+   *  semantic so the operator/customer view can see the full daily picture
+   *  (4 batches × 8 parts = 32 captured) instead of just the final batch. */
+  lastExternalRunBySource: Record<string, ExternalDailyRunAggregate>
 }
 
 async function readScheduledState(kv: SnapshotKV | undefined): Promise<ScheduledCaptureState> {
@@ -3175,12 +3219,62 @@ async function readScheduledState(kv: SnapshotKV | undefined): Promise<Scheduled
         cumulativeRowsInserted: typeof parsed.cumulativeRowsInserted === 'number' ? parsed.cumulativeRowsInserted : 0,
         lastExternalRun: parsed.lastExternalRun ?? null,
         lastExternalRunBySource: parsed.lastExternalRunBySource && typeof parsed.lastExternalRunBySource === 'object'
-          ? parsed.lastExternalRunBySource
+          // Phase 21B.1 — legacy entries here used to be a single
+          // ExternalCaptureRunRecord per source. Wrap any such legacy entry
+          // in a one-batch aggregate so the new readers don't see undefined
+          // batches[]/offsetsCovered fields. Real aggregates already match
+          // the new shape and pass through unchanged.
+          ? coerceLastExternalRunBySource(parsed.lastExternalRunBySource)
           : {},
       }
     }
   } catch { /* ignore */ }
   return empty
+}
+
+function coerceLastExternalRunBySource(
+  raw: Record<string, any>,
+): Record<string, ExternalDailyRunAggregate> {
+  const out: Record<string, ExternalDailyRunAggregate> = {}
+  for (const [source, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object') continue
+    if (Array.isArray(value.batches)) {
+      // Already an aggregate — accept verbatim.
+      out[source] = value as ExternalDailyRunAggregate
+    } else if (typeof value.offset === 'number' && typeof value.captured === 'number') {
+      // Legacy single-batch record. Wrap it as a 1-batch aggregate so
+      // pre-21B.1 KV state stays meaningful after the deploy.
+      const batch: ExternalDailyRunBatchSummary = {
+        offset: value.offset,
+        limit: value.limit ?? SCHEDULED_BATCH_LIMIT,
+        finishedAt: value.finishedAt ?? '',
+        attempted: value.attempted ?? 0,
+        captured: value.captured ?? 0,
+        failed: value.failed ?? 0,
+        stale: value.stale ?? 0,
+        rowsInsertedToHistory: value.rowsInsertedToHistory ?? 0,
+        signalsPersisted: typeof value.signalsPersisted === 'number' ? value.signalsPersisted : 0,
+        historyBackend: value.historyBackend ?? 'none',
+        status: value.status ?? 'ok',
+      }
+      out[source] = {
+        source: (value.source ?? source) as ExternalDailyRunAggregate['source'],
+        startedAt: batch.finishedAt,
+        finishedAt: batch.finishedAt,
+        offsetsCovered: 1,
+        attempted: batch.attempted,
+        captured: batch.captured,
+        failed: batch.failed,
+        stale: batch.stale,
+        rowsInsertedToHistory: batch.rowsInsertedToHistory,
+        signalsPersisted: batch.signalsPersisted,
+        historyBackend: batch.historyBackend,
+        status: batch.status === 'error' ? 'error' : (batch.status === 'partial' ? 'partial' : 'ok'),
+        batches: [batch],
+      }
+    }
+  }
+  return out
 }
 
 async function writeScheduledState(kv: SnapshotKV, state: ScheduledCaptureState): Promise<void> {
@@ -3192,6 +3286,13 @@ async function writeScheduledState(kv: SnapshotKV, state: ScheduledCaptureState)
 /** Phase 21K.2 — record a successful external capture (GitHub Actions / UI)
  *  into the same KV state the scheduled handler uses, so cumulativeRowsInserted
  *  reflects total D1 history inserts regardless of which path drove them.
+ *
+ *  Phase 21B.1 — also maintain a per-source multi-batch aggregate so
+ *  /schedule/status can show the full daily run (4 batches × 8 parts = 32
+ *  captured) instead of just the most recent batch. A new aggregate starts
+ *  when offset === 0 (the daily-run reset signal); subsequent batches in
+ *  the same cycle append to it.
+ *
  *  Best-effort: KV failures never break the capture response. */
 async function recordExternalCapture(
   env: Bindings,
@@ -3200,14 +3301,72 @@ async function recordExternalCapture(
   if (!env.SOURCE_SNAPSHOTS_KV) return
   try {
     const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
+    const aggregate = mergeBatchIntoAggregate(state.lastExternalRunBySource[record.source], record)
     const next: ScheduledCaptureState = {
       ...state,
       cumulativeRowsInserted: (state.cumulativeRowsInserted || 0) + (record.rowsInsertedToHistory || 0),
       lastExternalRun: record,
-      lastExternalRunBySource: { ...state.lastExternalRunBySource, [record.source]: record },
+      lastExternalRunBySource: { ...state.lastExternalRunBySource, [record.source]: aggregate },
     }
     await writeScheduledState(env.SOURCE_SNAPSHOTS_KV, next)
   } catch { /* swallow */ }
+}
+
+function mergeBatchIntoAggregate(
+  prior: ExternalDailyRunAggregate | undefined,
+  record: ExternalCaptureRunRecord,
+): ExternalDailyRunAggregate {
+  const batchSummary: ExternalDailyRunBatchSummary = {
+    offset: record.offset,
+    limit: record.limit,
+    finishedAt: record.finishedAt,
+    attempted: record.attempted,
+    captured: record.captured,
+    failed: record.failed,
+    stale: record.stale,
+    rowsInsertedToHistory: record.rowsInsertedToHistory,
+    signalsPersisted: record.signalsPersisted ?? 0,
+    historyBackend: record.historyBackend,
+    status: record.status,
+  }
+  // offset === 0 is the daily-run reset signal. Without a prior aggregate,
+  // also start fresh. Otherwise, append (replacing any prior entry for the
+  // same offset so a re-run of one batch doesn't double-count).
+  const isFreshCycle = !prior || record.offset === 0
+  const batches = isFreshCycle
+    ? [batchSummary]
+    : [...prior!.batches.filter(b => b.offset !== record.offset), batchSummary]
+  // Sort by offset so the operator sees the natural 0/8/16/24 order.
+  batches.sort((a, b) => a.offset - b.offset)
+
+  const sum = (key: keyof ExternalDailyRunBatchSummary) =>
+    batches.reduce((acc, b) => acc + (typeof b[key] === 'number' ? (b[key] as number) : 0), 0)
+  const distinctOffsets = new Set(batches.map(b => b.offset))
+  const startedAt = batches[0]?.finishedAt ?? batchSummary.finishedAt
+  const finishedAt = batches[batches.length - 1]?.finishedAt ?? batchSummary.finishedAt
+  const anyError = batches.some(b => b.status === 'error') || sum('failed') > 0
+  const anyStale = sum('stale') > 0
+  const status: ExternalDailyRunAggregate['status'] = anyError
+    ? 'error'
+    : anyStale
+      ? 'partial'
+      : (distinctOffsets.size >= SCHEDULED_DAILY_OFFSET_COUNT ? 'ok' : 'in_progress')
+
+  return {
+    source: record.source,
+    startedAt,
+    finishedAt,
+    offsetsCovered: distinctOffsets.size,
+    attempted: sum('attempted'),
+    captured: sum('captured'),
+    failed: sum('failed'),
+    stale: sum('stale'),
+    rowsInsertedToHistory: sum('rowsInsertedToHistory'),
+    signalsPersisted: sum('signalsPersisted'),
+    historyBackend: record.historyBackend,
+    status,
+    batches,
+  }
 }
 
 /** Phase 21K.2 — heuristic to label the caller of /api/ti/inventory/capture.
@@ -3298,11 +3457,14 @@ app.get('/api/ti/scheduled/status', async (c) => {
   const env = c.env
   const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
   const cronList = Object.keys(SCHEDULED_OFFSET_BY_CRON)
-  // Phase 21K.2 — pick the most recent across in-Cloudflare scheduled runs
-  // and external runs (GitHub Actions / operator UI). The cumulativeRows
-  // counter spans both paths.
+  // Phase 21B.1 — same aggregate-pick as the canonical endpoint so both
+  // mirrors agree on the daily-run summary fields.
+  const aggregates = Object.values(state.lastExternalRunBySource)
+  const latestAggregate = aggregates.length === 0
+    ? null
+    : aggregates.reduce((a, b) => (a.finishedAt > b.finishedAt ? a : b))
   const scheduledAt = state.lastRun?.finishedAt ?? null
-  const externalAt = state.lastExternalRun?.finishedAt ?? null
+  const externalAt = latestAggregate?.finishedAt ?? state.lastExternalRun?.finishedAt ?? null
   const lastAt = scheduledAt && externalAt
     ? (scheduledAt > externalAt ? scheduledAt : externalAt)
     : (scheduledAt ?? externalAt)
@@ -3310,15 +3472,22 @@ app.get('/api/ti/scheduled/status', async (c) => {
     ok: true,
     scheduledEnabled: true,
     backend: state.lastRun?.historyBackend
+      ?? latestAggregate?.historyBackend
       ?? state.lastExternalRun?.historyBackend
       ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
     cronsConfigured: cronList,
+    offsetsCovered: latestAggregate?.offsetsCovered ?? null,
+    capturedParts: latestAggregate?.captured ?? null,
+    failedParts: latestAggregate?.failed ?? null,
+    staleParts: latestAggregate?.stale ?? null,
+    rowsInsertedToHistory: latestAggregate?.rowsInsertedToHistory ?? null,
+    signalsPersisted: latestAggregate?.signalsPersisted ?? null,
     lastCaptureAt: lastAt,
     lastScheduledCaptureAt: scheduledAt,
     lastScheduledCaptureStatus: state.lastRun?.status ?? null,
     lastExternalCaptureAt: externalAt,
-    lastExternalCaptureStatus: state.lastExternalRun?.status ?? null,
-    lastExternalCaptureSource: state.lastExternalRun?.source ?? null,
+    lastExternalCaptureStatus: latestAggregate?.status ?? state.lastExternalRun?.status ?? null,
+    lastExternalCaptureSource: latestAggregate?.source ?? state.lastExternalRun?.source ?? null,
     cumulativeRowsInserted: state.cumulativeRowsInserted,
     note: 'Mirror of /api/ti/inventory/schedule/status. Cloudflare Pages cron is wired via .github/workflows/ti-inventory-capture.yml — wrangler.jsonc triggers.crons is Workers-only and is intentionally not set here. cumulativeRowsInserted counts D1 history inserts across all paths (scheduled handler + external runners).',
   })
@@ -3333,34 +3502,56 @@ app.get('/api/ti/inventory/schedule/status', async (c) => {
   const env = c.env
   const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
   const cronList = Object.keys(SCHEDULED_OFFSET_BY_CRON)
-  const offsetsCovered = cronList.filter(k => !!state.lastRunByCron[k]).length
   const lastRun = state.lastRun
   const lastByCron = cronList.map(cron => ({
     cron,
     offset: SCHEDULED_OFFSET_BY_CRON[cron],
     lastRun: state.lastRunByCron[cron] ?? null,
   }))
-  // Phase 21K.2 — surface external-runner records alongside the scheduled
-  // ones so cumulativeRowsInserted has a clear breakdown by source.
+  // Phase 21B.1 — pick the most recent external daily-run aggregate across
+  // all sources so the top-level fields describe the full daily cycle (4
+  // batches × 8 parts = 32 captured) rather than just the latest single
+  // batch. The per-source map below still exposes each source's aggregate
+  // with its batches[] trail for debug visibility.
+  const aggregates = Object.values(state.lastExternalRunBySource)
+  const latestAggregate = aggregates.length === 0
+    ? null
+    : aggregates.reduce(
+        (a, b) => (a.finishedAt > b.finishedAt ? a : b),
+      )
   const scheduledAt = lastRun?.finishedAt ?? null
-  const externalAt = state.lastExternalRun?.finishedAt ?? null
+  const externalAt = latestAggregate?.finishedAt ?? state.lastExternalRun?.finishedAt ?? null
   const overallAt = scheduledAt && externalAt
     ? (scheduledAt > externalAt ? scheduledAt : externalAt)
     : (scheduledAt ?? externalAt)
+  // offsetsCovered repurposed in Phase 21B.1: now reflects the most recent
+  // external daily run if we have one (matches the 4-batch GH Actions
+  // path), otherwise falls back to the legacy "scheduled crons that have
+  // fired" meaning. lastRunByCron below still exposes cron-only state.
+  const offsetsCovered = latestAggregate?.offsetsCovered
+    ?? cronList.filter(k => !!state.lastRunByCron[k]).length
   return c.json({
     success: true,
     cronSchedule: cronList,
     offsetsConfigured: cronList.length,
     offsetsCovered,
+    // Phase 21B.1 — daily-run aggregate fields (most recent external run).
+    // Null when no external runs have been recorded yet.
+    capturedParts: latestAggregate?.captured ?? null,
+    failedParts: latestAggregate?.failed ?? null,
+    staleParts: latestAggregate?.stale ?? null,
+    rowsInsertedToHistory: latestAggregate?.rowsInsertedToHistory ?? null,
+    signalsPersisted: latestAggregate?.signalsPersisted ?? null,
     lastCaptureAt: overallAt,
     lastScheduledCaptureAt: scheduledAt,
     lastScheduledCaptureStatus: lastRun?.status ?? null,
     lastExternalCaptureAt: externalAt,
-    lastExternalCaptureStatus: state.lastExternalRun?.status ?? null,
-    lastExternalCaptureSource: state.lastExternalRun?.source ?? null,
+    lastExternalCaptureStatus: latestAggregate?.status ?? state.lastExternalRun?.status ?? null,
+    lastExternalCaptureSource: latestAggregate?.source ?? state.lastExternalRun?.source ?? null,
     lastExternalRunBySource: state.lastExternalRunBySource,
     cumulativeRowsInserted: state.cumulativeRowsInserted,
     backend: lastRun?.historyBackend
+      ?? latestAggregate?.historyBackend
       ?? state.lastExternalRun?.historyBackend
       ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
     lastRunByCron: lastByCron,
