@@ -276,11 +276,43 @@ export async function readUniverseHistoryByPart(
 ): Promise<Map<string, HistoryRow[]>> {
   const result = new Map<string, HistoryRow[]>()
   if (partNumbers.length === 0) return result
-  // KV optimization: we read at most `days` keys, then bucket the rows by
-  // partNumber. D1 path issues one query per part — for small watchlists
-  // that's fine, and for larger universes we'll batch later (Phase 21D).
   const days = Math.max(1, Math.min(opts.days ?? 30, 90))
   const cutoff = new Date(Date.now() - days * 86_400_000).toISOString()
+  // Phase 21J.1 bugfix — D1 must take precedence over KV in the universe
+  // read path. The previous order was inverted, so deployments with both
+  // bindings (production) silently fell back to the empty KV history tier
+  // and reported observationCount: 0 across the whole watchlist even though
+  // D1 already had rows. Per-part history was unaffected because that path
+  // already preferred D1.
+  if (opts.d1) {
+    // Single grouped query keeps the Worker subrequest count at 1 instead
+    // of N regardless of universe size.
+    try {
+      const placeholders = partNumbers.map(() => '?').join(',')
+      const sql = `SELECT orderable_part_number, generic_part_number, category, subcategory, basket,
+                          captured_at, quantity_available, price_available, currency,
+                          normalized_unit_price, normalized_price_qty, order_limit,
+                          lead_time_weeks, lifecycle_status, okay_to_order,
+                          source_inventory, source_pricing, capture_status, warnings_json
+                   FROM ti_inventory_price_snapshot
+                   WHERE captured_at >= ?
+                     AND UPPER(orderable_part_number) IN (${placeholders})
+                   ORDER BY orderable_part_number ASC, captured_at ASC`
+      const stmt = opts.d1.prepare(sql).bind(cutoff, ...partNumbers.map(p => p.toUpperCase()))
+      const res = await stmt.all<any>()
+      const rows = res.results ?? []
+      for (const r of rows) {
+        const row = rowFromD1(r)
+        const key = row.orderablePartNumber.toUpperCase()
+        if (!result.has(key)) result.set(key, [])
+        result.get(key)!.push(row)
+      }
+      return result
+    } catch {
+      // Fall through to KV if D1 query throws (e.g. binding misconfigured
+      // mid-deploy). Empty result is preferable to crashing the endpoint.
+    }
+  }
   if (opts.kv) {
     const allRows = await readUniverseHistoryFromKV(opts.kv, cutoff)
     const wanted = new Set(partNumbers.map(p => p.toUpperCase()))
@@ -292,13 +324,6 @@ export async function readUniverseHistoryByPart(
     }
     for (const arr of result.values()) {
       arr.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
-    }
-    return result
-  }
-  if (opts.d1) {
-    for (const pn of partNumbers) {
-      const rows = await readPartHistory(pn, { d1: opts.d1, days })
-      result.set(pn.toUpperCase(), rows)
     }
     return result
   }
