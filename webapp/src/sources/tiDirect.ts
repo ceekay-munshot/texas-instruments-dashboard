@@ -17,7 +17,11 @@
 //   Token endpoint: https://transact.ti.com/v1/oauth/accesstoken
 //   Product info:   https://transact.ti.com/v1/products/{partNumber}
 //   Extended info:  https://transact.ti.com/v1/products-extended/{partNumber}?page=0
-//   Store I&P:      https://transact.ti.com/v1/store/products/inventory-pricing?partNumber={pn}
+//
+// Phase 20C.1 — Store Inventory & Pricing moved to the v2 production path.
+// The v1 query-string variant returned 401 even after Store API approval;
+// TI's published v2 endpoint puts the part number in the path:
+//   Store I&P (v2):  https://transact.ti.com/v2/store/products/{partNumber}?currency=USD
 //
 // Each default can be overridden via env var (no redeploy needed). The
 // templates use `{partNumber}` as a placeholder so a single env value covers
@@ -25,7 +29,7 @@
 const DEFAULT_TOKEN_URL = 'https://transact.ti.com/v1/oauth/accesstoken'
 const DEFAULT_PRODUCT_INFO_TPL = 'https://transact.ti.com/v1/products/{partNumber}'
 const DEFAULT_PRODUCT_INFO_EXT_TPL = 'https://transact.ti.com/v1/products-extended/{partNumber}?page=0'
-const DEFAULT_INVENTORY_PRICING_TPL = 'https://transact.ti.com/v1/store/products/inventory-pricing?partNumber={partNumber}'
+const DEFAULT_INVENTORY_PRICING_TPL = 'https://transact.ti.com/v2/store/products/{partNumber}?currency=USD'
 
 const TOKEN_CACHE_TTL_MS = 55 * 60 * 1000 // 55 min, per spec
 
@@ -66,6 +70,24 @@ function safeUrlSummary(url: string): { host: string; path: string } {
   try {
     const u = new URL(url)
     return { host: u.host, path: u.pathname }
+  } catch {
+    return { host: '', path: '' }
+  }
+}
+
+/** Phase 20C.1 — template-friendly URL summary for endpoints whose default
+ *  carries `{partNumber}` directly in the path. Substitutes a sentinel before
+ *  parsing so the URL constructor doesn't percent-encode the curly braces,
+ *  then restores `{partNumber}` in the pathname so the diagnostic display
+ *  reads `/v2/store/products/{partNumber}` instead of an opaque placeholder. */
+function safeTemplateUrlSummary(tpl: string): { host: string; path: string } {
+  const SENTINEL = '__TI_PARTNUMBER_TPL__'
+  try {
+    const u = new URL(tpl.split('{partNumber}').join(SENTINEL))
+    return {
+      host: u.host,
+      path: u.pathname.split(SENTINEL).join('{partNumber}'),
+    }
   } catch {
     return { host: '', path: '' }
   }
@@ -1163,7 +1185,11 @@ export function tiAttemptedEndpoints(env: TiEnv): {
   // never carries a real part number (no risk in this case, but keeps the
   // shape stable for display).
   const prod = safeUrlSummary(resolveProductInfoUrl(env, '_placeholder_'))
-  const inv = safeUrlSummary(resolveInventoryPricingUrl(env, '_placeholder_'))
+  // Phase 20C.1 — inventory template carries `{partNumber}` directly in the
+  // path. Use the template-friendly summary so the diagnostic shows
+  // `/v2/store/products/{partNumber}` rather than a substituted placeholder.
+  const invTpl = (env.TI_INVENTORY_PRICING_URL_TEMPLATE && env.TI_INVENTORY_PRICING_URL_TEMPLATE.trim()) || DEFAULT_INVENTORY_PRICING_TPL
+  const inv = safeTemplateUrlSummary(invTpl)
   return {
     attemptedTokenHost: tok.host,
     attemptedTokenPath: tok.path,
