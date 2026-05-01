@@ -168,15 +168,19 @@ export async function appendInventoryHistory(
 async function appendInventoryHistoryD1(d1: D1Database, rows: HistoryRow[]): Promise<AppendResult> {
   const errors: string[] = []
   let appended = 0
-  // Phase 21A — INSERT OR IGNORE relies on the unique index on
-  // (orderable_part_number, captured_at) added in migration 0002. Re-running
-  // a batch with the same capturedAt now silently no-ops instead of
-  // duplicating rows. The new columns added in 0002 (display_name,
-  // demand_proxy_type, dashboard_priority, supply_status, inventory_signal,
-  // pricing_signal, lead_time_signal, source_confidence, created_at) are
-  // populated here.
+  // Phase 21A.1 — migration-tolerant insert. The rich INSERT references
+  // columns added in migration 0002. Until that migration is applied in
+  // production, the rich INSERT throws "no such column" on every call. We
+  // try the rich INSERT first and fall back to the basic INSERT (only
+  // columns that exist in migration 0001) so daily captures keep persisting
+  // history regardless of whether the operator has applied 0002 yet. Once
+  // 0002 is applied, the rich INSERT starts succeeding and the new columns
+  // populate. INSERT OR IGNORE relies on the unique index on
+  // (orderable_part_number, captured_at) added in 0002 — INSERT OR IGNORE
+  // also gracefully no-ops on the basic-table path because SQLite treats
+  // duplicate-key errors the same way.
   const createdAt = new Date().toISOString()
-  const stmt = d1.prepare(
+  const richStmt = d1.prepare(
     `INSERT OR IGNORE INTO ti_inventory_price_snapshot (
       orderable_part_number, generic_part_number, category, subcategory, basket,
       display_name, demand_proxy_type, dashboard_priority,
@@ -187,40 +191,98 @@ async function appendInventoryHistoryD1(d1: D1Database, rows: HistoryRow[]): Pro
       source_inventory, source_pricing, capture_status, warnings_json, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
+  const basicStmt = d1.prepare(
+    `INSERT OR IGNORE INTO ti_inventory_price_snapshot (
+      orderable_part_number, generic_part_number, category, subcategory, basket,
+      captured_at, quantity_available, price_available, currency, price_breaks_json,
+      normalized_unit_price, normalized_price_qty, order_limit, future_inventory_json,
+      lead_time_weeks, lifecycle_status, okay_to_order,
+      source_inventory, source_pricing, capture_status, warnings_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+  // Cache which INSERT shape the database accepts after the first row, so
+  // we don't pay the rich-then-basic retry cost for every subsequent row.
+  let useRich: boolean | null = null
   for (const r of rows) {
     try {
-      await stmt
+      if (useRich !== false) {
+        try {
+          await richStmt
+            .bind(
+              r.orderablePartNumber,
+              r.genericPartNumber,
+              r.category,
+              r.subcategory,
+              r.basket,
+              r.displayName,
+              r.demandProxyType,
+              r.dashboardPriority,
+              r.capturedAt,
+              r.quantityAvailable,
+              r.priceAvailable ? 1 : 0,
+              r.currency,
+              null,
+              r.normalizedUnitPrice,
+              r.normalizedPriceQty,
+              r.orderLimit,
+              null,
+              r.leadTimeWeeks,
+              r.lifecycleStatus,
+              r.okayToOrder == null ? null : r.okayToOrder ? 1 : 0,
+              r.supplyStatus,
+              r.inventorySignal,
+              r.pricingSignal,
+              r.leadTimeSignal,
+              r.sourceConfidence,
+              r.sourceInventory,
+              r.sourcePricing,
+              r.captureStatus,
+              JSON.stringify(r.warnings ?? []),
+              createdAt,
+            )
+            .run()
+          if (useRich === null) useRich = true
+          appended += 1
+          continue
+        } catch (richErr: any) {
+          const msg = typeof richErr?.message === 'string' ? richErr.message : ''
+          if (/no such column|table .* has no column/i.test(msg) && useRich === null) {
+            useRich = false // fall through to basic on this and future rows
+            errors.push('d1:rich_insert_unsupported_falling_back_to_basic_until_migration_0002_applied')
+          } else if (useRich === null) {
+            // Some other error on first row — surface it and don't poison
+            // the path for subsequent rows.
+            errors.push(`d1:${msg.slice(0, 100)}`)
+            continue
+          } else {
+            // useRich was already true when set; rethrow to outer catch.
+            throw richErr
+          }
+        }
+      }
+      await basicStmt
         .bind(
           r.orderablePartNumber,
           r.genericPartNumber,
           r.category,
           r.subcategory,
           r.basket,
-          r.displayName,
-          r.demandProxyType,
-          r.dashboardPriority,
           r.capturedAt,
           r.quantityAvailable,
           r.priceAvailable ? 1 : 0,
           r.currency,
-          null, // price_breaks_json — not exposed by the public shape today
+          null,
           r.normalizedUnitPrice,
           r.normalizedPriceQty,
           r.orderLimit,
-          null, // future_inventory_json — public shape carries summary only
+          null,
           r.leadTimeWeeks,
           r.lifecycleStatus,
           r.okayToOrder == null ? null : r.okayToOrder ? 1 : 0,
-          r.supplyStatus,
-          r.inventorySignal,
-          r.pricingSignal,
-          r.leadTimeSignal,
-          r.sourceConfidence,
           r.sourceInventory,
           r.sourcePricing,
           r.captureStatus,
           JSON.stringify(r.warnings ?? []),
-          createdAt,
         )
         .run()
       appended += 1
@@ -287,13 +349,11 @@ export async function readPartHistory(
     try {
       const result = await opts.d1
         .prepare(
-          `SELECT orderable_part_number, generic_part_number, category, subcategory, basket,
-                  display_name, demand_proxy_type, dashboard_priority,
-                  captured_at, quantity_available, price_available, currency,
-                  normalized_unit_price, normalized_price_qty, order_limit,
-                  lead_time_weeks, lifecycle_status, okay_to_order,
-                  supply_status, inventory_signal, pricing_signal, lead_time_signal, source_confidence,
-                  source_inventory, source_pricing, capture_status, warnings_json
+          `SELECT *
+        -- Phase 21A.1 — SELECT * is schema-tolerant: works whether or not
+        -- migration 0002 has been applied. rowFromD1 maps each column with
+        -- `?? null` defaults, so missing columns silently degrade to null
+        -- without throwing
            FROM ti_inventory_price_snapshot
            WHERE UPPER(orderable_part_number) = UPPER(?) AND captured_at >= ?
            ORDER BY captured_at ASC`,
