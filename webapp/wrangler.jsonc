@@ -10,17 +10,15 @@
       "id": "b274de14818a45ff845067525dddf43f"
     }
   ],
-  // Phase 21A — D1 history binding. The operator provisions a database with
-  //   wrangler d1 create ti-inventory-history
-  // then replaces "TODO_D1_DATABASE_ID" with the returned database_id and
-  // applies migrations/0001_inventory_history.sql. Until the binding is
-  // populated the runtime falls back to a per-day KV history key so the
-  // system still works end-to-end on a fresh deploy.
+  // Phase 21A / 21J.1 — D1 history binding. Database created in the
+  // Cloudflare dashboard; ti_inventory_price_snapshot and ti_part_universe
+  // tables already exist there. With this binding wired, the runtime
+  // persists per-capture history rows to D1 instead of the KV fallback.
   "d1_databases": [
     {
       "binding": "TI_INVENTORY_HISTORY_DB",
       "database_name": "ti-inventory-history",
-      "database_id": "TODO_D1_DATABASE_ID"
+      "database_id": "17f3094d-37bf-4f1b-9f9a-aa5be1dfc9a2"
     }
   ]
 }
