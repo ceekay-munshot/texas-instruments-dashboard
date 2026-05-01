@@ -81,6 +81,17 @@ import {
   buildCurrentOrderableSet,
   filterSnapshotByOrderableSet,
 } from './sources/tiPartSignal'
+import {
+  type D1Database,
+  type HistoryKV,
+  appendInventoryHistory,
+  toHistoryRow,
+  readPartHistory,
+  readUniverseHistoryByPart,
+  computeWatchedSignals,
+  summarizeSignals,
+  type HistoryRow,
+} from './sources/tiInventoryHistory'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -103,6 +114,10 @@ type Bindings = {
   TI_API_ENV?: string
   /** Operator flag — flip to 'true' once TI Store API suite approval lands. */
   TI_STORE_API_ENABLED?: string
+  /** Phase 21A — D1 history database binding. When unbound the runtime
+   *  falls back to a per-day KV history tier so the dashboard still works
+   *  end-to-end on a fresh deploy. */
+  TI_INVENTORY_HISTORY_DB?: D1Database
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -1928,6 +1943,19 @@ app.post('/api/ti/inventory/capture', async (c) => {
   const orderableSet = buildCurrentOrderableSet(inputs)
   const filtered = filterSnapshotByOrderableSet(merged?.parts ?? [], orderableSet)
   const summary = summarizeInventorySnapshot(filtered.kept, inputs.length)
+
+  // Phase 21A — append the rows captured in THIS batch to the history table
+  // so trend / signal computation has per-capture observations to work with.
+  const slice = inputs.slice(batch.offset, batch.offset + batch.attemptedThisBatch)
+  const sliceSet = new Set(slice.map(p => p.partNumber.toUpperCase()))
+  const historyRows: HistoryRow[] = filtered.kept
+    .filter(p => sliceSet.has((p.partNumber || '').toUpperCase()))
+    .map(p => toHistoryRow(p, batch.capturedAt))
+  const history = await appendInventoryHistory(historyRows, {
+    d1: env.TI_INVENTORY_HISTORY_DB,
+    kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+  })
+
   return c.json({
     success: true,
     totalParts: batch.totalParts,
@@ -1946,6 +1974,11 @@ app.post('/api/ti/inventory/capture', async (c) => {
       snapshotRowsAfterFilter: batch.snapshotRowsAfterFilter,
       orphanRowsDropped: batch.orphanRowsDropped,
       orphanPartNumbersDropped: batch.orphanPartNumbersDropped,
+      history: {
+        backend: history.backend,
+        rowsAppended: history.rowsAppended,
+        errors: history.errors,
+      },
     },
   })
 })
@@ -1996,6 +2029,13 @@ app.post('/api/ti/inventory/capture-all', async (c) => {
   const orderableSet = buildCurrentOrderableSet(inputs)
   const filtered = filterSnapshotByOrderableSet(merged?.parts ?? [], orderableSet)
   const summary = summarizeInventorySnapshot(filtered.kept, inputs.length)
+  // Phase 21A — append every part captured in this orchestrated run.
+  const capturedAtForHistory = result.capturedAt
+  const historyRows: HistoryRow[] = filtered.kept.map(p => toHistoryRow(p, capturedAtForHistory))
+  const history = await appendInventoryHistory(historyRows, {
+    d1: env.TI_INVENTORY_HISTORY_DB,
+    kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+  })
   // Aggregate orphan diagnostics across all batches in this run.
   const orphanRowsDropped = result.batches.reduce((sum, b) => sum + (b.orphanRowsDropped || 0), 0)
   const orphanPartNumbersDropped = Array.from(new Set(result.batches.flatMap(b => b.orphanPartNumbersDropped || [])))
@@ -2012,6 +2052,11 @@ app.post('/api/ti/inventory/capture-all', async (c) => {
       snapshotRowsAfterFilter: filtered.kept.length,
       orphanRowsDropped,
       orphanPartNumbersDropped,
+      history: {
+        backend: history.backend,
+        rowsAppended: history.rowsAppended,
+        errors: history.errors,
+      },
     },
     note: result.done
       ? 'Watched-parts universe captured in a single Worker invocation.'
@@ -2083,6 +2128,123 @@ app.get('/api/ti/inventory/latest', async (c) => {
       orphanRowsDropped: dropped.length,
       orphanPartNumbersDropped: dropped,
     },
+  })
+})
+
+// GET /api/ti/inventory/history?partNumber=XYZ&days=30 — public, sanitized.
+// Returns per-capture history rows for a single watched part. Powers the
+// "trend" / "part detail" view in the Inventory tab. Reads from D1 when
+// bound, otherwise from the KV-history fallback. Never exposes raw TI
+// response bodies, tokens, secrets, or Authorization headers.
+app.get('/api/ti/inventory/history', async (c) => {
+  const env = c.env
+  const partNumber = (c.req.query('partNumber') || '').trim()
+  if (!partNumber) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required.' }, 400)
+  }
+  const days = Math.max(1, Math.min(parseInt(c.req.query('days') || '30', 10) || 30, 90))
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  const orderableSet = buildCurrentOrderableSet(inputs)
+  // Defensive: only allow history reads for watched parts. Stops a casual
+  // probe from using this endpoint to harvest arbitrary OPN inventory data.
+  if (!orderableSet.has(partNumber.toUpperCase())) {
+    return c.json({
+      success: false,
+      status: 'not_in_universe',
+      message: 'Part is not in the current watched universe.',
+    }, 404)
+  }
+  const rows = await readPartHistory(partNumber, {
+    d1: env.TI_INVENTORY_HISTORY_DB,
+    kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+    days,
+  })
+  const backend: 'd1' | 'kv' | 'none' = env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'
+  return c.json({
+    success: true,
+    partNumber,
+    days,
+    observationCount: rows.length,
+    backend,
+    rows,
+  })
+})
+
+// GET /api/ti/inventory/signals — public, sanitized.
+// Computes shortage / oversupply / tightening signals for every watched part
+// from the persisted history. Returns insufficient_history per part until at
+// least 3 captures have accumulated. Never exposes secrets.
+app.get('/api/ti/inventory/signals', async (c) => {
+  const env = c.env
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  const partNumbers = inputs.map(p => p.partNumber)
+  const days = Math.max(1, Math.min(parseInt(c.req.query('days') || '30', 10) || 30, 90))
+  const history = await readUniverseHistoryByPart(partNumbers, {
+    d1: env.TI_INVENTORY_HISTORY_DB,
+    kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+    days,
+  })
+  // Make sure every watched part has an entry, even if history is empty —
+  // the UI then shows insufficient_history rather than dropping the row.
+  for (const p of inputs) {
+    const key = p.partNumber.toUpperCase()
+    if (!history.has(key)) history.set(key, [])
+  }
+  const signals = computeWatchedSignals(history)
+  // Decorate with display name + basket from the watched-parts catalog so
+  // the UI can render without an extra fetch.
+  const inputByOpn = new Map(inputs.map(p => [p.partNumber.toUpperCase(), p]))
+  const decorated = signals.map(s => {
+    const w = inputByOpn.get(s.orderablePartNumber.toUpperCase())
+    return {
+      ...s,
+      basket: s.basket ?? (w?.basket ?? null),
+      displayName: w?.displayName ?? null,
+    }
+  })
+  // Add empty rows for any watched part the signal engine didn't emit (i.e.
+  // no history at all yet) so the dashboard summary counts every part.
+  const haveOpn = new Set(decorated.map(s => s.orderablePartNumber.toUpperCase()))
+  for (const p of inputs) {
+    const key = p.partNumber.toUpperCase()
+    if (!haveOpn.has(key)) {
+      decorated.push({
+        orderablePartNumber: p.partNumber,
+        genericPartNumber: p.genericPartNumberHint ?? null,
+        basket: p.basket ?? null,
+        asOf: new Date().toISOString(),
+        observationCount: 0,
+        inventoryDelta1d: null,
+        inventoryDelta7d: null,
+        inventoryDelta30d: null,
+        inventoryPctDelta1d: null,
+        inventoryPctDelta7d: null,
+        inventoryPctDelta30d: null,
+        priceDelta1d: null,
+        priceDelta7d: null,
+        priceDelta30d: null,
+        pricePctDelta1d: null,
+        pricePctDelta7d: null,
+        pricePctDelta30d: null,
+        leadTimeDelta: null,
+        signalType: 'insufficient_history',
+        signalStrength: 'none',
+        explanation: 'No captures recorded yet for this part.',
+        confidence: 0,
+        displayName: p.displayName ?? null,
+      })
+    }
+  }
+  const summary = summarizeSignals(decorated as any)
+  const backend: 'd1' | 'kv' | 'none' = env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'
+  return c.json({
+    success: true,
+    days,
+    backend,
+    summary,
+    signals: decorated,
   })
 })
 

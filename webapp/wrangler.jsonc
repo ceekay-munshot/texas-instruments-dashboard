@@ -9,5 +9,18 @@
       "binding": "SOURCE_SNAPSHOTS_KV",
       "id": "b274de14818a45ff845067525dddf43f"
     }
+  ],
+  // Phase 21A — D1 history binding. The operator provisions a database with
+  //   wrangler d1 create ti-inventory-history
+  // then replaces "TODO_D1_DATABASE_ID" with the returned database_id and
+  // applies migrations/0001_inventory_history.sql. Until the binding is
+  // populated the runtime falls back to a per-day KV history key so the
+  // system still works end-to-end on a fresh deploy.
+  "d1_databases": [
+    {
+      "binding": "TI_INVENTORY_HISTORY_DB",
+      "database_name": "ti-inventory-history",
+      "database_id": "TODO_D1_DATABASE_ID"
+    }
   ]
 }

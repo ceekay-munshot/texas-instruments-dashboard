@@ -938,6 +938,11 @@ function InventoryPanel() {
   const [snapshot, setSnapshot] = useState(null);
   const [snapshotLoading, setSnapshotLoading] = useState(true);
   const [snapshotError, setSnapshotError] = useState(null);
+  // Phase 21G — shortage / oversupply signal feed.
+  const [signalsResp, setSignalsResp] = useState(null);
+  // Phase 21H — per-part history expansion (lazy-loaded on click).
+  const [historyByPart, setHistoryByPart] = useState({});
+  const [expandedPart, setExpandedPart] = useState(null);
 
   // ── Operator-tools state (collapsed by default) ───────────────────────
   // Lets an operator paste the X-Capture-Secret to run a fresh capture or
@@ -953,29 +958,43 @@ function InventoryPanel() {
   const [partInput, setPartInput] = useState('');
   const [captureNote, setCaptureNote] = useState(null);
 
-  // Fetch the public snapshot on mount.
+  // Fetch the public snapshot + signals feed on mount.
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/ti/inventory/latest')
-      .then(r => r.ok ? r.json() : null)
-      .then(j => {
-        if (cancelled) return;
-        setSnapshotLoading(false);
-        if (!j) {
-          setSnapshotError('Inventory snapshot endpoint did not respond.');
-          return;
-        }
+    Promise.allSettled([
+      fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null),
+      fetch('/api/ti/inventory/signals').then(r => r.ok ? r.json() : null),
+    ]).then(([snapRes, sigRes]) => {
+      if (cancelled) return;
+      setSnapshotLoading(false);
+      const j = snapRes.status === 'fulfilled' ? snapRes.value : null;
+      if (!j) {
+        setSnapshotError('Inventory snapshot endpoint did not respond.');
+      } else {
         setSnapshot(j);
         if (j.status === 'no_snapshot') setSnapshotError('No inventory snapshot has been captured yet.');
         else if (j.status === 'snapshot_storage_not_configured') setSnapshotError('Snapshot storage is not configured on this deployment.');
-      })
-      .catch(e => {
-        if (cancelled) return;
-        setSnapshotLoading(false);
-        setSnapshotError(e?.message || 'Failed to load inventory snapshot.');
-      });
+      }
+      if (sigRes.status === 'fulfilled' && sigRes.value) setSignalsResp(sigRes.value);
+    });
     return () => { cancelled = true; };
   }, []);
+
+  async function fetchPartHistory(partNumber) {
+    if (!partNumber) return;
+    if (historyByPart[partNumber]) return; // cached
+    try {
+      const res = await fetch(`/api/ti/inventory/history?partNumber=${encodeURIComponent(partNumber)}&days=30`);
+      const j = res.ok ? await res.json().catch(() => null) : null;
+      if (j && j.success) {
+        setHistoryByPart(prev => ({ ...prev, [partNumber]: j }));
+      } else {
+        setHistoryByPart(prev => ({ ...prev, [partNumber]: { rows: [], error: j?.message || `Server returned ${res.status}` } }));
+      }
+    } catch (e) {
+      setHistoryByPart(prev => ({ ...prev, [partNumber]: { rows: [], error: e?.message || 'Fetch failed' } }));
+    }
+  }
 
   async function fetchOne(orderablePartNumber) {
     if (!secret.trim()) {
@@ -1257,6 +1276,115 @@ function InventoryPanel() {
         )}
       </div>
 
+      {/* ── Shortage / Oversupply Signals (Phase 21G) ── */}
+      {(() => {
+        const sigSummary = signalsResp?.summary;
+        const sigList = signalsResp?.signals || [];
+        const meaningful = sigList.filter(s => s.signalType !== 'insufficient_history' && s.signalType !== 'normal');
+        const insufficient = sigList.filter(s => s.signalType === 'insufficient_history').length;
+        const sigColor = t => t === 'shortage_pressure' ? '#f05c5c'
+          : t === 'oversupply_pressure' ? '#3d8ef0'
+          : t === 'inventory_tightening' ? '#f0a84e'
+          : t === 'supply_easing' ? '#00c9a7'
+          : t === 'price_only_pressure' ? '#ab6af0'
+          : t === 'normal' ? '#7a96b8'
+          : '#4a6a8a';
+        const sigLabel = t => t === 'shortage_pressure' ? 'Shortage pressure'
+          : t === 'oversupply_pressure' ? 'Oversupply pressure'
+          : t === 'inventory_tightening' ? 'Inventory tightening'
+          : t === 'supply_easing' ? 'Supply easing'
+          : t === 'price_only_pressure' ? 'Price-only pressure'
+          : t === 'normal' ? 'Normal'
+          : 'Insufficient history';
+        return (
+          <div style={sectionWrap}>
+            <div style={{ ...sectionTitle, marginBottom: 8 }}>Shortage / Oversupply Signals</div>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+              <KpiCard
+                label="Shortage pressure"
+                value={sigSummary?.shortagePressure ?? 0}
+                sub={sigSummary?.shortagePressure ? 'inv falling, price rising' : 'none detected'}
+                color={sigSummary?.shortagePressure ? '#f05c5c' : '#c4d4e8'}
+              />
+              <KpiCard
+                label="Oversupply pressure"
+                value={sigSummary?.oversupplyPressure ?? 0}
+                sub={sigSummary?.oversupplyPressure ? 'inv rising, price falling' : 'none detected'}
+                color={sigSummary?.oversupplyPressure ? '#3d8ef0' : '#c4d4e8'}
+              />
+              <KpiCard
+                label="Inventory tightening"
+                value={sigSummary?.inventoryTightening ?? 0}
+                sub="inv falling, price flat"
+                color={sigSummary?.inventoryTightening ? '#f0a84e' : '#c4d4e8'}
+              />
+              <KpiCard
+                label="Supply easing"
+                value={sigSummary?.supplyEasing ?? 0}
+                sub="inv rising, price flat"
+                color={sigSummary?.supplyEasing ? '#00c9a7' : '#c4d4e8'}
+              />
+              <KpiCard
+                label="Insufficient history"
+                value={insufficient}
+                sub="<3 captures recorded"
+                color="#7a96b8"
+              />
+            </div>
+            {meaningful.length === 0 ? (
+              <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
+                {insufficient === sigList.length && sigList.length > 0
+                  ? 'Run captures over multiple days to start surfacing shortage / oversupply classifications. The engine needs at least 3 successful captures per part.'
+                  : 'No shortage or oversupply pressure detected across the watched universe right now.'}
+              </div>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 900 }}>
+                  <thead>
+                    <tr>
+                      <th style={cellTH}>Signal</th>
+                      <th style={cellTH}>Strength</th>
+                      <th style={cellTH}>Part</th>
+                      <th style={cellTH}>Basket</th>
+                      <th style={cellTH}>Inventory Δ7d</th>
+                      <th style={cellTH}>Price Δ7d</th>
+                      <th style={cellTH}>Lead time Δ</th>
+                      <th style={cellTH}>Explanation</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {meaningful.slice(0, 15).map((s, idx) => (
+                      <tr key={`sig-${s.orderablePartNumber}-${idx}`}>
+                        <td style={{ ...cellTD, color: sigColor(s.signalType), fontWeight: 'bold' }}>{sigLabel(s.signalType)}</td>
+                        <td style={cellMono}>{s.signalStrength}</td>
+                        <td style={cellMono}>
+                          {s.orderablePartNumber}
+                          {s.displayName && <span style={{ color: '#7a96b8', marginLeft: 6, fontSize: '0.62rem' }}>· {s.displayName}</span>}
+                        </td>
+                        <td style={{ ...cellTD, color: '#a0b8d0' }}>{s.basket || '—'}</td>
+                        <td style={{ ...cellMono, color: s.inventoryPctDelta7d != null && s.inventoryPctDelta7d < 0 ? '#f0a84e' : s.inventoryPctDelta7d != null && s.inventoryPctDelta7d > 0 ? '#4dffc3' : '#7a96b8' }}>
+                          {s.inventoryPctDelta7d == null ? '—' : `${s.inventoryPctDelta7d > 0 ? '+' : ''}${s.inventoryPctDelta7d.toFixed(1)}%`}
+                        </td>
+                        <td style={{ ...cellMono, color: s.pricePctDelta7d != null && s.pricePctDelta7d > 0 ? '#f05c5c' : s.pricePctDelta7d != null && s.pricePctDelta7d < 0 ? '#4dffc3' : '#7a96b8' }}>
+                          {s.pricePctDelta7d == null ? '—' : `${s.pricePctDelta7d > 0 ? '+' : ''}${s.pricePctDelta7d.toFixed(1)}%`}
+                        </td>
+                        <td style={cellMono}>
+                          {s.leadTimeDelta == null ? '—' : `${s.leadTimeDelta > 0 ? '+' : ''}${s.leadTimeDelta} wk`}
+                        </td>
+                        <td style={{ ...cellTD, color: '#c4d4e8', fontSize: '0.66rem' }}>{s.explanation}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div style={{ marginTop: 8, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic' }}>
+              Signals require at least 3 captures per part. Capture failures are not counted as out-of-stock.
+            </div>
+          </div>
+        );
+      })()}
+
       {/* ── Filter / search / sort (Phase 20D) ── */}
       <div style={sectionWrap}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1372,12 +1500,24 @@ function InventoryPanel() {
                     ? <span style={{ color: '#f0a84e' }}>Capture failed — retry · showing last good{p.failureStage ? ` · ${p.failureStage}` : ''}</span>
                     : <span>TI Product Info + Store I&P · {fmtSignalLabel(conf)}</span>;
                 const rowBg = isFailed && !isStale ? '#1a0d10' : isStale ? '#1a1408' : undefined;
+                const isExpanded = expandedPart === p.partNumber;
+                const histResp = isExpanded ? historyByPart[p.partNumber] : null;
+                const onToggleHistory = () => {
+                  if (isExpanded) { setExpandedPart(null); return; }
+                  setExpandedPart(p.partNumber);
+                  if (!historyByPart[p.partNumber]) fetchPartHistory(p.partNumber);
+                };
                 return (
-                  <tr key={`snap-${p.partNumber || ''}-${idx}`} style={rowBg ? { background: rowBg } : undefined}>
+                  <React.Fragment key={`snap-${p.partNumber || ''}-${idx}`}>
+                  <tr style={rowBg ? { background: rowBg } : undefined}>
                     <td style={{ ...cellTD, color: '#a0b8d0' }}>{p.basket || '—'}</td>
                     <td style={cellMono}>{p.genericPartNumber || '—'}</td>
                     <td style={cellMono}>
-                      {p.partNumber || '—'}
+                      <span
+                        onClick={onToggleHistory}
+                        style={{ cursor: 'pointer', borderBottom: '1px dotted #2c4a70' }}
+                        title="Click to view inventory history"
+                      >{p.partNumber || '—'}</span>
                       {isStale && <sup style={{ color: '#f0a84e', marginLeft: 4, fontSize: '0.55rem' }}>stale</sup>}
                       {isFailed && !isStale && <sup style={{ color: '#f05c5c', marginLeft: 4, fontSize: '0.55rem' }}>failed</sup>}
                     </td>
@@ -1394,6 +1534,64 @@ function InventoryPanel() {
                       {sourceLabel}
                     </td>
                   </tr>
+                  {isExpanded && (
+                    <tr style={{ background: '#040711' }}>
+                      <td colSpan={13} style={{ padding: '10px 12px', borderBottom: '1px solid #1a2740' }}>
+                        {!histResp ? (
+                          <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>Loading history…</span>
+                        ) : histResp.error ? (
+                          <span style={{ fontSize: '0.7rem', color: '#f0a84e' }}>{histResp.error}</span>
+                        ) : (histResp.rows || []).length === 0 ? (
+                          <span style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
+                            No history rows yet for {p.partNumber}. Run captures over multiple days to populate the trend.
+                          </span>
+                        ) : (
+                          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                            <div style={{ minWidth: 260 }}>
+                              <div style={tinyLabel}>30d inventory history · {histResp.rows.length} captures</div>
+                              <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem' }}>
+                                <thead>
+                                  <tr>
+                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Captured</th>
+                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Qty</th>
+                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Lead</th>
+                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {histResp.rows.slice(-15).reverse().map((r, hi) => (
+                                    <tr key={hi}>
+                                      <td style={{ ...cellTD, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                        {new Date(r.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+                                      </td>
+                                      <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                        {r.quantityAvailable == null ? '—' : Number(r.quantityAvailable).toLocaleString()}
+                                      </td>
+                                      <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                        {r.leadTimeWeeks == null ? '—' : `${r.leadTimeWeeks}w`}
+                                      </td>
+                                      <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px', color: r.captureStatus === 'failed' ? '#f05c5c' : '#a0b8d0' }}>
+                                        {r.captureStatus}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                            <div style={{ minWidth: 260 }}>
+                              <div style={tinyLabel}>Source</div>
+                              <div style={{ fontSize: '0.7rem', color: '#a0b8d0', fontFamily: 'monospace', marginTop: 4 }}>
+                                Backend: {histResp.backend}<br/>
+                                Inventory: TI Store I&P API<br/>
+                                Pricing: {(histResp.rows || []).some(r => r.priceAvailable) ? 'TI Store API' : 'unavailable'}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 );
               })}
               {adhocRows.map((s, idx) => {
