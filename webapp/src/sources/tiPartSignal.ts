@@ -496,6 +496,44 @@ export type CaptureBatchResult = {
   nextOffset: number | null
   done: boolean
   capturedAt: string
+  /** Phase 20D.4 — orphan diagnostics. Counts how many rows in KV before
+   *  this write didn't match the current watched universe and were dropped
+   *  on persist. Empty when the snapshot was already aligned. */
+  snapshotRowsBeforeFilter: number
+  snapshotRowsAfterFilter: number
+  orphanRowsDropped: number
+  orphanPartNumbersDropped: string[]
+}
+
+/** Phase 20D.4 — defensive filter shared by capture writes and the public
+ *  latest endpoint. Returns the rows that match the current watched-parts
+ *  OPN set, plus the part numbers that were dropped (case-insensitive
+ *  comparison). The same Set object can be reused for many filter calls. */
+export function buildCurrentOrderableSet(
+  watchedParts: Array<{ partNumber: string }>,
+): Set<string> {
+  const set = new Set<string>()
+  for (const p of watchedParts) {
+    if (p.partNumber) set.add(p.partNumber.trim().toUpperCase())
+  }
+  return set
+}
+
+export function filterSnapshotByOrderableSet(
+  parts: TiPartSignalPublic[],
+  orderableSet: Set<string>,
+): { kept: TiPartSignalPublic[]; dropped: string[] } {
+  const kept: TiPartSignalPublic[] = []
+  const dropped: string[] = []
+  for (const row of parts) {
+    const key = (row.partNumber || '').trim().toUpperCase()
+    if (key && orderableSet.has(key)) {
+      kept.push(row)
+    } else if (row.partNumber) {
+      dropped.push(row.partNumber)
+    }
+  }
+  return { kept, dropped }
 }
 
 /** Phase 20D.1 — capture a batch of watched parts and merge the result with
@@ -574,6 +612,9 @@ export async function captureWatchedPartsBatch(
 
   // Compose the merged snapshot: every prior row stays unless a new capture
   // for the same partNumber is in this batch (in which case the new row wins).
+  // Phase 20D.4 — rows whose partNumber is no longer part of the watched
+  // universe (e.g. an OPN that was swapped) are dropped before the KV write.
+  const orderableSet = buildCurrentOrderableSet(allParts)
   const merged: TiPartSignalPublic[] = []
   // Walk allParts so the row order matches the watched universe order, even
   // when a prior capture used a different ordering.
@@ -585,19 +626,28 @@ export async function captureWatchedPartsBatch(
       merged.push(priorByPartNumber.get(key)!)
     }
   }
-  // Carry over any prior rows whose part numbers aren't in the current
-  // watched-parts list — defensive, normally empty.
+  // Pre-filter snapshot stats: how big was the rolling KV state before we
+  // dropped orphans? `merged` only carries rows for the current universe,
+  // so the rolling size is len(prior) + new rows that weren't in prior.
+  const newOnlyKeys = Array.from(newRows.keys()).filter(k => !priorByPartNumber.has(k))
+  const snapshotRowsBeforeFilter = priorByPartNumber.size + newOnlyKeys.length
+  const { kept, dropped } = filterSnapshotByOrderableSet(merged, orderableSet)
+  // Any prior rows whose partNumbers aren't in the current watched universe
+  // count toward orphanRowsDropped even though they didn't make it into
+  // `merged` above (we never put them there). Surface them in the diagnostic
+  // list so the operator can see what was cleaned up.
+  const droppedSet = new Set(dropped.map(s => s.toUpperCase()))
   for (const [key, row] of priorByPartNumber.entries()) {
-    if (!merged.some(m => (m.partNumber || '').toUpperCase() === key)
-        && !newRows.has(key)
-        && !allParts.some(p => (p.partNumber || '').toUpperCase() === key)) {
-      merged.push(row)
+    if (!orderableSet.has(key) && !droppedSet.has(key)) {
+      dropped.push(row.partNumber)
+      droppedSet.add(key)
     }
   }
+  const snapshotRowsAfterFilter = kept.length
 
   const entry: InventorySnapshotEntry = {
     capturedAt: attemptedAt,
-    parts: merged,
+    parts: kept,
   }
   await writeLatestInventorySnapshot(kv, entry)
 
@@ -614,6 +664,10 @@ export async function captureWatchedPartsBatch(
     nextOffset: done ? null : nextOffset,
     done,
     capturedAt: attemptedAt,
+    snapshotRowsBeforeFilter,
+    snapshotRowsAfterFilter,
+    orphanRowsDropped: dropped.length,
+    orphanPartNumbersDropped: dropped,
   }
 }
 

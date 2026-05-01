@@ -78,6 +78,8 @@ import {
   captureWatchedPartsBatch,
   captureAllWatchedPartsInternal,
   summarizeInventorySnapshot,
+  buildCurrentOrderableSet,
+  filterSnapshotByOrderableSet,
 } from './sources/tiPartSignal'
 
 type Bindings = {
@@ -1921,7 +1923,11 @@ app.post('/api/ti/inventory/capture', async (c) => {
 
   const batch = await captureWatchedPartsBatch(env, env.SOURCE_SNAPSHOTS_KV, inputs, offset, limit)
   const merged = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
-  const summary = summarizeInventorySnapshot(merged?.parts ?? [], inputs.length)
+  // Phase 20D.4 — defensive filter on read so even a stale snapshot pre-cleanup
+  // never surfaces orphan rows.
+  const orderableSet = buildCurrentOrderableSet(inputs)
+  const filtered = filterSnapshotByOrderableSet(merged?.parts ?? [], orderableSet)
+  const summary = summarizeInventorySnapshot(filtered.kept, inputs.length)
   return c.json({
     success: true,
     totalParts: batch.totalParts,
@@ -1935,6 +1941,12 @@ app.post('/api/ti/inventory/capture', async (c) => {
     done: batch.done,
     capturedAt: batch.capturedAt,
     summary,
+    diagnostics: {
+      snapshotRowsBeforeFilter: batch.snapshotRowsBeforeFilter,
+      snapshotRowsAfterFilter: batch.snapshotRowsAfterFilter,
+      orphanRowsDropped: batch.orphanRowsDropped,
+      orphanPartNumbersDropped: batch.orphanPartNumbersDropped,
+    },
   })
 })
 
@@ -1981,7 +1993,12 @@ app.post('/api/ti/inventory/capture-all', async (c) => {
     maxBatches,
   })
   const merged = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
-  const summary = summarizeInventorySnapshot(merged?.parts ?? [], inputs.length)
+  const orderableSet = buildCurrentOrderableSet(inputs)
+  const filtered = filterSnapshotByOrderableSet(merged?.parts ?? [], orderableSet)
+  const summary = summarizeInventorySnapshot(filtered.kept, inputs.length)
+  // Aggregate orphan diagnostics across all batches in this run.
+  const orphanRowsDropped = result.batches.reduce((sum, b) => sum + (b.orphanRowsDropped || 0), 0)
+  const orphanPartNumbersDropped = Array.from(new Set(result.batches.flatMap(b => b.orphanPartNumbersDropped || [])))
   return c.json({
     success: true,
     totalParts: result.totalParts,
@@ -1990,6 +2007,12 @@ app.post('/api/ti/inventory/capture-all', async (c) => {
     done: result.done,
     capturedAt: result.capturedAt,
     summary,
+    diagnostics: {
+      snapshotRowsBeforeFilter: result.batches.length > 0 ? result.batches[0].snapshotRowsBeforeFilter : 0,
+      snapshotRowsAfterFilter: filtered.kept.length,
+      orphanRowsDropped,
+      orphanPartNumbersDropped,
+    },
     note: result.done
       ? 'Watched-parts universe captured in a single Worker invocation.'
       : 'Worker stopped early to stay under platform limits — call /api/ti/inventory/capture with the returned nextOffset to continue.',
@@ -2002,15 +2025,30 @@ app.post('/api/ti/inventory/capture-all', async (c) => {
 // no raw quality/parametric blobs, no pricing-break numbers, no tokens,
 // no secrets, no Authorization headers. The capture endpoint is the only
 // writer; this endpoint only reads from KV and computes the summary.
+//
+// Phase 20D.4 — applies a defensive filter against the current watched-
+// universe OPN set, so even an unrefreshed KV snapshot containing rows for
+// retired OPNs never surfaces in the response. The filter is idempotent
+// with the capture-write filter, so the moment the operator runs a fresh
+// capture the KV state is also cleaned.
 app.get('/api/ti/inventory/latest', async (c) => {
   const env = c.env
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  const orderableSet = buildCurrentOrderableSet(inputs)
   if (!env.SOURCE_SNAPSHOTS_KV) {
     return c.json({
       configured: false,
       status: 'snapshot_storage_not_configured',
       capturedAt: null,
       parts: [],
-      summary: summarizeInventorySnapshot([], TI_WATCHED_PARTS.length),
+      summary: summarizeInventorySnapshot([], inputs.length),
+      diagnostics: {
+        snapshotRowsBeforeFilter: 0,
+        snapshotRowsAfterFilter: 0,
+        orphanRowsDropped: 0,
+        orphanPartNumbersDropped: [],
+      },
     })
   }
   const entry = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
@@ -2020,17 +2058,31 @@ app.get('/api/ti/inventory/latest', async (c) => {
       status: 'no_snapshot',
       capturedAt: null,
       parts: [],
-      summary: summarizeInventorySnapshot([], TI_WATCHED_PARTS.length),
+      summary: summarizeInventorySnapshot([], inputs.length),
+      diagnostics: {
+        snapshotRowsBeforeFilter: 0,
+        snapshotRowsAfterFilter: 0,
+        orphanRowsDropped: 0,
+        orphanPartNumbersDropped: [],
+      },
       note: 'Inventory snapshot has not been captured yet. Operator: POST /api/ti/inventory/capture with X-Capture-Secret.',
     })
   }
-  const summary = summarizeInventorySnapshot(entry.parts, TI_WATCHED_PARTS.length)
+  const beforeCount = entry.parts.length
+  const { kept, dropped } = filterSnapshotByOrderableSet(entry.parts, orderableSet)
+  const summary = summarizeInventorySnapshot(kept, inputs.length)
   return c.json({
     configured: true,
     status: 'ok',
     capturedAt: entry.capturedAt,
-    parts: entry.parts,
+    parts: kept,
     summary,
+    diagnostics: {
+      snapshotRowsBeforeFilter: beforeCount,
+      snapshotRowsAfterFilter: kept.length,
+      orphanRowsDropped: dropped.length,
+      orphanPartNumbersDropped: dropped,
+    },
   })
 })
 
