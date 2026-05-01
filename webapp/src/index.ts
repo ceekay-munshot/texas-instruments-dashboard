@@ -91,6 +91,9 @@ import {
   computeWatchedSignals,
   summarizeSignals,
   type HistoryRow,
+  recomputeAndPersistSignals,
+  getLatestSignalsFromD1,
+  getInventoryHistorySummary,
 } from './sources/tiInventoryHistory'
 
 type Bindings = {
@@ -1956,6 +1959,28 @@ app.post('/api/ti/inventory/capture', async (c) => {
     kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
   })
 
+  // Phase 21A — recompute and persist signals for THIS batch's parts.
+  // Reads the just-written history rows back via D1, classifies each
+  // part, and writes one row per part to ti_inventory_price_signal so
+  // /api/ti/inventory/signals/latest can serve fast reads. Uses the same
+  // signal classification rules as /api/ti/inventory/signals (which
+  // continues to compute on the fly for parity).
+  const partsThisBatch = slice.map(p => p.partNumber)
+  const hintMap = new Map<string, { displayName: string | null; basket: string | null }>()
+  for (const p of slice) {
+    hintMap.set(p.partNumber.toUpperCase(), {
+      displayName: (p as any).displayName ?? null,
+      basket: p.basket ?? null,
+    })
+  }
+  const signalRecompute = await recomputeAndPersistSignals(
+    env.TI_INVENTORY_HISTORY_DB ?? null,
+    env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+    partsThisBatch,
+    hintMap,
+    30,
+  )
+
   // Phase 21K.2 — record this external capture (GitHub Actions or operator
   // UI) into the same KV state /api/ti/inventory/schedule/status reads from,
   // so cumulativeRowsInserted reflects total D1 history inserts regardless
@@ -1997,6 +2022,11 @@ app.post('/api/ti/inventory/capture', async (c) => {
         backend: history.backend,
         rowsAppended: history.rowsAppended,
         errors: history.errors,
+      },
+      signals: {
+        computed: signalRecompute.computed,
+        persisted: signalRecompute.persisted,
+        errors: signalRecompute.errors,
       },
     },
   })
@@ -2264,6 +2294,111 @@ app.get('/api/ti/inventory/signals', async (c) => {
     backend,
     summary,
     signals: decorated,
+  })
+})
+
+// GET /api/ti/inventory/signals/latest — Phase 21A public, sanitized.
+// Reads the persisted ti_inventory_price_signal table and returns one row
+// per watched part — synthesizing insufficient_history rows for parts that
+// haven't accumulated enough history yet to be classified. Differs from
+// /api/ti/inventory/signals only in that this path reads from the
+// persisted signal table (one D1 query) instead of recomputing from raw
+// history on each call. Both paths agree on the classification rules.
+app.get('/api/ti/inventory/signals/latest', async (c) => {
+  const env = c.env
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  const persisted = await getLatestSignalsFromD1(env.TI_INVENTORY_HISTORY_DB ?? null)
+  const persistedByOpn = new Map(persisted.map(s => [s.orderablePartNumber.toUpperCase(), s]))
+  const inputByOpn = new Map(inputs.map(p => [p.partNumber.toUpperCase(), p]))
+  const decorated = inputs.map(p => {
+    const key = p.partNumber.toUpperCase()
+    const sig = persistedByOpn.get(key)
+    if (sig) {
+      return {
+        signalType: sig.signalType,
+        signalStrength: sig.signalStrength,
+        partNumber: sig.orderablePartNumber,
+        genericPartNumber: sig.genericPartNumber ?? p.genericPartNumberHint ?? null,
+        basket: sig.basket ?? p.basket ?? null,
+        displayName: sig.displayName ?? p.displayName ?? null,
+        latestQuantityAvailable: sig.latestQuantityAvailable,
+        previousQuantityAvailable: sig.previousQuantityAvailable,
+        inventoryDelta: sig.inventoryDelta,
+        inventoryPctDelta: sig.inventoryPctDelta,
+        latestNormalizedUnitPrice: sig.latestNormalizedUnitPrice,
+        previousNormalizedUnitPrice: sig.previousNormalizedUnitPrice,
+        priceDelta: sig.priceDelta,
+        pricePctDelta: sig.pricePctDelta,
+        observationsCount: sig.observationsCount,
+        explanation: sig.explanation,
+        confidence: sig.confidence,
+        asOf: sig.asOf,
+      }
+    }
+    return {
+      signalType: 'insufficient_history' as const,
+      signalStrength: 'none' as const,
+      partNumber: p.partNumber,
+      genericPartNumber: p.genericPartNumberHint ?? null,
+      basket: p.basket ?? null,
+      displayName: p.displayName ?? null,
+      latestQuantityAvailable: null,
+      previousQuantityAvailable: null,
+      inventoryDelta: null,
+      inventoryPctDelta: null,
+      latestNormalizedUnitPrice: null,
+      previousNormalizedUnitPrice: null,
+      priceDelta: null,
+      pricePctDelta: null,
+      observationsCount: 0,
+      explanation: 'No persisted signal yet for this part.',
+      confidence: 0,
+      asOf: new Date().toISOString(),
+    }
+  })
+  // Sort meaningful signals first.
+  const order: Record<string, number> = {
+    shortage_pressure: 0,
+    oversupply_pressure: 1,
+    inventory_tightening: 2,
+    supply_easing: 3,
+    price_only_pressure: 4,
+    normal: 5,
+    insufficient_history: 6,
+  }
+  decorated.sort((a, b) => (order[a.signalType] ?? 9) - (order[b.signalType] ?? 9) || a.partNumber.localeCompare(b.partNumber))
+  // Summary using same shape as /api/ti/inventory/signals so the UI can
+  // share render code.
+  const summary = summarizeSignals(
+    decorated.map(d => ({ signalType: d.signalType } as any)),
+  )
+  const backend: 'd1' | 'kv' | 'none' = env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'
+  return c.json({
+    success: true,
+    backend,
+    summary,
+    signals: decorated,
+  })
+})
+
+// GET /api/ti/inventory/history/summary — Phase 21A public, sanitized.
+// Universe-level history depth + signal counts. Powers the dashboard
+// header that tells the customer "X observations per part — Y more needed
+// before signals fire". One D1 round-trip aggregates per-part observation
+// counts; signal counts come from the persisted signal table.
+app.get('/api/ti/inventory/history/summary', async (c) => {
+  const env = c.env
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  const summary = await getInventoryHistorySummary(
+    env.TI_INVENTORY_HISTORY_DB ?? null,
+    env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+    inputs.map(p => p.partNumber),
+  )
+  return c.json({
+    success: true,
+    ...summary,
   })
 })
 

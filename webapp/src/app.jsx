@@ -943,6 +943,14 @@ function InventoryPanel() {
   // Phase 21H — per-part history expansion (lazy-loaded on click).
   const [historyByPart, setHistoryByPart] = useState({});
   const [expandedPart, setExpandedPart] = useState(null);
+  // Phase 21A — Inventory tab now has internal sub-tabs:
+  //   'snapshot' = Latest Snapshot (default)
+  //   'trends'   = Trends (per-part inventory + price history)
+  //   'signals'  = Shortage / Oversupply Signals
+  const [inventorySubTab, setInventorySubTab] = useState('snapshot');
+  // Trends tab — selected part for trend deep-dive.
+  const [trendPart, setTrendPart] = useState(null);
+  const [historySummary, setHistorySummary] = useState(null);
 
   // ── Operator-tools state (collapsed by default) ───────────────────────
   // Lets an operator paste the X-Capture-Secret to run a fresh capture or
@@ -963,8 +971,13 @@ function InventoryPanel() {
     let cancelled = false;
     Promise.allSettled([
       fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null),
-      fetch('/api/ti/inventory/signals').then(r => r.ok ? r.json() : null),
-    ]).then(([snapRes, sigRes]) => {
+      // Phase 21A — prefer the persisted-signal endpoint; fall through to
+      // the on-the-fly /signals endpoint if signals/latest isn't deployed
+      // yet (e.g. during the brief gap between push and Cloudflare build).
+      fetch('/api/ti/inventory/signals/latest').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch('/api/ti/inventory/signals').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch('/api/ti/inventory/history/summary').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([snapRes, sigLatestRes, sigOnFlyRes, summaryRes]) => {
       if (cancelled) return;
       setSnapshotLoading(false);
       const j = snapRes.status === 'fulfilled' ? snapRes.value : null;
@@ -975,7 +988,10 @@ function InventoryPanel() {
         if (j.status === 'no_snapshot') setSnapshotError('No inventory snapshot has been captured yet.');
         else if (j.status === 'snapshot_storage_not_configured') setSnapshotError('Snapshot storage is not configured on this deployment.');
       }
-      if (sigRes.status === 'fulfilled' && sigRes.value) setSignalsResp(sigRes.value);
+      const persisted = sigLatestRes.status === 'fulfilled' ? sigLatestRes.value : null;
+      const onFly = sigOnFlyRes.status === 'fulfilled' ? sigOnFlyRes.value : null;
+      setSignalsResp(persisted ?? onFly ?? null);
+      if (summaryRes.status === 'fulfilled' && summaryRes.value) setHistorySummary(summaryRes.value);
     });
     return () => { cancelled = true; };
   }, []);
@@ -1233,6 +1249,43 @@ function InventoryPanel() {
         </div>
       </div>
 
+      {/* ── Sub-tab strip (Phase 21A): Latest Snapshot / Trends / Signals ── */}
+      <div style={{ display: 'flex', gap: 0, padding: '0 16px', background: '#080c14', borderBottom: '1px solid #1a2740' }}>
+        {[
+          { id: 'snapshot', label: 'Latest Snapshot' },
+          { id: 'trends', label: 'Trends' },
+          { id: 'signals', label: 'Shortage / Oversupply Signals' },
+        ].map(t => {
+          const on = inventorySubTab === t.id;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setInventorySubTab(t.id)}
+              style={{
+                background: 'none',
+                border: 'none',
+                borderBottom: on ? '2px solid #3d8ef0' : '2px solid transparent',
+                padding: '10px 14px',
+                fontSize: '0.62rem',
+                letterSpacing: '0.14em',
+                textTransform: 'uppercase',
+                color: on ? '#e0eaf8' : '#6b8aa8',
+                cursor: 'pointer',
+                fontFamily: 'monospace',
+                fontWeight: on ? 'bold' : 'normal',
+              }}
+            >{t.label}</button>
+          );
+        })}
+        {historySummary && (
+          <span style={{ marginLeft: 'auto', alignSelf: 'center', fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', paddingRight: 4 }}>
+            {historySummary.partsWithHistory}/{historySummary.totalTrackedParts} with history · {historySummary.totalSnapshots} snapshots · {historySummary.partsWith3PlusObservations} with ≥3 obs
+          </span>
+        )}
+      </div>
+
+      {inventorySubTab === 'snapshot' && (<>
       {/* ── Universe summary cards (Phase 20D) ── */}
       <div style={sectionWrap}>
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
@@ -1275,7 +1328,9 @@ function InventoryPanel() {
           </div>
         )}
       </div>
+      </>)}
 
+      {inventorySubTab === 'signals' && (<>
       {/* ── Shortage / Oversupply Signals (Phase 21G / 21K) ── */}
       {(() => {
         const sigSummary = signalsResp?.summary;
@@ -1284,7 +1339,9 @@ function InventoryPanel() {
         const insufficient = sigList.filter(s => s.signalType === 'insufficient_history').length;
         // Phase 21K — history depth read-out so customers can see how close
         // we are to having enough observations to leave insufficient_history.
-        const obsCounts = sigList.map(s => s.observationCount || 0);
+        // Phase 21A — both /signals (singular) and /signals/latest (plural)
+        // can drive this feed; tolerate either name.
+        const obsCounts = sigList.map(s => s.observationCount ?? s.observationsCount ?? 0);
         const minObs = obsCounts.length > 0 ? Math.min(...obsCounts) : 0;
         const maxObs = obsCounts.length > 0 ? Math.max(...obsCounts) : 0;
         const sortedObs = [...obsCounts].sort((a, b) => a - b);
@@ -1404,7 +1461,113 @@ function InventoryPanel() {
           </div>
         );
       })()}
+      </>)}
 
+      {inventorySubTab === 'trends' && (
+        <div style={sectionWrap}>
+          <div style={{ ...sectionTitle, marginBottom: 8 }}>Trends</div>
+          <div style={{ fontSize: '0.7rem', color: '#a0b8d0', maxWidth: 920, marginBottom: 12 }}>
+            Pick a watched part to see its inventory and price history over the last 30 days.
+            Pricing series only renders when the TI Store API has returned price breaks for that part — otherwise we say so explicitly rather than fabricating a price line.
+          </div>
+          {(() => {
+            const partOptions = (snapshot?.parts || []).map(p => ({ partNumber: p.partNumber, basket: p.basket, displayName: p.displayName }));
+            const selected = trendPart || partOptions[0]?.partNumber || null;
+            const histResp = selected ? historyByPart[selected] : null;
+            // Lazy-load history when a part is selected.
+            if (selected && !histResp) {
+              fetchPartHistory(selected);
+            }
+            return (
+              <>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+                  <div style={tinyLabel}>Part</div>
+                  <select
+                    value={selected || ''}
+                    onChange={e => setTrendPart(e.target.value)}
+                    style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 280 }}
+                  >
+                    {partOptions.map(p => (
+                      <option key={p.partNumber} value={p.partNumber}>
+                        {p.partNumber}{p.displayName ? ` — ${p.displayName}` : ''}{p.basket ? ` (${p.basket})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {!selected ? (
+                  <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>No watched parts loaded yet.</div>
+                ) : !histResp ? (
+                  <div style={{ fontSize: '0.7rem', color: '#7a96b8' }}>Loading history for {selected}…</div>
+                ) : histResp.error ? (
+                  <div style={{ fontSize: '0.7rem', color: '#f0a84e' }}>{histResp.error}</div>
+                ) : (histResp.rows || []).length === 0 ? (
+                  <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
+                    No history rows yet for {selected}. Run captures over multiple days to populate the trend.
+                  </div>
+                ) : (() => {
+                  const rows = histResp.rows || [];
+                  const anyPrice = rows.some(r => r.priceAvailable);
+                  return (
+                    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                      <div style={{ minWidth: 360, flex: 1 }}>
+                        <div style={tinyLabel}>30d inventory & price history · {rows.length} captures</div>
+                        <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem', width: '100%' }}>
+                          <thead>
+                            <tr>
+                              <th style={cellTH}>Captured</th>
+                              <th style={cellTH}>Quantity</th>
+                              <th style={cellTH}>Price</th>
+                              <th style={cellTH}>Lead</th>
+                              <th style={cellTH}>Lifecycle</th>
+                              <th style={cellTH}>Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rows.slice().reverse().map((r, hi) => {
+                              const priceTxt = r.priceAvailable && r.normalizedUnitPrice != null
+                                ? `$${Number(r.normalizedUnitPrice).toFixed(4)}`
+                                : 'unavailable';
+                              return (
+                                <tr key={hi}>
+                                  <td style={{ ...cellTD, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                    {new Date(r.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+                                  </td>
+                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                    {r.quantityAvailable == null ? '—' : Number(r.quantityAvailable).toLocaleString()}
+                                  </td>
+                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px', color: r.priceAvailable ? '#c4d4e8' : '#7a96b8' }}>
+                                    {priceTxt}
+                                  </td>
+                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                    {r.leadTimeWeeks == null ? '—' : `${r.leadTimeWeeks}w`}
+                                  </td>
+                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
+                                    {r.lifecycleStatus || '—'}
+                                  </td>
+                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px', color: r.captureStatus === 'failed' ? '#f05c5c' : '#a0b8d0' }}>
+                                    {r.captureStatus}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                        {!anyPrice && (
+                          <div style={{ marginTop: 8, fontSize: '0.66rem', color: '#f0a84e', fontStyle: 'italic' }}>
+                            Pricing unavailable from current TI Store API response for this part — inventory series only.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      {inventorySubTab === 'snapshot' && (<>
       {/* ── Filter / search / sort (Phase 20D) ── */}
       <div style={sectionWrap}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1656,8 +1819,9 @@ function InventoryPanel() {
           Inventory and future availability are retrieved from the Texas Instruments Store Inventory & Pricing API. Future inventory is forecasted and not committed supply.
         </div>
       </div>
+      </>)}
 
-      {/* ── Operator tools (collapsed by default) ── */}
+      {/* ── Operator tools (collapsed by default) — always visible across sub-tabs ── */}
       <div style={sectionWrap}>
         <button
           type="button"
