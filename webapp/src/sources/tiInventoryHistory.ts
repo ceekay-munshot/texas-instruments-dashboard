@@ -350,10 +350,6 @@ export async function readPartHistory(
       const result = await opts.d1
         .prepare(
           `SELECT *
-        -- Phase 21A.1 — SELECT * is schema-tolerant: works whether or not
-        -- migration 0002 has been applied. rowFromD1 maps each column with
-        -- `?? null` defaults, so missing columns silently degrade to null
-        -- without throwing
            FROM ti_inventory_price_snapshot
            WHERE UPPER(orderable_part_number) = UPPER(?) AND captured_at >= ?
            ORDER BY captured_at ASC`,
