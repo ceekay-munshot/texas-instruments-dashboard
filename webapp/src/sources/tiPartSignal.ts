@@ -195,3 +195,129 @@ export async function fetchTiPartSignal(env: TiEnv, partNumber: string): Promise
     fetchedAt: new Date().toISOString(),
   }
 }
+
+// ── Phase 20C.3 — public sanitized snapshot shape ───────────────────────────
+// The customer-facing /api/ti/inventory/latest endpoint serves this shape.
+// Strips internal warnings, raw quality/parametric blobs, datasheet URLs, and
+// anything that could leak adapter internals or secrets. Pricing is kept as a
+// boolean availability flag rather than the price-break array — pricing
+// numbers are commercially sensitive and stay behind the auth-gated
+// /api/ti/part-signal endpoint.
+
+export type TiPartSignalPublic = {
+  partNumber: string
+  genericPartNumber: string | null
+  description: string | null
+  basket: string | null
+  quantityAvailable: number | null
+  pricingAvailability: 'available' | 'unavailable' | 'pending_approval' | 'unknown'
+  orderLimit: number | null
+  futureInventoryVisibility: {
+    forecastCount: number
+    nextForecastDate: string | null
+    nextForecastQuantity: number | null
+  }
+  leadTimeWeeks: number | null
+  lifecycleStatus: string | null
+  okayToOrder: boolean | null
+  signals: {
+    supplyStatus: PartSignalSupplyStatus
+    inventorySignal: PartSignalInventoryFlag
+    pricingSignal: PartSignalPricingFlag
+    leadTimeSignal: PartSignalLeadTimeFlag
+    sourceConfidence: PartSignalSourceConfidence
+  }
+  fetchedAt: string
+  sources: {
+    productInfo: { label: string; status: TiProductInfo['status'] }
+    inventoryPricing: { label: string; status: TiInventoryPricing['status'] }
+  }
+}
+
+/** Build the public snapshot shape from the merged signal. `basket` is taken
+ *  from a caller-supplied catalog hint (the watched-parts module) since the
+ *  Product Information API does not return a basket label. */
+export function toPublicPartSignal(
+  signal: TiPartSignal,
+  basket: string | null = null,
+): TiPartSignalPublic {
+  const futureRows = signal.futureInventory ?? []
+  return {
+    partNumber: signal.resolvedPartNumber ?? signal.requestedPartNumber,
+    genericPartNumber: signal.genericPartNumber,
+    description: signal.description,
+    basket,
+    quantityAvailable: signal.quantityAvailable,
+    pricingAvailability: signal.signals.pricingSignal,
+    orderLimit: signal.orderLimit,
+    futureInventoryVisibility: {
+      forecastCount: futureRows.length,
+      nextForecastDate: signal.forecastDate,
+      nextForecastQuantity: signal.forecastQuantity,
+    },
+    leadTimeWeeks: signal.leadTimeWeeks,
+    lifecycleStatus: signal.lifecycleStatus,
+    okayToOrder: signal.okayToOrder,
+    signals: signal.signals,
+    fetchedAt: signal.fetchedAt,
+    sources: signal.sources,
+  }
+}
+
+// ── KV inventory snapshot ───────────────────────────────────────────────────
+
+export type InventorySnapshotKV = {
+  get(key: string): Promise<string | null>
+  put(key: string, value: string): Promise<void>
+}
+
+const INVENTORY_LATEST_KEY = 'source-snapshots/texas_instruments/ti_direct_inventory/store_inventory_pricing/latest'
+
+export type InventorySnapshotEntry = {
+  capturedAt: string
+  parts: TiPartSignalPublic[]
+}
+
+export async function readLatestInventorySnapshot(
+  kv: InventorySnapshotKV,
+): Promise<InventorySnapshotEntry | null> {
+  const raw = await kv.get(INVENTORY_LATEST_KEY)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.parts)) return null
+    return parsed as InventorySnapshotEntry
+  } catch {
+    return null
+  }
+}
+
+export async function writeLatestInventorySnapshot(
+  kv: InventorySnapshotKV,
+  entry: InventorySnapshotEntry,
+): Promise<void> {
+  await kv.put(INVENTORY_LATEST_KEY, JSON.stringify(entry))
+}
+
+/** Captures the customer-facing demo set: a small list of OPNs (currently
+ *  just AFE7799IABJ per Phase 20C.3 spec). Each part is fetched through the
+ *  authenticated part-signal merger, sanitized into the public shape, and
+ *  the bundle is written to KV under a single "latest" key. The capture
+ *  result is also returned so the operator endpoint can echo the outcome. */
+export async function capturePublicInventorySnapshot(
+  env: TiEnv,
+  kv: InventorySnapshotKV,
+  parts: Array<{ partNumber: string; basket: string | null }>,
+): Promise<InventorySnapshotEntry> {
+  const collected: TiPartSignalPublic[] = []
+  for (const p of parts) {
+    const signal = await fetchTiPartSignal(env, p.partNumber)
+    collected.push(toPublicPartSignal(signal, p.basket))
+  }
+  const entry: InventorySnapshotEntry = {
+    capturedAt: new Date().toISOString(),
+    parts: collected,
+  }
+  await writeLatestInventorySnapshot(kv, entry)
+  return entry
+}

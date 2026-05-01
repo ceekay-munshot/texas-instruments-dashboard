@@ -932,17 +932,50 @@ function fmtPriceUSD(n, currency) {
 }
 
 function InventoryPanel() {
+  // ── Public snapshot (customer-facing default) ─────────────────────────
+  // Loaded from /api/ti/inventory/latest on mount. Contains sanitized
+  // TiPartSignalPublic records — never any secrets, never raw pricing breaks.
+  const [snapshot, setSnapshot] = useState(null);
+  const [snapshotLoading, setSnapshotLoading] = useState(true);
+  const [snapshotError, setSnapshotError] = useState(null);
+
+  // ── Operator-tools state (collapsed by default) ───────────────────────
+  // Lets an operator paste the X-Capture-Secret to run a fresh capture or
+  // an ad-hoc part-signal lookup. Customers never need to interact with
+  // these controls.
+  const [opsOpen, setOpsOpen] = useState(false);
   const [secret, setSecret] = useState('');
   const [showSecret, setShowSecret] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  // rows is an array of { input, signal }; signal is the merged TiPartSignal
-  // payload, or null while still pending. The seed row is always present so
-  // the table has a verified anchor before any fetch.
-  const [rows, setRows] = useState([
-    { ...INVENTORY_SEED_PART, signal: null },
-  ]);
+  const [adhocSignals, setAdhocSignals] = useState({}); // OPN -> TiPartSignal
+  const [adhocOrder, setAdhocOrder] = useState([]); // ordered OPNs added by operator
   const [partInput, setPartInput] = useState('');
+  const [captureNote, setCaptureNote] = useState(null);
+
+  // Fetch the public snapshot on mount.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/ti/inventory/latest')
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (cancelled) return;
+        setSnapshotLoading(false);
+        if (!j) {
+          setSnapshotError('Inventory snapshot endpoint did not respond.');
+          return;
+        }
+        setSnapshot(j);
+        if (j.status === 'no_snapshot') setSnapshotError('No inventory snapshot has been captured yet.');
+        else if (j.status === 'snapshot_storage_not_configured') setSnapshotError('Snapshot storage is not configured on this deployment.');
+      })
+      .catch(e => {
+        if (cancelled) return;
+        setSnapshotLoading(false);
+        setSnapshotError(e?.message || 'Failed to load inventory snapshot.');
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   async function fetchOne(orderablePartNumber) {
     if (!secret.trim()) {
@@ -971,45 +1004,66 @@ function InventoryPanel() {
     }
   }
 
-  async function fetchAll() {
+  async function refreshSnapshot() {
     if (!secret.trim()) {
       setError('Capture secret required.');
       return;
     }
-    const next = [...rows];
-    for (let i = 0; i < next.length; i++) {
-      const r = next[i];
-      const json = await fetchOne(r.preferredOrderablePartNumber);
-      if (json && (json.success || json.requestedPartNumber)) {
-        next[i] = { ...r, signal: json };
+    setBusy(true);
+    setError(null);
+    setCaptureNote(null);
+    try {
+      const res = await fetch('/api/ti/inventory/capture', {
+        method: 'POST',
+        headers: { 'X-Capture-Secret': secret.trim() },
+      });
+      const json = await res.json().catch(() => null);
+      if (!json) {
+        setError(`Server returned ${res.status} (no JSON).`);
+      } else if (json.status === 'unauthorized') {
+        setError('Unauthorized — check the capture secret.');
+      } else if (json.status === 'capture_secret_not_configured') {
+        setError('Capture secret is not configured on the server.');
+      } else if (json.success) {
+        setCaptureNote(`Captured ${json.partsCaptured} part${json.partsCaptured === 1 ? '' : 's'} at ${new Date(json.capturedAt).toLocaleString()}`);
+        // Re-pull the public snapshot so the table updates immediately.
+        const fresh = await fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null).catch(() => null);
+        if (fresh) setSnapshot(fresh);
+      } else {
+        setError(`Capture failed: ${json.status || 'unknown'}`);
       }
+    } catch (e) {
+      setError(e?.message || 'Failed to reach server.');
+    } finally {
+      setBusy(false);
     }
-    setRows(next);
   }
 
   async function addPart() {
     const opn = partInput.trim();
     if (!opn) return;
-    if (rows.find(r => r.preferredOrderablePartNumber.toUpperCase() === opn.toUpperCase())) {
+    if (adhocSignals[opn.toUpperCase()] || (snapshot?.parts || []).some(p => (p.partNumber || '').toUpperCase() === opn.toUpperCase())) {
       setError(`${opn} is already in the table.`);
       return;
     }
     const json = await fetchOne(opn);
-    const newRow = {
-      basket: '—',
-      genericPartNumber: json?.genericPartNumber || opn,
-      preferredOrderablePartNumber: opn,
-      signal: json,
-    };
-    setRows([...rows, newRow]);
-    setPartInput('');
+    if (json && (json.requestedPartNumber || json.success)) {
+      const upper = opn.toUpperCase();
+      setAdhocSignals(prev => ({ ...prev, [upper]: json }));
+      setAdhocOrder(prev => [...prev, upper]);
+      setPartInput('');
+    }
   }
 
-  // ── Aggregate KPIs ────────────────────────────────────────────────────
-  // Hero cards focus on the first row (the seed/selected part), but the
-  // table renders all rows so an operator can compare at a glance.
-  const focusRow = rows[0]?.signal || null;
-  const focusInput = rows[0];
+  // ── Build display rows ────────────────────────────────────────────────
+  // Snapshot rows are the customer-facing source of truth for the KPI hero
+  // cards. Operator-added ad-hoc rows (full TiPartSignal shape) are appended
+  // to the table beneath the snapshot rows but do not influence the hero
+  // KPIs — those cards always describe the latest verified snapshot.
+  const snapshotParts = snapshot?.parts || [];
+  const adhocRows = adhocOrder.map(upper => adhocSignals[upper]).filter(Boolean);
+  const focusRow = snapshotParts[0] || null;
+  const focusPartNumber = focusRow?.partNumber || INVENTORY_SEED_PART.preferredOrderablePartNumber;
 
   const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 4 };
@@ -1027,27 +1081,32 @@ function InventoryPanel() {
   const cellTD = { padding: '6px 8px', borderBottom: '1px solid #0d1520', fontSize: '0.7rem', color: '#c4d4e8', verticalAlign: 'top' };
   const cellMono = { ...cellTD, fontFamily: 'monospace' };
 
-  // KPI values
+  // KPI values — derived strictly from the public snapshot's first row.
   const qty = focusRow?.quantityAvailable;
   const qtyLabel = qty == null ? '—' : Number(qty).toLocaleString();
   const lead = focusRow?.leadTimeWeeks;
   const leadLabel = lead == null ? '—' : `${lead} wk`;
   const lifecycle = focusRow?.lifecycleStatus || '—';
-  const futureRows = focusRow?.futureInventory || [];
-  const futureLabel = futureRows.length > 0
-    ? `${futureRows.length} forecast${futureRows.length === 1 ? '' : 's'}`
-    : (focusRow ? '—' : '—');
-  const futureSub = futureRows.length > 0
-    ? `next ${focusRow.forecastDate || ''}: ${focusRow.forecastQuantity != null ? Number(focusRow.forecastQuantity).toLocaleString() : '—'}`
-    : (focusRow ? 'no forecast posted' : 'pending fetch');
-  const pricingArr = focusRow?.pricing || [];
-  const minPriceRow = pricingArr.length > 0
-    ? pricingArr.slice().sort((a, b) => a.unitPrice - b.unitPrice)[0]
+  const fiv = focusRow?.futureInventoryVisibility;
+  const futureCount = fiv?.forecastCount || 0;
+  const futureLabel = futureCount > 0 ? `${futureCount} forecast${futureCount === 1 ? '' : 's'}` : '—';
+  const futureSub = futureCount > 0 && fiv?.nextForecastDate
+    ? `next ${fiv.nextForecastDate}: ${fiv.nextForecastQuantity != null ? Number(fiv.nextForecastQuantity).toLocaleString() : '—'}`
+    : (focusRow ? 'no forecast posted' : 'pending capture');
+  const pricingFlag = focusRow?.pricingAvailability;
+  const pricingLabel = pricingFlag === 'available' ? 'Available'
+    : pricingFlag === 'unavailable' ? 'Not posted'
+    : pricingFlag === 'pending_approval' ? 'Pending approval'
+    : '—';
+  const pricingColor = pricingFlag === 'available' ? '#4dffc3'
+    : pricingFlag === 'unavailable' || pricingFlag === 'pending_approval' ? '#f0a84e'
+    : '#c4d4e8';
+  const pricingSub = focusRow ? `signal: ${fmtSignalLabel(pricingFlag)}` : 'pending capture';
+
+  // Snapshot freshness label for the header.
+  const snapshotCapturedAt = snapshot?.capturedAt
+    ? new Date(snapshot.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
     : null;
-  const pricingLabel = minPriceRow ? fmtPriceUSD(minPriceRow.unitPrice, minPriceRow.currency) : '—';
-  const pricingSub = pricingArr.length > 0
-    ? `${pricingArr.length} break${pricingArr.length === 1 ? '' : 's'} · low ${minPriceRow?.breakQuantity}`
-    : (focusRow ? 'pricing not returned' : 'pending fetch');
 
   return (
     <>
@@ -1057,86 +1116,56 @@ function InventoryPanel() {
         <div style={{ fontSize: '0.78rem', color: '#a0b8d0', lineHeight: 1.55, maxWidth: 920 }}>
           Live TI direct inventory, pricing and future availability signals from Texas Instruments Store Inventory & Pricing API.
         </div>
+        <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#7a96b8', maxWidth: 920, lineHeight: 1.5 }}>
+          Inventory data is refreshed from Texas Instruments Store Inventory & Pricing API and shown from the latest verified snapshot.
+          {snapshotCapturedAt && (
+            <span style={{ color: '#a0b8d0' }}> Latest snapshot captured {snapshotCapturedAt}.</span>
+          )}
+        </div>
       </div>
 
       {/* ── Hero KPI cards ── */}
       <div style={sectionWrap}>
         <div style={{ ...tinyLabel, marginBottom: 10 }}>
-          Selected part: <span style={{ color: '#c4d4e8', fontFamily: 'monospace', textTransform: 'none', letterSpacing: 0 }}>{focusInput?.preferredOrderablePartNumber || '—'}</span>
+          Selected part: <span style={{ color: '#c4d4e8', fontFamily: 'monospace', textTransform: 'none', letterSpacing: 0 }}>{focusPartNumber}</span>
         </div>
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
           <KpiCard
             label="Available inventory"
             value={qtyLabel}
-            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.inventorySignal)}` : 'pending fetch'}
+            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.inventorySignal)}` : (snapshotLoading ? 'loading…' : 'pending capture')}
             color={focusRow ? INV_FLAG_COLOR[focusRow.signals?.inventorySignal] : '#e0eaf8'}
           />
           <KpiCard
             label="Lead time"
             value={leadLabel}
-            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.leadTimeSignal)}` : 'pending fetch'}
+            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.leadTimeSignal)}` : (snapshotLoading ? 'loading…' : 'pending capture')}
             color={focusRow ? INV_FLAG_COLOR[focusRow.signals?.leadTimeSignal] : '#e0eaf8'}
           />
           <KpiCard
             label="Lifecycle status"
             value={lifecycle}
-            sub={focusRow ? `okay to order: ${focusRow.okayToOrder == null ? '—' : focusRow.okayToOrder ? 'yes' : 'no'}` : 'pending fetch'}
+            sub={focusRow ? `okay to order: ${focusRow.okayToOrder == null ? '—' : focusRow.okayToOrder ? 'yes' : 'no'}` : (snapshotLoading ? 'loading…' : 'pending capture')}
             color="#c4d4e8"
           />
           <KpiCard
             label="Future inventory visibility"
             value={futureLabel}
             sub={futureSub}
-            color={futureRows.length > 0 ? '#4dffc3' : '#c4d4e8'}
+            color={futureCount > 0 ? '#4dffc3' : '#c4d4e8'}
           />
           <KpiCard
             label="Pricing availability"
             value={pricingLabel}
             sub={pricingSub}
-            color={minPriceRow ? '#4dffc3' : '#c4d4e8'}
+            color={pricingColor}
           />
         </div>
-      </div>
-
-      {/* ── Operator fetch controls ── */}
-      <div style={sectionWrap}>
-        <div style={{ ...tinyLabel, marginBottom: 6 }}>Operator</div>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input
-            type={showSecret ? 'text' : 'password'}
-            value={secret}
-            onChange={e => setSecret(e.target.value)}
-            placeholder="X-Capture-Secret"
-            autoComplete="off"
-            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
-          />
-          <button
-            type="button"
-            onClick={() => setShowSecret(s => !s)}
-            style={{ background: 'transparent', border: '1px solid #1a2740', color: '#7a96b8', padding: '5px 8px', fontSize: '0.66rem', borderRadius: 3, cursor: 'pointer' }}
-          >{showSecret ? 'hide' : 'show'}</button>
-          <button
-            type="button"
-            onClick={fetchAll}
-            disabled={busy || !secret.trim()}
-            style={{ background: busy ? '#1a2740' : '#0f2540', border: '1px solid #2c4a70', color: '#e0eaf8', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() ? 'not-allowed' : 'pointer' }}
-          >{busy ? 'Fetching…' : (rows.some(r => r.signal) ? 'Refresh all' : 'Fetch live data')}</button>
-          <span style={{ width: 12 }} />
-          <input
-            type="text"
-            value={partInput}
-            onChange={e => setPartInput(e.target.value)}
-            placeholder="Add OPN (e.g. INA226AIDGSR)"
-            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
-          />
-          <button
-            type="button"
-            onClick={addPart}
-            disabled={busy || !secret.trim() || !partInput.trim()}
-            style={{ background: 'transparent', border: '1px solid #1a2740', color: '#a0b8d0', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() || !partInput.trim() ? 'not-allowed' : 'pointer' }}
-          >Add part</button>
-          {error && <span style={{ fontSize: '0.7rem', color: '#f05c5c' }}>{error}</span>}
-        </div>
+        {snapshotError && !focusRow && (
+          <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#f0a84e' }}>
+            {snapshotError} The latest snapshot will appear here once an operator runs a capture.
+          </div>
+        )}
       </div>
 
       {/* ── Live inventory table ── */}
@@ -1162,8 +1191,49 @@ function InventoryPanel() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, idx) => {
-                const s = r.signal;
+              {snapshotParts.length === 0 && adhocRows.length === 0 && (
+                <tr>
+                  <td colSpan={13} style={{ ...cellTD, color: '#7a96b8', fontStyle: 'italic', textAlign: 'center', padding: '14px 8px' }}>
+                    {snapshotLoading ? 'Loading inventory snapshot…' : 'No verified snapshot yet — operator can run a capture below.'}
+                  </td>
+                </tr>
+              )}
+              {snapshotParts.map((p, idx) => {
+                const fiCount = p.futureInventoryVisibility?.forecastCount || 0;
+                const fiTxt = fiCount > 0 && p.futureInventoryVisibility?.nextForecastDate
+                  ? `${Number(p.futureInventoryVisibility.nextForecastQuantity ?? 0).toLocaleString()} on ${p.futureInventoryVisibility.nextForecastDate}`
+                  : '—';
+                const qtyTxt = p.quantityAvailable == null ? '—' : Number(p.quantityAvailable).toLocaleString();
+                const ol = p.orderLimit == null ? '—' : Number(p.orderLimit).toLocaleString();
+                const lt = p.leadTimeWeeks == null ? '—' : `${p.leadTimeWeeks} wk`;
+                const ok = p.okayToOrder == null ? '—' : p.okayToOrder ? 'yes' : 'no';
+                const fetched = p.fetchedAt ? new Date(p.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+                const conf = p.signals?.sourceConfidence;
+                const pricingTxt = p.pricingAvailability === 'available' ? 'Available'
+                  : p.pricingAvailability === 'unavailable' ? 'Not posted'
+                  : p.pricingAvailability === 'pending_approval' ? 'Pending approval'
+                  : '—';
+                return (
+                  <tr key={`snap-${p.partNumber || ''}-${idx}`}>
+                    <td style={{ ...cellTD, color: '#a0b8d0' }}>{p.basket || '—'}</td>
+                    <td style={cellMono}>{p.genericPartNumber || '—'}</td>
+                    <td style={cellMono}>{p.partNumber || '—'}</td>
+                    <td style={{ ...cellTD, maxWidth: 280 }}>{p.description || '—'}</td>
+                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[p.signals?.inventorySignal] || '#c4d4e8' }}>{qtyTxt}</td>
+                    <td style={cellMono}>{pricingTxt}</td>
+                    <td style={cellMono}>{ol}</td>
+                    <td style={cellMono}>{fiTxt}</td>
+                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[p.signals?.leadTimeSignal] || '#c4d4e8' }}>{lt}</td>
+                    <td style={cellMono}>{p.lifecycleStatus || '—'}</td>
+                    <td style={cellMono}>{ok}</td>
+                    <td style={{ ...cellMono, color: '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
+                    <td style={{ ...cellTD, color: INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
+                      TI Product Info + Store I&P · {fmtSignalLabel(conf)}
+                    </td>
+                  </tr>
+                );
+              })}
+              {adhocRows.map((s, idx) => {
                 const desc = s?.description || '—';
                 const qtyAvail = s?.quantityAvailable;
                 const qtyTxt = qtyAvail == null ? '—' : Number(qtyAvail).toLocaleString();
@@ -1172,28 +1242,28 @@ function InventoryPanel() {
                 const ol = s?.orderLimit == null ? '—' : Number(s.orderLimit).toLocaleString();
                 const fi = s?.futureInventory && s.futureInventory.length > 0
                   ? `${Number(s.forecastQuantity).toLocaleString()} on ${s.forecastDate}`
-                  : (s ? '—' : '—');
+                  : '—';
                 const lt = s?.leadTimeWeeks == null ? '—' : `${s.leadTimeWeeks} wk`;
                 const lc = s?.lifecycleStatus || '—';
                 const ok = s?.okayToOrder == null ? '—' : s.okayToOrder ? 'yes' : 'no';
                 const fetched = s?.fetchedAt ? new Date(s.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
                 const conf = s?.signals?.sourceConfidence;
                 return (
-                  <tr key={r.preferredOrderablePartNumber + idx}>
-                    <td style={{ ...cellTD, color: '#a0b8d0' }}>{r.basket || '—'}</td>
-                    <td style={cellMono}>{r.genericPartNumber}</td>
-                    <td style={cellMono}>{r.preferredOrderablePartNumber}</td>
+                  <tr key={`adhoc-${s?.requestedPartNumber || ''}-${idx}`}>
+                    <td style={{ ...cellTD, color: '#a0b8d0', fontStyle: 'italic' }}>operator</td>
+                    <td style={cellMono}>{s?.genericPartNumber || s?.requestedPartNumber || '—'}</td>
+                    <td style={cellMono}>{s?.resolvedPartNumber || s?.requestedPartNumber || '—'}</td>
                     <td style={{ ...cellTD, maxWidth: 280 }}>{desc}</td>
-                    <td style={{ ...cellMono, color: s ? INV_FLAG_COLOR[s.signals?.inventorySignal] : '#c4d4e8' }}>{qtyTxt}</td>
+                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[s?.signals?.inventorySignal] || '#c4d4e8' }}>{qtyTxt}</td>
                     <td style={cellMono}>{prTxt}</td>
                     <td style={cellMono}>{ol}</td>
                     <td style={cellMono}>{fi}</td>
-                    <td style={{ ...cellMono, color: s ? INV_FLAG_COLOR[s.signals?.leadTimeSignal] : '#c4d4e8' }}>{lt}</td>
+                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[s?.signals?.leadTimeSignal] || '#c4d4e8' }}>{lt}</td>
                     <td style={cellMono}>{lc}</td>
                     <td style={cellMono}>{ok}</td>
                     <td style={{ ...cellMono, color: '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
                     <td style={{ ...cellTD, color: INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
-                      {s ? `TI Product Info + Store I&P · ${fmtSignalLabel(conf)}` : '—'}
+                      TI Product Info + Store I&P · {fmtSignalLabel(conf)}
                     </td>
                   </tr>
                 );
@@ -1204,6 +1274,65 @@ function InventoryPanel() {
         <div style={{ marginTop: 10, fontSize: '0.62rem', color: '#7a96b8', fontStyle: 'italic', maxWidth: 920 }}>
           Inventory and future availability are retrieved from the Texas Instruments Store Inventory & Pricing API. Future inventory is forecasted and not committed supply.
         </div>
+      </div>
+
+      {/* ── Operator tools (collapsed by default) ── */}
+      <div style={sectionWrap}>
+        <button
+          type="button"
+          onClick={() => setOpsOpen(o => !o)}
+          style={{ background: 'transparent', border: 'none', color: '#7a96b8', fontSize: '0.62rem', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold', cursor: 'pointer', padding: 0 }}
+        >
+          {opsOpen ? '▾ Operator tools' : '▸ Operator tools'}
+        </button>
+        {opsOpen && (
+          <div style={{ marginTop: 10, padding: 12, background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+            <div style={{ fontSize: '0.66rem', color: '#7a96b8', marginBottom: 8, lineHeight: 1.5 }}>
+              For TI operations only. The X-Capture-Secret never leaves this browser tab and is never persisted.
+              Customers do not need to interact with these controls.
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                type={showSecret ? 'text' : 'password'}
+                value={secret}
+                onChange={e => setSecret(e.target.value)}
+                placeholder="X-Capture-Secret"
+                autoComplete="off"
+                style={{ background: '#050810', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
+              />
+              <button
+                type="button"
+                onClick={() => setShowSecret(s => !s)}
+                style={{ background: 'transparent', border: '1px solid #1a2740', color: '#7a96b8', padding: '5px 8px', fontSize: '0.66rem', borderRadius: 3, cursor: 'pointer' }}
+              >{showSecret ? 'hide' : 'show'}</button>
+              <button
+                type="button"
+                onClick={refreshSnapshot}
+                disabled={busy || !secret.trim()}
+                style={{ background: busy ? '#1a2740' : '#0f2540', border: '1px solid #2c4a70', color: '#e0eaf8', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() ? 'not-allowed' : 'pointer' }}
+              >{busy ? 'Working…' : 'Capture snapshot'}</button>
+              <span style={{ width: 12 }} />
+              <input
+                type="text"
+                value={partInput}
+                onChange={e => setPartInput(e.target.value)}
+                placeholder="Ad-hoc OPN (e.g. INA226AIDGSR)"
+                style={{ background: '#050810', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
+              />
+              <button
+                type="button"
+                onClick={addPart}
+                disabled={busy || !secret.trim() || !partInput.trim()}
+                style={{ background: 'transparent', border: '1px solid #1a2740', color: '#a0b8d0', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() || !partInput.trim() ? 'not-allowed' : 'pointer' }}
+              >Fetch live data</button>
+            </div>
+            {(error || captureNote) && (
+              <div style={{ marginTop: 8, fontSize: '0.7rem', color: error ? '#f05c5c' : '#4dffc3' }}>
+                {error || captureNote}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </>
   );

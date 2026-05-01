@@ -70,7 +70,18 @@ import {
   TI_WATCHED_PARTS,
   summarizeWatchedBaskets,
 } from './sources/tiWatchedParts'
-import { fetchTiPartSignal } from './sources/tiPartSignal'
+import {
+  fetchTiPartSignal,
+  readLatestInventorySnapshot,
+  capturePublicInventorySnapshot,
+} from './sources/tiPartSignal'
+
+// Phase 20C.3 — small demo set captured into a public sanitized snapshot.
+// Currently one verified part; the array is the single source of truth so
+// adding more rows later only requires editing this one place.
+const TI_PUBLIC_INVENTORY_SET: Array<{ partNumber: string; basket: string | null }> = [
+  { partNumber: 'AFE7799IABJ', basket: 'Wireless Infra / RF' },
+]
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -1861,6 +1872,81 @@ app.get('/api/ti/part-signal', async (c) => {
   return c.json({
     success: productOk || inventoryOk,
     ...signal,
+  })
+})
+
+// POST /api/ti/inventory/capture — auth-gated (Phase 20C.3).
+// Runs the part-signal merger over a small demo set (TI_PUBLIC_INVENTORY_SET)
+// and writes a sanitized snapshot to SOURCE_SNAPSHOTS_KV. The customer-facing
+// /api/ti/inventory/latest then serves that snapshot without ever needing a
+// secret. Capture is the only path that hits TI; latest only reads KV.
+app.post('/api/ti/inventory/capture', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      success: false,
+      status: 'snapshot_storage_not_configured',
+      message: 'SOURCE_SNAPSHOTS_KV binding not set on this deployment.',
+    })
+  }
+  const entry = await capturePublicInventorySnapshot(env, env.SOURCE_SNAPSHOTS_KV, TI_PUBLIC_INVENTORY_SET)
+  return c.json({
+    success: true,
+    capturedAt: entry.capturedAt,
+    partsCaptured: entry.parts.length,
+    parts: entry.parts.map(p => ({
+      partNumber: p.partNumber,
+      genericPartNumber: p.genericPartNumber,
+      basket: p.basket,
+      supplyStatus: p.signals.supplyStatus,
+      sourceConfidence: p.signals.sourceConfidence,
+    })),
+  })
+})
+
+// GET /api/ti/inventory/latest — public, no secret required (Phase 20C.3).
+// Serves the sanitized inventory snapshot for the customer-facing Inventory
+// tab. Returns ONLY the public shape: no datasheet URL, no warnings, no
+// raw quality/parametric blobs, no pricing-break numbers, and no token /
+// header / secret-bearing fields. The capture endpoint is the only writer.
+app.get('/api/ti/inventory/latest', async (c) => {
+  const env = c.env
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      configured: false,
+      status: 'snapshot_storage_not_configured',
+      capturedAt: null,
+      parts: [],
+    })
+  }
+  const entry = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
+  if (!entry) {
+    return c.json({
+      configured: true,
+      status: 'no_snapshot',
+      capturedAt: null,
+      parts: [],
+      note: 'Inventory snapshot has not been captured yet. Operator: POST /api/ti/inventory/capture with X-Capture-Secret.',
+    })
+  }
+  return c.json({
+    configured: true,
+    status: 'ok',
+    capturedAt: entry.capturedAt,
+    parts: entry.parts,
   })
 })
 
