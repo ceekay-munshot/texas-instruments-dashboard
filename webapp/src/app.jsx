@@ -881,6 +881,334 @@ function TiWatchedPartsUniverse() {
   );
 }
 
+// ── Inventory tab — TI Direct Supply Signal (Phase 20C.2) ───────────────────
+// Surfaces live TI Product Information API metadata + Store Inventory &
+// Pricing API quantity / pricing / future-supply signals for one or more
+// watched part numbers. Designed to start with a single verified row
+// (AFE7799IABJ) and accept additional rows as the operator types them; the
+// table structure is ready for the full watched-parts universe but does NOT
+// auto-fan-out today (per spec). Never persists or echoes the X-Capture-Secret
+// — it lives only in component memory for the lifetime of the tab.
+const INVENTORY_SEED_PART = {
+  basket: 'Wireless Infra / RF',
+  genericPartNumber: 'AFE7799',
+  preferredOrderablePartNumber: 'AFE7799IABJ',
+};
+
+const INV_FLAG_COLOR = {
+  // supplyStatus
+  in_stock: '#4dffc3',
+  limited: '#f0a84e',
+  out_of_stock: '#f05c5c',
+  pending_approval: '#f0a84e',
+  // inventorySignal
+  healthy: '#4dffc3',
+  thin: '#f0a84e',
+  critical: '#f05c5c',
+  out: '#f05c5c',
+  // pricingSignal
+  available: '#4dffc3',
+  unavailable: '#f0a84e',
+  // leadTimeSignal
+  normal: '#4dffc3',
+  extended: '#f0a84e',
+  // sourceConfidence
+  high: '#4dffc3',
+  medium: '#f0a84e',
+  low: '#f05c5c',
+  none: '#7a96b8',
+  unknown: '#7a96b8',
+};
+
+function fmtSignalLabel(s) {
+  if (!s) return '—';
+  return String(s).replace(/_/g, ' ');
+}
+
+function fmtPriceUSD(n, currency) {
+  if (n == null || !Number.isFinite(n)) return '—';
+  const cur = currency || 'USD';
+  return cur === 'USD' ? `$${Number(n).toFixed(4)}` : `${Number(n).toFixed(4)} ${cur}`;
+}
+
+function InventoryPanel() {
+  const [secret, setSecret] = useState('');
+  const [showSecret, setShowSecret] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  // rows is an array of { input, signal }; signal is the merged TiPartSignal
+  // payload, or null while still pending. The seed row is always present so
+  // the table has a verified anchor before any fetch.
+  const [rows, setRows] = useState([
+    { ...INVENTORY_SEED_PART, signal: null },
+  ]);
+  const [partInput, setPartInput] = useState('');
+
+  async function fetchOne(orderablePartNumber) {
+    if (!secret.trim()) {
+      setError('Capture secret required.');
+      return null;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const url = `/api/ti/part-signal?partNumber=${encodeURIComponent(orderablePartNumber)}`;
+      const res = await fetch(url, { headers: { 'X-Capture-Secret': secret.trim() } });
+      const json = await res.json().catch(() => null);
+      if (!json) {
+        setError(`Server returned ${res.status} (no JSON).`);
+      } else if (json.status === 'unauthorized') {
+        setError('Unauthorized — check the capture secret.');
+      } else if (json.status === 'capture_secret_not_configured') {
+        setError('Capture secret is not configured on the server.');
+      }
+      return json;
+    } catch (e) {
+      setError(e?.message || 'Failed to reach server.');
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function fetchAll() {
+    if (!secret.trim()) {
+      setError('Capture secret required.');
+      return;
+    }
+    const next = [...rows];
+    for (let i = 0; i < next.length; i++) {
+      const r = next[i];
+      const json = await fetchOne(r.preferredOrderablePartNumber);
+      if (json && (json.success || json.requestedPartNumber)) {
+        next[i] = { ...r, signal: json };
+      }
+    }
+    setRows(next);
+  }
+
+  async function addPart() {
+    const opn = partInput.trim();
+    if (!opn) return;
+    if (rows.find(r => r.preferredOrderablePartNumber.toUpperCase() === opn.toUpperCase())) {
+      setError(`${opn} is already in the table.`);
+      return;
+    }
+    const json = await fetchOne(opn);
+    const newRow = {
+      basket: '—',
+      genericPartNumber: json?.genericPartNumber || opn,
+      preferredOrderablePartNumber: opn,
+      signal: json,
+    };
+    setRows([...rows, newRow]);
+    setPartInput('');
+  }
+
+  // ── Aggregate KPIs ────────────────────────────────────────────────────
+  // Hero cards focus on the first row (the seed/selected part), but the
+  // table renders all rows so an operator can compare at a glance.
+  const focusRow = rows[0]?.signal || null;
+  const focusInput = rows[0];
+
+  const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
+  const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 4 };
+  const tinyLabel = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
+
+  const KpiCard = ({ label, value, sub, color }) => (
+    <div style={{ minWidth: 180, padding: '12px 16px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+      <div style={tinyLabel}>{label}</div>
+      <div style={{ fontSize: '1.15rem', fontFamily: 'monospace', color: color || '#e0eaf8', marginTop: 4, lineHeight: 1.2 }}>{value}</div>
+      {sub && <div style={{ fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+
+  const cellTH = { padding: '6px 8px', textAlign: 'left', borderBottom: '1px solid #1a2740', color: '#6b8aa8', fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.12em', fontWeight: 'bold', whiteSpace: 'nowrap' };
+  const cellTD = { padding: '6px 8px', borderBottom: '1px solid #0d1520', fontSize: '0.7rem', color: '#c4d4e8', verticalAlign: 'top' };
+  const cellMono = { ...cellTD, fontFamily: 'monospace' };
+
+  // KPI values
+  const qty = focusRow?.quantityAvailable;
+  const qtyLabel = qty == null ? '—' : Number(qty).toLocaleString();
+  const lead = focusRow?.leadTimeWeeks;
+  const leadLabel = lead == null ? '—' : `${lead} wk`;
+  const lifecycle = focusRow?.lifecycleStatus || '—';
+  const futureRows = focusRow?.futureInventory || [];
+  const futureLabel = futureRows.length > 0
+    ? `${futureRows.length} forecast${futureRows.length === 1 ? '' : 's'}`
+    : (focusRow ? '—' : '—');
+  const futureSub = futureRows.length > 0
+    ? `next ${focusRow.forecastDate || ''}: ${focusRow.forecastQuantity != null ? Number(focusRow.forecastQuantity).toLocaleString() : '—'}`
+    : (focusRow ? 'no forecast posted' : 'pending fetch');
+  const pricingArr = focusRow?.pricing || [];
+  const minPriceRow = pricingArr.length > 0
+    ? pricingArr.slice().sort((a, b) => a.unitPrice - b.unitPrice)[0]
+    : null;
+  const pricingLabel = minPriceRow ? fmtPriceUSD(minPriceRow.unitPrice, minPriceRow.currency) : '—';
+  const pricingSub = pricingArr.length > 0
+    ? `${pricingArr.length} break${pricingArr.length === 1 ? '' : 's'} · low ${minPriceRow?.breakQuantity}`
+    : (focusRow ? 'pricing not returned' : 'pending fetch');
+
+  return (
+    <>
+      {/* ── Header ── */}
+      <div style={{ ...sectionWrap, paddingTop: 22, paddingBottom: 18 }}>
+        <div style={{ ...sectionTitle, marginBottom: 6 }}>TI Direct Supply Signal</div>
+        <div style={{ fontSize: '0.78rem', color: '#a0b8d0', lineHeight: 1.55, maxWidth: 920 }}>
+          Live TI direct inventory, pricing and future availability signals from Texas Instruments Store Inventory & Pricing API.
+        </div>
+      </div>
+
+      {/* ── Hero KPI cards ── */}
+      <div style={sectionWrap}>
+        <div style={{ ...tinyLabel, marginBottom: 10 }}>
+          Selected part: <span style={{ color: '#c4d4e8', fontFamily: 'monospace', textTransform: 'none', letterSpacing: 0 }}>{focusInput?.preferredOrderablePartNumber || '—'}</span>
+        </div>
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+          <KpiCard
+            label="Available inventory"
+            value={qtyLabel}
+            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.inventorySignal)}` : 'pending fetch'}
+            color={focusRow ? INV_FLAG_COLOR[focusRow.signals?.inventorySignal] : '#e0eaf8'}
+          />
+          <KpiCard
+            label="Lead time"
+            value={leadLabel}
+            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.leadTimeSignal)}` : 'pending fetch'}
+            color={focusRow ? INV_FLAG_COLOR[focusRow.signals?.leadTimeSignal] : '#e0eaf8'}
+          />
+          <KpiCard
+            label="Lifecycle status"
+            value={lifecycle}
+            sub={focusRow ? `okay to order: ${focusRow.okayToOrder == null ? '—' : focusRow.okayToOrder ? 'yes' : 'no'}` : 'pending fetch'}
+            color="#c4d4e8"
+          />
+          <KpiCard
+            label="Future inventory visibility"
+            value={futureLabel}
+            sub={futureSub}
+            color={futureRows.length > 0 ? '#4dffc3' : '#c4d4e8'}
+          />
+          <KpiCard
+            label="Pricing availability"
+            value={pricingLabel}
+            sub={pricingSub}
+            color={minPriceRow ? '#4dffc3' : '#c4d4e8'}
+          />
+        </div>
+      </div>
+
+      {/* ── Operator fetch controls ── */}
+      <div style={sectionWrap}>
+        <div style={{ ...tinyLabel, marginBottom: 6 }}>Operator</div>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type={showSecret ? 'text' : 'password'}
+            value={secret}
+            onChange={e => setSecret(e.target.value)}
+            placeholder="X-Capture-Secret"
+            autoComplete="off"
+            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
+          />
+          <button
+            type="button"
+            onClick={() => setShowSecret(s => !s)}
+            style={{ background: 'transparent', border: '1px solid #1a2740', color: '#7a96b8', padding: '5px 8px', fontSize: '0.66rem', borderRadius: 3, cursor: 'pointer' }}
+          >{showSecret ? 'hide' : 'show'}</button>
+          <button
+            type="button"
+            onClick={fetchAll}
+            disabled={busy || !secret.trim()}
+            style={{ background: busy ? '#1a2740' : '#0f2540', border: '1px solid #2c4a70', color: '#e0eaf8', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() ? 'not-allowed' : 'pointer' }}
+          >{busy ? 'Fetching…' : (rows.some(r => r.signal) ? 'Refresh all' : 'Fetch live data')}</button>
+          <span style={{ width: 12 }} />
+          <input
+            type="text"
+            value={partInput}
+            onChange={e => setPartInput(e.target.value)}
+            placeholder="Add OPN (e.g. INA226AIDGSR)"
+            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
+          />
+          <button
+            type="button"
+            onClick={addPart}
+            disabled={busy || !secret.trim() || !partInput.trim()}
+            style={{ background: 'transparent', border: '1px solid #1a2740', color: '#a0b8d0', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() || !partInput.trim() ? 'not-allowed' : 'pointer' }}
+          >Add part</button>
+          {error && <span style={{ fontSize: '0.7rem', color: '#f05c5c' }}>{error}</span>}
+        </div>
+      </div>
+
+      {/* ── Live inventory table ── */}
+      <div style={sectionWrap}>
+        <div style={{ ...sectionTitle, marginBottom: 8 }}>Live Inventory Table</div>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ borderCollapse: 'collapse', minWidth: 1200, width: '100%' }}>
+            <thead>
+              <tr>
+                <th style={cellTH}>Basket</th>
+                <th style={cellTH}>Generic Part</th>
+                <th style={cellTH}>Orderable Part</th>
+                <th style={cellTH}>Description</th>
+                <th style={cellTH}>Quantity Available</th>
+                <th style={cellTH}>Pricing</th>
+                <th style={cellTH}>Order Limit</th>
+                <th style={cellTH}>Future Inventory</th>
+                <th style={cellTH}>Lead Time</th>
+                <th style={cellTH}>Lifecycle</th>
+                <th style={cellTH}>Okay to Order</th>
+                <th style={cellTH}>Last Fetched</th>
+                <th style={cellTH}>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, idx) => {
+                const s = r.signal;
+                const desc = s?.description || '—';
+                const qtyAvail = s?.quantityAvailable;
+                const qtyTxt = qtyAvail == null ? '—' : Number(qtyAvail).toLocaleString();
+                const pr = s?.pricing && s.pricing.length > 0 ? s.pricing.slice().sort((a, b) => a.unitPrice - b.unitPrice)[0] : null;
+                const prTxt = pr ? `${fmtPriceUSD(pr.unitPrice, pr.currency)} @ ${pr.breakQuantity}+` : '—';
+                const ol = s?.orderLimit == null ? '—' : Number(s.orderLimit).toLocaleString();
+                const fi = s?.futureInventory && s.futureInventory.length > 0
+                  ? `${Number(s.forecastQuantity).toLocaleString()} on ${s.forecastDate}`
+                  : (s ? '—' : '—');
+                const lt = s?.leadTimeWeeks == null ? '—' : `${s.leadTimeWeeks} wk`;
+                const lc = s?.lifecycleStatus || '—';
+                const ok = s?.okayToOrder == null ? '—' : s.okayToOrder ? 'yes' : 'no';
+                const fetched = s?.fetchedAt ? new Date(s.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+                const conf = s?.signals?.sourceConfidence;
+                return (
+                  <tr key={r.preferredOrderablePartNumber + idx}>
+                    <td style={{ ...cellTD, color: '#a0b8d0' }}>{r.basket || '—'}</td>
+                    <td style={cellMono}>{r.genericPartNumber}</td>
+                    <td style={cellMono}>{r.preferredOrderablePartNumber}</td>
+                    <td style={{ ...cellTD, maxWidth: 280 }}>{desc}</td>
+                    <td style={{ ...cellMono, color: s ? INV_FLAG_COLOR[s.signals?.inventorySignal] : '#c4d4e8' }}>{qtyTxt}</td>
+                    <td style={cellMono}>{prTxt}</td>
+                    <td style={cellMono}>{ol}</td>
+                    <td style={cellMono}>{fi}</td>
+                    <td style={{ ...cellMono, color: s ? INV_FLAG_COLOR[s.signals?.leadTimeSignal] : '#c4d4e8' }}>{lt}</td>
+                    <td style={cellMono}>{lc}</td>
+                    <td style={cellMono}>{ok}</td>
+                    <td style={{ ...cellMono, color: '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
+                    <td style={{ ...cellTD, color: INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
+                      {s ? `TI Product Info + Store I&P · ${fmtSignalLabel(conf)}` : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ marginTop: 10, fontSize: '0.62rem', color: '#7a96b8', fontStyle: 'italic', maxWidth: 920 }}>
+          Inventory and future availability are retrieved from the Texas Instruments Store Inventory & Pricing API. Future inventory is forecasted and not committed supply.
+        </div>
+      </div>
+    </>
+  );
+}
+
 // ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
 // Shows only what answers the customer's question: are prices moving, by how
 // much, where, and any outliers. Hides empty sections. No operator chrome.
@@ -1521,6 +1849,7 @@ function App(){
       <div style={{display:'flex',gap:0,borderBottom:`1px solid ${B}`,background:'#050810',padding:'0 12px'}}>
         {[
           {id:'prices', label:'Prices'},
+          {id:'inventory', label:'Inventory'},
           {id:'insights', label:'Insights'},
         ].map(t=>{
           const on=activeTab===t.id;
@@ -1642,6 +1971,8 @@ function App(){
         </table>
       </div>
       </>}
+
+      {activeTab==='inventory'&&<InventoryPanel/>}
 
       {activeTab==='insights'&&<InsightsPanel
         liveData={liveData}

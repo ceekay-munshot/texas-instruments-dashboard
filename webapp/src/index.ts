@@ -70,6 +70,7 @@ import {
   TI_WATCHED_PARTS,
   summarizeWatchedBaskets,
 } from './sources/tiWatchedParts'
+import { fetchTiPartSignal } from './sources/tiPartSignal'
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -1826,6 +1827,40 @@ app.get('/api/ti/watched-parts/catalog', (c) => {
       thesisReason: p.thesisReason,
       demandProxyType: p.demandProxyType,
     })),
+  })
+})
+
+// GET /api/ti/part-signal?partNumber=XYZ — auth-gated (Phase 20C.2).
+// Single-round-trip merge of the Product Information API + Store Inventory &
+// Pricing API for one part. Returns dashboard-ready metadata + live supply
+// signals + derived signal flags. NEVER returns the OAuth token, the client
+// id/secret, or the capture secret. NEVER fans out to the watched-parts
+// catalog — this endpoint is one-part-at-a-time.
+app.get('/api/ti/part-signal', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const partNumber = (c.req.query('partNumber') || '').trim()
+  if (!partNumber) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required.' }, 400)
+  }
+  const signal = await fetchTiPartSignal(env, partNumber)
+  const productOk = signal.sources.productInfo.status === 'ok'
+  const inventoryOk = signal.sources.inventoryPricing.status === 'ok'
+  return c.json({
+    success: productOk || inventoryOk,
+    ...signal,
   })
 })
 
