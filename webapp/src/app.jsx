@@ -1056,14 +1056,70 @@ function InventoryPanel() {
   }
 
   // ── Build display rows ────────────────────────────────────────────────
-  // Snapshot rows are the customer-facing source of truth for the KPI hero
-  // cards. Operator-added ad-hoc rows (full TiPartSignal shape) are appended
-  // to the table beneath the snapshot rows but do not influence the hero
-  // KPIs — those cards always describe the latest verified snapshot.
+  // Snapshot rows are the customer-facing source of truth for the universe
+  // KPI summary cards. Operator-added ad-hoc rows (full TiPartSignal shape)
+  // are appended to the table beneath the snapshot rows but do not influence
+  // the summary cards — those always describe the latest verified snapshot.
   const snapshotParts = snapshot?.parts || [];
   const adhocRows = adhocOrder.map(upper => adhocSignals[upper]).filter(Boolean);
-  const focusRow = snapshotParts[0] || null;
-  const focusPartNumber = focusRow?.partNumber || INVENTORY_SEED_PART.preferredOrderablePartNumber;
+  const summary = snapshot?.summary || null;
+
+  // ── Filter / search / sort state (Phase 20D) ───────────────────────────
+  const [basketFilter, setBasketFilter] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [sortBy, setSortBy] = useState('basket'); // basket | quantityAvailable | leadTimeWeeks | lifecycleStatus
+  const [sortDir, setSortDir] = useState('asc'); // asc | desc
+
+  const distinctBaskets = useMemo(() => {
+    const set = new Set();
+    for (const p of snapshotParts) if (p.basket) set.add(p.basket);
+    return Array.from(set).sort();
+  }, [snapshotParts]);
+
+  const filteredSnapshotParts = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    let rows = snapshotParts;
+    if (basketFilter && basketFilter !== 'all') {
+      rows = rows.filter(p => p.basket === basketFilter);
+    }
+    if (q) {
+      rows = rows.filter(p => {
+        const gen = (p.genericPartNumber || '').toLowerCase();
+        const ord = (p.partNumber || '').toLowerCase();
+        const dn = (p.displayName || '').toLowerCase();
+        return gen.includes(q) || ord.includes(q) || dn.includes(q);
+      });
+    }
+    const dir = sortDir === 'desc' ? -1 : 1;
+    const cmp = (a, b) => {
+      switch (sortBy) {
+        case 'quantityAvailable': {
+          const av = a.quantityAvailable == null ? -Infinity : a.quantityAvailable;
+          const bv = b.quantityAvailable == null ? -Infinity : b.quantityAvailable;
+          return (av - bv) * dir;
+        }
+        case 'leadTimeWeeks': {
+          const av = a.leadTimeWeeks == null ? Infinity : a.leadTimeWeeks;
+          const bv = b.leadTimeWeeks == null ? Infinity : b.leadTimeWeeks;
+          return (av - bv) * dir;
+        }
+        case 'lifecycleStatus': {
+          const av = (a.lifecycleStatus || '').toUpperCase();
+          const bv = (b.lifecycleStatus || '').toUpperCase();
+          return av.localeCompare(bv) * dir;
+        }
+        case 'basket':
+        default: {
+          const av = (a.basket || '').toLowerCase();
+          const bv = (b.basket || '').toLowerCase();
+          if (av !== bv) return av.localeCompare(bv) * dir;
+          // Stable secondary sort by orderable PN.
+          return (a.partNumber || '').localeCompare(b.partNumber || '');
+        }
+      }
+    };
+    return rows.slice().sort(cmp);
+  }, [snapshotParts, basketFilter, searchQuery, sortBy, sortDir]);
 
   const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 4 };
@@ -1081,27 +1137,22 @@ function InventoryPanel() {
   const cellTD = { padding: '6px 8px', borderBottom: '1px solid #0d1520', fontSize: '0.7rem', color: '#c4d4e8', verticalAlign: 'top' };
   const cellMono = { ...cellTD, fontFamily: 'monospace' };
 
-  // KPI values — derived strictly from the public snapshot's first row.
-  const qty = focusRow?.quantityAvailable;
-  const qtyLabel = qty == null ? '—' : Number(qty).toLocaleString();
-  const lead = focusRow?.leadTimeWeeks;
-  const leadLabel = lead == null ? '—' : `${lead} wk`;
-  const lifecycle = focusRow?.lifecycleStatus || '—';
-  const fiv = focusRow?.futureInventoryVisibility;
-  const futureCount = fiv?.forecastCount || 0;
-  const futureLabel = futureCount > 0 ? `${futureCount} forecast${futureCount === 1 ? '' : 's'}` : '—';
-  const futureSub = futureCount > 0 && fiv?.nextForecastDate
-    ? `next ${fiv.nextForecastDate}: ${fiv.nextForecastQuantity != null ? Number(fiv.nextForecastQuantity).toLocaleString() : '—'}`
-    : (focusRow ? 'no forecast posted' : 'pending capture');
-  const pricingFlag = focusRow?.pricingAvailability;
-  const pricingLabel = pricingFlag === 'available' ? 'Available'
-    : pricingFlag === 'unavailable' ? 'Not posted'
-    : pricingFlag === 'pending_approval' ? 'Pending approval'
+  // ── Summary card values (Phase 20D — universe-level) ───────────────────
+  // Sourced from the API summary if present; otherwise computed from the
+  // local snapshot rows so the cards still populate when a stale or
+  // partial snapshot is on disk.
+  const total = summary?.totalParts ?? snapshotParts.length;
+  const inStock = summary?.inStockParts ?? snapshotParts.filter(p => p.signals?.supplyStatus === 'in_stock').length;
+  const outOfStock = summary?.outOfStockParts ?? snapshotParts.filter(p => p.signals?.supplyStatus === 'out_of_stock').length;
+  const activeCount = summary?.activeParts ?? null;
+  const longestLead = summary?.longestLeadTimePart;
+  const longestLabel = longestLead && longestLead.leadTimeWeeks != null
+    ? `${longestLead.leadTimeWeeks} wk`
     : '—';
-  const pricingColor = pricingFlag === 'available' ? '#4dffc3'
-    : pricingFlag === 'unavailable' || pricingFlag === 'pending_approval' ? '#f0a84e'
-    : '#c4d4e8';
-  const pricingSub = focusRow ? `signal: ${fmtSignalLabel(pricingFlag)}` : 'pending capture';
+  const longestSub = longestLead?.partNumber || (snapshotParts.length === 0 ? 'pending capture' : 'no lead time reported');
+  const basketsCovered = summary?.basketsCovered ?? distinctBaskets.length;
+  const medianLead = summary?.medianLeadTimeWeeks;
+  const medianLabel = typeof medianLead === 'number' && Number.isFinite(medianLead) ? `${medianLead} wk` : '—';
 
   // Snapshot freshness label for the header.
   const snapshotCapturedAt = snapshot?.capturedAt
@@ -1124,48 +1175,91 @@ function InventoryPanel() {
         </div>
       </div>
 
-      {/* ── Hero KPI cards ── */}
+      {/* ── Universe summary cards (Phase 20D) ── */}
       <div style={sectionWrap}>
-        <div style={{ ...tinyLabel, marginBottom: 10 }}>
-          Selected part: <span style={{ color: '#c4d4e8', fontFamily: 'monospace', textTransform: 'none', letterSpacing: 0 }}>{focusPartNumber}</span>
-        </div>
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
           <KpiCard
-            label="Available inventory"
-            value={qtyLabel}
-            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.inventorySignal)}` : (snapshotLoading ? 'loading…' : 'pending capture')}
-            color={focusRow ? INV_FLAG_COLOR[focusRow.signals?.inventorySignal] : '#e0eaf8'}
+            label="Total watched parts"
+            value={total ?? '—'}
+            sub={summary && summary.capturedParts !== summary.totalParts
+              ? `${summary.capturedParts}/${summary.totalParts} captured${summary.failedParts > 0 ? ` · ${summary.failedParts} failed` : ''}`
+              : (snapshotParts.length > 0 ? `${snapshotParts.length} captured` : (snapshotLoading ? 'loading…' : 'pending capture'))}
+            color="#e0eaf8"
           />
           <KpiCard
-            label="Lead time"
-            value={leadLabel}
-            sub={focusRow ? `signal: ${fmtSignalLabel(focusRow.signals?.leadTimeSignal)}` : (snapshotLoading ? 'loading…' : 'pending capture')}
-            color={focusRow ? INV_FLAG_COLOR[focusRow.signals?.leadTimeSignal] : '#e0eaf8'}
+            label="In-stock parts"
+            value={inStock}
+            sub={total ? `${Math.round((inStock / Math.max(1, total)) * 100)}% of universe` : 'pending capture'}
+            color={inStock > 0 ? '#4dffc3' : '#c4d4e8'}
           />
           <KpiCard
-            label="Lifecycle status"
-            value={lifecycle}
-            sub={focusRow ? `okay to order: ${focusRow.okayToOrder == null ? '—' : focusRow.okayToOrder ? 'yes' : 'no'}` : (snapshotLoading ? 'loading…' : 'pending capture')}
+            label="Out-of-stock parts"
+            value={outOfStock}
+            sub={total ? `${Math.round((outOfStock / Math.max(1, total)) * 100)}% of universe` : 'pending capture'}
+            color={outOfStock > 0 ? '#f0a84e' : '#c4d4e8'}
+          />
+          <KpiCard
+            label="Longest lead time"
+            value={longestLabel}
+            sub={longestSub}
+            color={longestLead ? '#f0a84e' : '#c4d4e8'}
+          />
+          <KpiCard
+            label="Baskets covered"
+            value={basketsCovered}
+            sub={`median lead ${medianLabel}${activeCount != null ? ` · ${activeCount} active` : ''}`}
             color="#c4d4e8"
           />
-          <KpiCard
-            label="Future inventory visibility"
-            value={futureLabel}
-            sub={futureSub}
-            color={futureCount > 0 ? '#4dffc3' : '#c4d4e8'}
-          />
-          <KpiCard
-            label="Pricing availability"
-            value={pricingLabel}
-            sub={pricingSub}
-            color={pricingColor}
-          />
         </div>
-        {snapshotError && !focusRow && (
+        {snapshotError && snapshotParts.length === 0 && (
           <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#f0a84e' }}>
-            {snapshotError} The latest snapshot will appear here once an operator runs a capture.
+            {snapshotError} The watched-parts inventory snapshot will appear here once an operator runs a capture.
           </div>
         )}
+      </div>
+
+      {/* ── Filter / search / sort (Phase 20D) ── */}
+      <div style={sectionWrap}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={tinyLabel}>Filter</div>
+          <select
+            value={basketFilter}
+            onChange={e => setBasketFilter(e.target.value)}
+            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3 }}
+          >
+            <option value="all">All baskets ({distinctBaskets.length})</option>
+            {distinctBaskets.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Search generic / orderable part"
+            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 240 }}
+          />
+          <span style={{ width: 10 }} />
+          <div style={tinyLabel}>Sort</div>
+          <select
+            value={sortBy}
+            onChange={e => setSortBy(e.target.value)}
+            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3 }}
+          >
+            <option value="basket">Basket</option>
+            <option value="quantityAvailable">Quantity available</option>
+            <option value="leadTimeWeeks">Lead time</option>
+            <option value="lifecycleStatus">Lifecycle</option>
+          </select>
+          <button
+            type="button"
+            onClick={() => setSortDir(d => d === 'asc' ? 'desc' : 'asc')}
+            style={{ background: 'transparent', border: '1px solid #1a2740', color: '#a0b8d0', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: 'pointer', fontFamily: 'monospace' }}
+          >
+            {sortDir === 'asc' ? '▲ asc' : '▼ desc'}
+          </button>
+          <span style={{ marginLeft: 'auto', fontSize: '0.66rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+            {filteredSnapshotParts.length} of {snapshotParts.length} watched parts shown
+          </span>
+        </div>
       </div>
 
       {/* ── Live inventory table ── */}
@@ -1198,7 +1292,14 @@ function InventoryPanel() {
                   </td>
                 </tr>
               )}
-              {snapshotParts.map((p, idx) => {
+              {snapshotParts.length > 0 && filteredSnapshotParts.length === 0 && (
+                <tr>
+                  <td colSpan={13} style={{ ...cellTD, color: '#7a96b8', fontStyle: 'italic', textAlign: 'center', padding: '14px 8px' }}>
+                    No watched parts match the current filter.
+                  </td>
+                </tr>
+              )}
+              {filteredSnapshotParts.map((p, idx) => {
                 const fiCount = p.futureInventoryVisibility?.forecastCount || 0;
                 const fiTxt = fiCount > 0 && p.futureInventoryVisibility?.nextForecastDate
                   ? `${Number(p.futureInventoryVisibility.nextForecastQuantity ?? 0).toLocaleString()} on ${p.futureInventoryVisibility.nextForecastDate}`

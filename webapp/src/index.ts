@@ -69,19 +69,15 @@ import {
   fetchWatchedPartsProductInfo,
   TI_WATCHED_PARTS,
   summarizeWatchedBaskets,
+  getWatchedPartsCaptureInputs,
+  WATCHED_PARTS_FALLBACK_SEED,
 } from './sources/tiWatchedParts'
 import {
   fetchTiPartSignal,
   readLatestInventorySnapshot,
   capturePublicInventorySnapshot,
+  summarizeInventorySnapshot,
 } from './sources/tiPartSignal'
-
-// Phase 20C.3 — small demo set captured into a public sanitized snapshot.
-// Currently one verified part; the array is the single source of truth so
-// adding more rows later only requires editing this one place.
-const TI_PUBLIC_INVENTORY_SET: Array<{ partNumber: string; basket: string | null }> = [
-  { partNumber: 'AFE7799IABJ', basket: 'Wireless Infra / RF' },
-]
 
 type Bindings = {
   MOUSER_API_KEY: string
@@ -1875,11 +1871,15 @@ app.get('/api/ti/part-signal', async (c) => {
   })
 })
 
-// POST /api/ti/inventory/capture — auth-gated (Phase 20C.3).
-// Runs the part-signal merger over a small demo set (TI_PUBLIC_INVENTORY_SET)
-// and writes a sanitized snapshot to SOURCE_SNAPSHOTS_KV. The customer-facing
-// /api/ti/inventory/latest then serves that snapshot without ever needing a
-// secret. Capture is the only path that hits TI; latest only reads KV.
+// POST /api/ti/inventory/capture — auth-gated (Phase 20D).
+// Iterates the watched-parts universe (webapp/src/sources/tiWatchedParts.ts),
+// fetches each via the part-signal merger, and writes the sanitized array
+// to SOURCE_SNAPSHOTS_KV. Per-row failures never abort the run — every
+// input contributes a row carrying its own captureStatus + warnings. If the
+// watched-parts config is empty for any reason, falls back to the verified
+// AFE7799IABJ seed so the customer-facing Inventory tab is never blank.
+// NEVER returns the OAuth token, client id/secret, capture secret, or raw
+// Authorization headers.
 app.post('/api/ti/inventory/capture', async (c) => {
   const env = c.env
   if (!env.SNAPSHOT_CAPTURE_SECRET) {
@@ -1902,26 +1902,35 @@ app.post('/api/ti/inventory/capture', async (c) => {
       message: 'SOURCE_SNAPSHOTS_KV binding not set on this deployment.',
     })
   }
-  const entry = await capturePublicInventorySnapshot(env, env.SOURCE_SNAPSHOTS_KV, TI_PUBLIC_INVENTORY_SET)
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  // Defensive: getWatchedPartsCaptureInputs already returns the seed when
+  // the config is empty, but double-check here so a misconfigured deploy
+  // can never produce an empty snapshot.
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  const entry = await capturePublicInventorySnapshot(env, env.SOURCE_SNAPSHOTS_KV, inputs)
+  const summary = summarizeInventorySnapshot(entry.parts, TI_WATCHED_PARTS.length)
   return c.json({
     success: true,
     capturedAt: entry.capturedAt,
     partsCaptured: entry.parts.length,
+    summary,
     parts: entry.parts.map(p => ({
       partNumber: p.partNumber,
       genericPartNumber: p.genericPartNumber,
       basket: p.basket,
+      captureStatus: p.captureStatus,
       supplyStatus: p.signals.supplyStatus,
       sourceConfidence: p.signals.sourceConfidence,
     })),
   })
 })
 
-// GET /api/ti/inventory/latest — public, no secret required (Phase 20C.3).
-// Serves the sanitized inventory snapshot for the customer-facing Inventory
-// tab. Returns ONLY the public shape: no datasheet URL, no warnings, no
-// raw quality/parametric blobs, no pricing-break numbers, and no token /
-// header / secret-bearing fields. The capture endpoint is the only writer.
+// GET /api/ti/inventory/latest — public, no secret required (Phase 20D).
+// Serves the sanitized watched-parts inventory snapshot for the customer-
+// facing Inventory tab. Returns ONLY the public shape — no datasheet URL,
+// no raw quality/parametric blobs, no pricing-break numbers, no tokens,
+// no secrets, no Authorization headers. The capture endpoint is the only
+// writer; this endpoint only reads from KV and computes the summary.
 app.get('/api/ti/inventory/latest', async (c) => {
   const env = c.env
   if (!env.SOURCE_SNAPSHOTS_KV) {
@@ -1930,6 +1939,7 @@ app.get('/api/ti/inventory/latest', async (c) => {
       status: 'snapshot_storage_not_configured',
       capturedAt: null,
       parts: [],
+      summary: summarizeInventorySnapshot([], TI_WATCHED_PARTS.length),
     })
   }
   const entry = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
@@ -1939,14 +1949,17 @@ app.get('/api/ti/inventory/latest', async (c) => {
       status: 'no_snapshot',
       capturedAt: null,
       parts: [],
+      summary: summarizeInventorySnapshot([], TI_WATCHED_PARTS.length),
       note: 'Inventory snapshot has not been captured yet. Operator: POST /api/ti/inventory/capture with X-Capture-Secret.',
     })
   }
+  const summary = summarizeInventorySnapshot(entry.parts, TI_WATCHED_PARTS.length)
   return c.json({
     configured: true,
     status: 'ok',
     capturedAt: entry.capturedAt,
     parts: entry.parts,
+    summary,
   })
 })
 

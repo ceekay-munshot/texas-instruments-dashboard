@@ -417,6 +417,46 @@ export function summarizeWatchedBaskets(): WatchedBasketSummary[] {
   return Array.from(buckets.values())
 }
 
+// ── Phase 20D — Inventory snapshot capture adapter ──────────────────────────
+// Translates the static watched-parts universe into the input shape consumed
+// by the public-inventory snapshot capture in tiPartSignal.ts. Kept thin so
+// the capture pipeline remains the single source of truth for sanitization.
+
+export type WatchedPartCaptureSeed = {
+  partNumber: string
+  basket: string
+  displayName: string
+  thesisReason: string
+  demandProxyType: string
+  dashboardPriority: DashboardPriority
+  genericPartNumberHint: string
+}
+
+export const WATCHED_PARTS_FALLBACK_SEED: WatchedPartCaptureSeed = {
+  partNumber: 'AFE7799IABJ',
+  basket: WATCHED_BASKET_LABEL.wireless_infra_rf,
+  displayName: 'AFE7799 Wireless Infra AFE',
+  thesisReason: 'Quad-channel transceiver AFE — purpose-built for 5G massive-MIMO radios. Direct read on wireless infra capex through TI.',
+  demandProxyType: 'wireless_5g_buildout',
+  dashboardPriority: 'high',
+  genericPartNumberHint: 'AFE7799',
+}
+
+export function getWatchedPartsCaptureInputs(): WatchedPartCaptureSeed[] {
+  if (!Array.isArray(TI_WATCHED_PARTS) || TI_WATCHED_PARTS.length === 0) {
+    return [WATCHED_PARTS_FALLBACK_SEED]
+  }
+  return TI_WATCHED_PARTS.map(p => ({
+    partNumber: p.preferredOrderablePartNumber,
+    basket: WATCHED_BASKET_LABEL[p.basket],
+    displayName: p.displayName,
+    thesisReason: p.thesisReason,
+    demandProxyType: p.demandProxyType,
+    dashboardPriority: p.dashboardPriority,
+    genericPartNumberHint: p.genericPartNumber,
+  }))
+}
+
 // ── Normalized product metadata response shape ──────────────────────────────
 // One row per watched part. Mirrors the spec in the Phase 20B brief: only
 // the public, non-pricing fields exposed by the Product Information API.

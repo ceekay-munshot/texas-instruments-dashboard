@@ -204,11 +204,18 @@ export async function fetchTiPartSignal(env: TiEnv, partNumber: string): Promise
 // numbers are commercially sensitive and stay behind the auth-gated
 // /api/ti/part-signal endpoint.
 
+export type WatchedPartCaptureStatus = 'ok' | 'partial' | 'failed' | 'pending_approval'
+
 export type TiPartSignalPublic = {
   partNumber: string
   genericPartNumber: string | null
   description: string | null
   basket: string | null
+  /** Phase 20D — investor-facing fields propagated from the watched-parts catalog. */
+  displayName?: string | null
+  thesisReason?: string | null
+  demandProxyType?: string | null
+  dashboardPriority?: 'high' | 'medium' | 'low' | null
   quantityAvailable: number | null
   pricingAvailability: 'available' | 'unavailable' | 'pending_approval' | 'unknown'
   orderLimit: number | null
@@ -227,6 +234,13 @@ export type TiPartSignalPublic = {
     leadTimeSignal: PartSignalLeadTimeFlag
     sourceConfidence: PartSignalSourceConfidence
   }
+  /** Phase 20D — per-row capture outcome. `ok` = both APIs returned; `partial`
+   *  = one side ok, the other not; `failed` = both failed; `pending_approval`
+   *  = Store API not yet enabled for this deployment. */
+  captureStatus: WatchedPartCaptureStatus
+  /** Phase 20D — sanitized per-row warnings, prefixed by sub-source. Never
+   *  contains tokens, secrets, or raw response bodies. */
+  captureWarnings: string[]
   fetchedAt: string
   sources: {
     productInfo: { label: string; status: TiProductInfo['status'] }
@@ -234,19 +248,49 @@ export type TiPartSignalPublic = {
   }
 }
 
-/** Build the public snapshot shape from the merged signal. `basket` is taken
- *  from a caller-supplied catalog hint (the watched-parts module) since the
- *  Product Information API does not return a basket label. */
+export type WatchedPartCatalogHint = {
+  basket: string | null
+  displayName?: string | null
+  thesisReason?: string | null
+  demandProxyType?: string | null
+  dashboardPriority?: 'high' | 'medium' | 'low' | null
+  /** When the watched-parts catalog has a generic part number for this entry,
+   *  surface it on the public row even if Product Info itself didn't return
+   *  one. This makes generic-part filtering robust. */
+  genericPartNumberHint?: string | null
+}
+
+function classifyCaptureStatus(signal: TiPartSignal): WatchedPartCaptureStatus {
+  const productOk = signal.sources.productInfo.status === 'ok'
+  const invOk = signal.sources.inventoryPricing.status === 'ok'
+  const invPending = signal.sources.inventoryPricing.status === 'pending_approval'
+  if (productOk && invOk) return 'ok'
+  if (productOk && invPending) return 'pending_approval'
+  if (productOk || invOk) return 'partial'
+  return 'failed'
+}
+
+/** Build the public snapshot shape from the merged signal. `basket` and the
+ *  optional investor-thesis fields are taken from the caller-supplied catalog
+ *  hint (the watched-parts module) since the TI Product Information API does
+ *  not return any basket / thesis / priority metadata. */
 export function toPublicPartSignal(
   signal: TiPartSignal,
-  basket: string | null = null,
+  hint: WatchedPartCatalogHint | string | null = null,
 ): TiPartSignalPublic {
   const futureRows = signal.futureInventory ?? []
+  const h: WatchedPartCatalogHint = typeof hint === 'string' || hint === null
+    ? { basket: hint as string | null }
+    : hint
   return {
     partNumber: signal.resolvedPartNumber ?? signal.requestedPartNumber,
-    genericPartNumber: signal.genericPartNumber,
+    genericPartNumber: signal.genericPartNumber ?? h.genericPartNumberHint ?? null,
     description: signal.description,
-    basket,
+    basket: h.basket ?? null,
+    displayName: h.displayName ?? null,
+    thesisReason: h.thesisReason ?? null,
+    demandProxyType: h.demandProxyType ?? null,
+    dashboardPriority: h.dashboardPriority ?? null,
     quantityAvailable: signal.quantityAvailable,
     pricingAvailability: signal.signals.pricingSignal,
     orderLimit: signal.orderLimit,
@@ -259,6 +303,8 @@ export function toPublicPartSignal(
     lifecycleStatus: signal.lifecycleStatus,
     okayToOrder: signal.okayToOrder,
     signals: signal.signals,
+    captureStatus: classifyCaptureStatus(signal),
+    captureWarnings: signal.warnings ?? [],
     fetchedAt: signal.fetchedAt,
     sources: signal.sources,
   }
@@ -299,20 +345,72 @@ export async function writeLatestInventorySnapshot(
   await kv.put(INVENTORY_LATEST_KEY, JSON.stringify(entry))
 }
 
-/** Captures the customer-facing demo set: a small list of OPNs (currently
- *  just AFE7799IABJ per Phase 20C.3 spec). Each part is fetched through the
- *  authenticated part-signal merger, sanitized into the public shape, and
- *  the bundle is written to KV under a single "latest" key. The capture
- *  result is also returned so the operator endpoint can echo the outcome. */
+export type WatchedPartCaptureInput = {
+  partNumber: string
+} & WatchedPartCatalogHint
+
+/** Captures the customer-facing watched-parts universe (Phase 20D). Each
+ *  part is fetched through the authenticated part-signal merger, sanitized
+ *  into the public shape, and the bundle is written to KV under a single
+ *  "latest" key. Per-row failures never abort the run — every input
+ *  contributes a row carrying its captureStatus and warnings. */
 export async function capturePublicInventorySnapshot(
   env: TiEnv,
   kv: InventorySnapshotKV,
-  parts: Array<{ partNumber: string; basket: string | null }>,
+  parts: WatchedPartCaptureInput[],
 ): Promise<InventorySnapshotEntry> {
   const collected: TiPartSignalPublic[] = []
-  for (const p of parts) {
-    const signal = await fetchTiPartSignal(env, p.partNumber)
-    collected.push(toPublicPartSignal(signal, p.basket))
+  // Sequential fetch keeps us comfortably under TI's per-app rate budget.
+  // The watched universe is currently 32 parts; a small inter-call gap also
+  // gives the OAuth token cache time to settle on retries.
+  const INTER_CALL_DELAY_MS = 100
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0 && INTER_CALL_DELAY_MS > 0) {
+      await new Promise(r => setTimeout(r, INTER_CALL_DELAY_MS))
+    }
+    const p = parts[i]
+    let publicRow: TiPartSignalPublic
+    try {
+      const signal = await fetchTiPartSignal(env, p.partNumber)
+      publicRow = toPublicPartSignal(signal, p)
+    } catch (e: any) {
+      // Defensive — fetchTiPartSignal already returns sanitized failures
+      // on its own, so this branch should be rare. Convert anything thrown
+      // into a synthetic failed row so the snapshot stays uniform.
+      const message = typeof e?.message === 'string' ? e.message : 'capture exception'
+      publicRow = {
+        partNumber: p.partNumber,
+        genericPartNumber: p.genericPartNumberHint ?? null,
+        description: null,
+        basket: p.basket ?? null,
+        displayName: p.displayName ?? null,
+        thesisReason: p.thesisReason ?? null,
+        demandProxyType: p.demandProxyType ?? null,
+        dashboardPriority: p.dashboardPriority ?? null,
+        quantityAvailable: null,
+        pricingAvailability: 'unknown',
+        orderLimit: null,
+        futureInventoryVisibility: { forecastCount: 0, nextForecastDate: null, nextForecastQuantity: null },
+        leadTimeWeeks: null,
+        lifecycleStatus: null,
+        okayToOrder: null,
+        signals: {
+          supplyStatus: 'unknown',
+          inventorySignal: 'unknown',
+          pricingSignal: 'unknown',
+          leadTimeSignal: 'unknown',
+          sourceConfidence: 'none',
+        },
+        captureStatus: 'failed',
+        captureWarnings: [`exception:${message.slice(0, 120)}`],
+        fetchedAt: new Date().toISOString(),
+        sources: {
+          productInfo: { label: 'Texas Instruments Product Information API', status: 'error' },
+          inventoryPricing: { label: 'Texas Instruments Store Inventory & Pricing API', status: 'error' },
+        },
+      }
+    }
+    collected.push(publicRow)
   }
   const entry: InventorySnapshotEntry = {
     capturedAt: new Date().toISOString(),
@@ -320,4 +418,82 @@ export async function capturePublicInventorySnapshot(
   }
   await writeLatestInventorySnapshot(kv, entry)
   return entry
+}
+
+// ── Phase 20D — public snapshot summary ─────────────────────────────────────
+
+export type InventorySnapshotSummary = {
+  totalParts: number
+  capturedParts: number
+  failedParts: number
+  inStockParts: number
+  outOfStockParts: number
+  activeParts: number
+  medianLeadTimeWeeks: number | null
+  longestLeadTimePart: { partNumber: string; leadTimeWeeks: number } | null
+  basketsCovered: number
+  latestFetchedAt: string | null
+}
+
+const ACTIVE_LIFECYCLE_LITERALS = new Set(['ACTIVE', 'PRODUCTION', 'PRODUCT', 'AVAILABLE'])
+function isActiveLifecycle(lc: string | null | undefined): boolean {
+  if (!lc) return false
+  const u = String(lc).trim().toUpperCase()
+  if (ACTIVE_LIFECYCLE_LITERALS.has(u)) return true
+  return u.startsWith('ACTIVE')
+}
+
+function median(numbers: number[]): number | null {
+  if (!numbers || numbers.length === 0) return null
+  const sorted = [...numbers].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  if (sorted.length % 2 === 0) {
+    return Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 10) / 10
+  }
+  return sorted[mid]
+}
+
+export function summarizeInventorySnapshot(
+  parts: TiPartSignalPublic[],
+  totalWatched?: number,
+): InventorySnapshotSummary {
+  const totalParts = typeof totalWatched === 'number' ? totalWatched : parts.length
+  let capturedParts = 0
+  let failedParts = 0
+  let inStockParts = 0
+  let outOfStockParts = 0
+  let activeParts = 0
+  const leadTimes: number[] = []
+  let longest: { partNumber: string; leadTimeWeeks: number } | null = null
+  const baskets = new Set<string>()
+  let latestFetchedAt: string | null = null
+  for (const p of parts) {
+    if (p.captureStatus === 'failed') failedParts += 1
+    else capturedParts += 1
+    if (p.signals?.supplyStatus === 'in_stock') inStockParts += 1
+    if (p.signals?.supplyStatus === 'out_of_stock') outOfStockParts += 1
+    if (isActiveLifecycle(p.lifecycleStatus)) activeParts += 1
+    if (typeof p.leadTimeWeeks === 'number' && Number.isFinite(p.leadTimeWeeks)) {
+      leadTimes.push(p.leadTimeWeeks)
+      if (!longest || p.leadTimeWeeks > longest.leadTimeWeeks) {
+        longest = { partNumber: p.partNumber, leadTimeWeeks: p.leadTimeWeeks }
+      }
+    }
+    if (p.basket) baskets.add(p.basket)
+    if (p.fetchedAt && (!latestFetchedAt || p.fetchedAt > latestFetchedAt)) {
+      latestFetchedAt = p.fetchedAt
+    }
+  }
+  return {
+    totalParts,
+    capturedParts,
+    failedParts,
+    inStockParts,
+    outOfStockParts,
+    activeParts,
+    medianLeadTimeWeeks: median(leadTimes),
+    longestLeadTimePart: longest,
+    basketsCovered: baskets.size,
+    latestFetchedAt,
+  }
 }
