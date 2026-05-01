@@ -1004,7 +1004,15 @@ function InventoryPanel() {
     }
   }
 
-  async function refreshSnapshot() {
+  // ── Universe capture (Phase 20D.1) ─────────────────────────────────────
+  // The Cloudflare Worker can't reliably do all 32 parts in one invocation
+  // (subrequest cap), so the operator UI loops the batched endpoint with
+  // offset=0,8,16,24 and surfaces progress per batch. The server already
+  // merges each batch into the persistent snapshot, so a partial run is
+  // never lost.
+  const [captureProgress, setCaptureProgress] = useState(null);
+
+  async function captureUniverse() {
     if (!secret.trim()) {
       setError('Capture secret required.');
       return;
@@ -1012,26 +1020,57 @@ function InventoryPanel() {
     setBusy(true);
     setError(null);
     setCaptureNote(null);
+    setCaptureProgress({ done: 0, total: 32, totalCaptured: 0, totalFailed: 0, totalStale: 0 });
+    let offset = 0;
+    const limit = 8;
+    let total = 32;
+    let totalCaptured = 0;
+    let totalFailed = 0;
+    let totalStale = 0;
+    let lastCapturedAt = null;
     try {
-      const res = await fetch('/api/ti/inventory/capture', {
-        method: 'POST',
-        headers: { 'X-Capture-Secret': secret.trim() },
-      });
-      const json = await res.json().catch(() => null);
-      if (!json) {
-        setError(`Server returned ${res.status} (no JSON).`);
-      } else if (json.status === 'unauthorized') {
-        setError('Unauthorized — check the capture secret.');
-      } else if (json.status === 'capture_secret_not_configured') {
-        setError('Capture secret is not configured on the server.');
-      } else if (json.success) {
-        setCaptureNote(`Captured ${json.partsCaptured} part${json.partsCaptured === 1 ? '' : 's'} at ${new Date(json.capturedAt).toLocaleString()}`);
-        // Re-pull the public snapshot so the table updates immediately.
-        const fresh = await fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null).catch(() => null);
-        if (fresh) setSnapshot(fresh);
-      } else {
-        setError(`Capture failed: ${json.status || 'unknown'}`);
+      while (offset < total) {
+        const url = `/api/ti/inventory/capture?offset=${offset}&limit=${limit}`;
+        const res = await fetch(url, { method: 'POST', headers: { 'X-Capture-Secret': secret.trim() } });
+        const json = await res.json().catch(() => null);
+        if (!json) {
+          setError(`Server returned ${res.status} (no JSON).`);
+          break;
+        }
+        if (json.status === 'unauthorized') {
+          setError('Unauthorized — check the capture secret.');
+          break;
+        }
+        if (json.status === 'capture_secret_not_configured') {
+          setError('Capture secret is not configured on the server.');
+          break;
+        }
+        if (!json.success) {
+          setError(`Batch failed at offset ${offset}: ${json.status || 'unknown'}`);
+          break;
+        }
+        total = typeof json.totalParts === 'number' ? json.totalParts : total;
+        totalCaptured += json.capturedThisBatch || 0;
+        totalFailed += json.failedThisBatch || 0;
+        totalStale += json.staleThisBatch || 0;
+        lastCapturedAt = json.capturedAt || lastCapturedAt;
+        const advanced = (json.offset ?? offset) + (json.attemptedThisBatch ?? limit);
+        offset = json.nextOffset == null ? total : json.nextOffset;
+        setCaptureProgress({
+          done: Math.min(advanced, total),
+          total,
+          totalCaptured,
+          totalFailed,
+          totalStale,
+        });
+        if (json.done) break;
       }
+      // Re-pull the public snapshot so the table reflects the merged state.
+      const fresh = await fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null).catch(() => null);
+      if (fresh) setSnapshot(fresh);
+      setCaptureNote(
+        `Captured ${totalCaptured}/${total} parts${totalFailed > 0 ? ` · ${totalFailed} failed` : ''}${totalStale > 0 ? ` · ${totalStale} stale (kept last good)` : ''}${lastCapturedAt ? ` · ${new Date(lastCapturedAt).toLocaleString()}` : ''}`
+      );
     } catch (e) {
       setError(e?.message || 'Failed to reach server.');
     } finally {
@@ -1308,17 +1347,40 @@ function InventoryPanel() {
                 const ol = p.orderLimit == null ? '—' : Number(p.orderLimit).toLocaleString();
                 const lt = p.leadTimeWeeks == null ? '—' : `${p.leadTimeWeeks} wk`;
                 const ok = p.okayToOrder == null ? '—' : p.okayToOrder ? 'yes' : 'no';
-                const fetched = p.fetchedAt ? new Date(p.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+                // Phase 20D.1 — failed-now / stale classification.
+                const latest = p.latestCaptureStatus ?? p.captureStatus;
+                const isFailed = latest === 'failed';
+                const isStale = !!p.stale;
+                const lastGood = p.lastGoodFetchedAt
+                  ? new Date(p.lastGoodFetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+                  : null;
+                const fetchedRaw = p.fetchedAt ? new Date(p.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+                const fetched = isStale && lastGood ? `${lastGood} (stale)` : fetchedRaw;
                 const conf = p.signals?.sourceConfidence;
                 const pricingTxt = p.pricingAvailability === 'available' ? 'Available'
                   : p.pricingAvailability === 'unavailable' ? 'Not posted'
                   : p.pricingAvailability === 'pending_approval' ? 'Pending approval'
                   : '—';
+                // When the latest capture failed and we have NO prior good
+                // values, every numeric cell renders as a single "Capture
+                // failed — retry" indicator anchored on the quantity column;
+                // other numeric cells stay '—'. When the row is stale we
+                // keep the prior values but tag the source column.
+                const sourceLabel = isFailed && !isStale
+                  ? <span style={{ color: '#f05c5c' }}>Capture failed — retry{p.failureStage ? ` · ${p.failureStage}` : ''}{p.httpStatus != null ? ` · HTTP ${p.httpStatus}` : ''}</span>
+                  : isStale
+                    ? <span style={{ color: '#f0a84e' }}>Capture failed — retry · showing last good{p.failureStage ? ` · ${p.failureStage}` : ''}</span>
+                    : <span>TI Product Info + Store I&P · {fmtSignalLabel(conf)}</span>;
+                const rowBg = isFailed && !isStale ? '#1a0d10' : isStale ? '#1a1408' : undefined;
                 return (
-                  <tr key={`snap-${p.partNumber || ''}-${idx}`}>
+                  <tr key={`snap-${p.partNumber || ''}-${idx}`} style={rowBg ? { background: rowBg } : undefined}>
                     <td style={{ ...cellTD, color: '#a0b8d0' }}>{p.basket || '—'}</td>
                     <td style={cellMono}>{p.genericPartNumber || '—'}</td>
-                    <td style={cellMono}>{p.partNumber || '—'}</td>
+                    <td style={cellMono}>
+                      {p.partNumber || '—'}
+                      {isStale && <sup style={{ color: '#f0a84e', marginLeft: 4, fontSize: '0.55rem' }}>stale</sup>}
+                      {isFailed && !isStale && <sup style={{ color: '#f05c5c', marginLeft: 4, fontSize: '0.55rem' }}>failed</sup>}
+                    </td>
                     <td style={{ ...cellTD, maxWidth: 280 }}>{p.description || '—'}</td>
                     <td style={{ ...cellMono, color: INV_FLAG_COLOR[p.signals?.inventorySignal] || '#c4d4e8' }}>{qtyTxt}</td>
                     <td style={cellMono}>{pricingTxt}</td>
@@ -1327,9 +1389,9 @@ function InventoryPanel() {
                     <td style={{ ...cellMono, color: INV_FLAG_COLOR[p.signals?.leadTimeSignal] || '#c4d4e8' }}>{lt}</td>
                     <td style={cellMono}>{p.lifecycleStatus || '—'}</td>
                     <td style={cellMono}>{ok}</td>
-                    <td style={{ ...cellMono, color: '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
-                    <td style={{ ...cellTD, color: INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
-                      TI Product Info + Store I&P · {fmtSignalLabel(conf)}
+                    <td style={{ ...cellMono, color: isStale ? '#f0a84e' : '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
+                    <td style={{ ...cellTD, color: isFailed ? '#f05c5c' : INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
+                      {sourceLabel}
                     </td>
                   </tr>
                 );
@@ -1408,10 +1470,21 @@ function InventoryPanel() {
               >{showSecret ? 'hide' : 'show'}</button>
               <button
                 type="button"
-                onClick={refreshSnapshot}
+                onClick={captureUniverse}
                 disabled={busy || !secret.trim()}
                 style={{ background: busy ? '#1a2740' : '#0f2540', border: '1px solid #2c4a70', color: '#e0eaf8', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() ? 'not-allowed' : 'pointer' }}
-              >{busy ? 'Working…' : 'Capture snapshot'}</button>
+              >{busy ? 'Capturing…' : 'Capture watched universe'}</button>
+              {captureProgress && (
+                <span style={{ fontSize: '0.7rem', color: '#a0b8d0', fontFamily: 'monospace' }}>
+                  {captureProgress.done}/{captureProgress.total}
+                  {captureProgress.totalFailed > 0 && (
+                    <span style={{ color: '#f0a84e' }}> · {captureProgress.totalFailed} failed</span>
+                  )}
+                  {captureProgress.totalStale > 0 && (
+                    <span style={{ color: '#7a96b8' }}> · {captureProgress.totalStale} stale</span>
+                  )}
+                </span>
+              )}
               <span style={{ width: 12 }} />
               <input
                 type="text"

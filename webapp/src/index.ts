@@ -75,7 +75,8 @@ import {
 import {
   fetchTiPartSignal,
   readLatestInventorySnapshot,
-  capturePublicInventorySnapshot,
+  captureWatchedPartsBatch,
+  captureAllWatchedPartsInternal,
   summarizeInventorySnapshot,
 } from './sources/tiPartSignal'
 
@@ -1871,15 +1872,22 @@ app.get('/api/ti/part-signal', async (c) => {
   })
 })
 
-// POST /api/ti/inventory/capture — auth-gated (Phase 20D).
-// Iterates the watched-parts universe (webapp/src/sources/tiWatchedParts.ts),
-// fetches each via the part-signal merger, and writes the sanitized array
-// to SOURCE_SNAPSHOTS_KV. Per-row failures never abort the run — every
-// input contributes a row carrying its own captureStatus + warnings. If the
-// watched-parts config is empty for any reason, falls back to the verified
-// AFE7799IABJ seed so the customer-facing Inventory tab is never blank.
+// POST /api/ti/inventory/capture — auth-gated (Phase 20D.1, batched).
+// Iterates a SLICE of the watched-parts universe and merges the result into
+// the existing snapshot. Cloudflare Workers cap each invocation at ~50–100
+// outbound subrequests, and the part-signal merger can spend up to four
+// subrequests per part (token, product info basic, product info extended,
+// store inventory). 32 parts × 4 ≈ 128 subrequests, comfortably over the
+// budget — so this endpoint defaults to limit=8 and the operator UI calls
+// it sequentially with offset=0,8,16,24 to cover the full universe.
+//
+// Per-row failures never abort the batch. When a row's most recent attempt
+// fails but a prior good row exists in KV, the prior values are preserved
+// and the row is marked stale so customers still see the last known state.
+//
 // NEVER returns the OAuth token, client id/secret, capture secret, or raw
-// Authorization headers.
+// Authorization headers. Per-row diagnostics expose only sanitized HTTP
+// status numbers, sanitized failure codes, and a coarse failureStage tag.
 app.post('/api/ti/inventory/capture', async (c) => {
   const env = c.env
   if (!env.SNAPSHOT_CAPTURE_SECRET) {
@@ -1903,25 +1911,88 @@ app.post('/api/ti/inventory/capture', async (c) => {
     })
   }
   const watchedInputs = getWatchedPartsCaptureInputs()
-  // Defensive: getWatchedPartsCaptureInputs already returns the seed when
-  // the config is empty, but double-check here so a misconfigured deploy
-  // can never produce an empty snapshot.
   const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
-  const entry = await capturePublicInventorySnapshot(env, env.SOURCE_SNAPSHOTS_KV, inputs)
-  const summary = summarizeInventorySnapshot(entry.parts, TI_WATCHED_PARTS.length)
+
+  // Accept both `offset`+`limit` and `cursor` for forward-compat.
+  const offsetParam = c.req.query('offset') ?? c.req.query('cursor') ?? '0'
+  const limitParam = c.req.query('limit') ?? '8'
+  const offset = Math.max(0, parseInt(offsetParam, 10) || 0)
+  const limit = Math.max(1, Math.min(parseInt(limitParam, 10) || 8, 16))
+
+  const batch = await captureWatchedPartsBatch(env, env.SOURCE_SNAPSHOTS_KV, inputs, offset, limit)
+  const merged = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
+  const summary = summarizeInventorySnapshot(merged?.parts ?? [], inputs.length)
   return c.json({
     success: true,
-    capturedAt: entry.capturedAt,
-    partsCaptured: entry.parts.length,
+    totalParts: batch.totalParts,
+    attemptedThisBatch: batch.attemptedThisBatch,
+    capturedThisBatch: batch.capturedThisBatch,
+    failedThisBatch: batch.failedThisBatch,
+    staleThisBatch: batch.staleThisBatch,
+    offset: batch.offset,
+    limit: batch.limit,
+    nextOffset: batch.nextOffset,
+    done: batch.done,
+    capturedAt: batch.capturedAt,
     summary,
-    parts: entry.parts.map(p => ({
-      partNumber: p.partNumber,
-      genericPartNumber: p.genericPartNumber,
-      basket: p.basket,
-      captureStatus: p.captureStatus,
-      supplyStatus: p.signals.supplyStatus,
-      sourceConfidence: p.signals.sourceConfidence,
-    })),
+  })
+})
+
+// POST /api/ti/inventory/capture-all — auth-gated (Phase 20D.1).
+// Convenience wrapper that orchestrates sequential batches inside a single
+// Worker invocation when subrequest budget allows. If the platform throws
+// (subrequest cap, CPU time, etc.) we stop early and return the cumulative
+// progress; the operator UI then continues with explicit batched calls
+// from `nextOffset`. NEVER exposes secrets or raw TI bodies.
+app.post('/api/ti/inventory/capture-all', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false,
+      status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return c.json({
+      success: false,
+      status: 'snapshot_storage_not_configured',
+      message: 'SOURCE_SNAPSHOTS_KV binding not set on this deployment.',
+    })
+  }
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  // Conservative defaults so we stay well under the Worker subrequest cap on
+  // every plan tier. 4 batches × 8 parts × ~4 subrequests = ~128 subrequests
+  // total; if that's still too much for this deployment, the orchestrator
+  // returns early and the operator UI continues with explicit batched calls.
+  const limitParam = c.req.query('limit') ?? '8'
+  const maxBatchesParam = c.req.query('maxBatches') ?? '4'
+  const limit = Math.max(1, Math.min(parseInt(limitParam, 10) || 8, 16))
+  const maxBatches = Math.max(1, Math.min(parseInt(maxBatchesParam, 10) || 4, 8))
+  const result = await captureAllWatchedPartsInternal(env, env.SOURCE_SNAPSHOTS_KV, inputs, {
+    batchLimit: limit,
+    maxBatches,
+  })
+  const merged = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
+  const summary = summarizeInventorySnapshot(merged?.parts ?? [], inputs.length)
+  return c.json({
+    success: true,
+    totalParts: result.totalParts,
+    batches: result.batches,
+    nextOffset: result.nextOffset,
+    done: result.done,
+    capturedAt: result.capturedAt,
+    summary,
+    note: result.done
+      ? 'Watched-parts universe captured in a single Worker invocation.'
+      : 'Worker stopped early to stay under platform limits — call /api/ti/inventory/capture with the returned nextOffset to continue.',
   })
 })
 
