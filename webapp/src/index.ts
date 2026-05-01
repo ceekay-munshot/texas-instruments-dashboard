@@ -2927,4 +2927,193 @@ const COMBINED_EVIDENCE_NOTES = [
   'Canonical taxonomy has 28 subcategories.',
 ] as const
 
-export default app
+// ── Phase 21K — scheduled daily capture ─────────────────────────────────────
+// One cron tick handles one batch of 8 parts. Four ticks spaced 15 min apart
+// rotate through the watched universe so a single Worker invocation never
+// exceeds the subrequest cap. The manual operator capture endpoint is
+// untouched; the scheduled handler runs the exact same captureWatchedPartsBatch
+// path. Diagnostics (last run, status, rows inserted, backend, failures) are
+// persisted to KV under a known key so a public status endpoint can expose
+// them without leaking secrets.
+
+const SCHEDULED_CAPTURE_STATE_KEY = 'source-snapshots/texas_instruments/ti_direct_inventory/scheduled-capture/state'
+
+const SCHEDULED_OFFSET_BY_CRON: Record<string, number> = {
+  '0 4 * * *': 0,
+  '15 4 * * *': 8,
+  '30 4 * * *': 16,
+  '45 4 * * *': 24,
+}
+
+const SCHEDULED_BATCH_LIMIT = 8
+
+type ScheduledCaptureRunRecord = {
+  cron: string
+  scheduledAt: string
+  startedAt: string
+  finishedAt: string
+  offset: number
+  limit: number
+  attempted: number
+  captured: number
+  failed: number
+  stale: number
+  rowsInsertedToHistory: number
+  historyBackend: 'd1' | 'kv' | 'none'
+  historyErrors: string[]
+  status: 'ok' | 'partial' | 'error' | 'no_kv' | 'no_secret'
+  errorMessage: string | null
+}
+
+type ScheduledCaptureState = {
+  lastRunByCron: Record<string, ScheduledCaptureRunRecord>
+  lastRun: ScheduledCaptureRunRecord | null
+  cumulativeRowsInserted: number
+}
+
+async function readScheduledState(kv: SnapshotKV | undefined): Promise<ScheduledCaptureState> {
+  const empty: ScheduledCaptureState = {
+    lastRunByCron: {},
+    lastRun: null,
+    cumulativeRowsInserted: 0,
+  }
+  if (!kv) return empty
+  try {
+    const raw = await kv.get(SCHEDULED_CAPTURE_STATE_KEY)
+    if (!raw) return empty
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') {
+      return {
+        lastRunByCron: parsed.lastRunByCron && typeof parsed.lastRunByCron === 'object' ? parsed.lastRunByCron : {},
+        lastRun: parsed.lastRun ?? null,
+        cumulativeRowsInserted: typeof parsed.cumulativeRowsInserted === 'number' ? parsed.cumulativeRowsInserted : 0,
+      }
+    }
+  } catch { /* ignore */ }
+  return empty
+}
+
+async function writeScheduledState(kv: SnapshotKV, state: ScheduledCaptureState): Promise<void> {
+  try {
+    await kv.put(SCHEDULED_CAPTURE_STATE_KEY, JSON.stringify(state))
+  } catch { /* swallow — diagnostics are best-effort */ }
+}
+
+async function runScheduledCapture(env: Bindings, controller: { cron: string; scheduledTime: number }): Promise<ScheduledCaptureRunRecord> {
+  const startedAt = new Date().toISOString()
+  const offset = SCHEDULED_OFFSET_BY_CRON[controller.cron] ?? 0
+  const baseRecord: ScheduledCaptureRunRecord = {
+    cron: controller.cron,
+    scheduledAt: new Date(controller.scheduledTime).toISOString(),
+    startedAt,
+    finishedAt: startedAt,
+    offset,
+    limit: SCHEDULED_BATCH_LIMIT,
+    attempted: 0,
+    captured: 0,
+    failed: 0,
+    stale: 0,
+    rowsInsertedToHistory: 0,
+    historyBackend: 'none',
+    historyErrors: [],
+    status: 'error',
+    errorMessage: null,
+  }
+  if (!env.SOURCE_SNAPSHOTS_KV) {
+    return { ...baseRecord, status: 'no_kv', errorMessage: 'SOURCE_SNAPSHOTS_KV binding missing.' }
+  }
+  // Reuse the existing watched-universe inputs and the exact same capture
+  // path the operator UI uses — no new TI API surface, no new auth, no
+  // capture-all behavior.
+  const watchedInputs = getWatchedPartsCaptureInputs()
+  const inputs = watchedInputs.length > 0 ? watchedInputs : [WATCHED_PARTS_FALLBACK_SEED]
+  let batch
+  try {
+    batch = await captureWatchedPartsBatch(env, env.SOURCE_SNAPSHOTS_KV, inputs, offset, SCHEDULED_BATCH_LIMIT)
+  } catch (e: any) {
+    const msg = typeof e?.message === 'string' ? e.message.slice(0, 200) : 'capture exception'
+    return { ...baseRecord, status: 'error', errorMessage: msg }
+  }
+  const merged = await readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV)
+  const orderableSet = buildCurrentOrderableSet(inputs)
+  const filtered = filterSnapshotByOrderableSet(merged?.parts ?? [], orderableSet)
+  const sliceSet = new Set(inputs.slice(batch.offset, batch.offset + batch.attemptedThisBatch).map(p => p.partNumber.toUpperCase()))
+  const historyRows: HistoryRow[] = filtered.kept
+    .filter(p => sliceSet.has((p.partNumber || '').toUpperCase()))
+    .map(p => toHistoryRow(p, batch.capturedAt))
+  const history = await appendInventoryHistory(historyRows, {
+    d1: env.TI_INVENTORY_HISTORY_DB,
+    kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+  })
+  const finishedAt = new Date().toISOString()
+  return {
+    ...baseRecord,
+    finishedAt,
+    attempted: batch.attemptedThisBatch,
+    captured: batch.capturedThisBatch,
+    failed: batch.failedThisBatch,
+    stale: batch.staleThisBatch,
+    rowsInsertedToHistory: history.rowsAppended,
+    historyBackend: history.backend,
+    historyErrors: history.errors,
+    status: batch.failedThisBatch === 0 ? 'ok' : 'partial',
+    errorMessage: null,
+  }
+}
+
+// GET /api/ti/inventory/schedule/status — public, sanitized.
+// Reports the most recent run of the daily scheduled capture per cron, plus
+// a cumulative rows-inserted counter and the active history backend. No
+// secrets, no token, no raw TI bodies. Operators can poll this to confirm
+// the cron stack is firing without needing the operator-tools UI.
+app.get('/api/ti/inventory/schedule/status', async (c) => {
+  const env = c.env
+  const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
+  const cronList = Object.keys(SCHEDULED_OFFSET_BY_CRON)
+  const offsetsCovered = cronList.filter(k => !!state.lastRunByCron[k]).length
+  const lastRun = state.lastRun
+  const lastByCron = cronList.map(cron => ({
+    cron,
+    offset: SCHEDULED_OFFSET_BY_CRON[cron],
+    lastRun: state.lastRunByCron[cron] ?? null,
+  }))
+  return c.json({
+    success: true,
+    cronSchedule: cronList,
+    offsetsConfigured: cronList.length,
+    offsetsCovered,
+    lastScheduledCaptureAt: lastRun?.finishedAt ?? null,
+    lastScheduledCaptureStatus: lastRun?.status ?? null,
+    cumulativeRowsInserted: state.cumulativeRowsInserted,
+    backend: lastRun?.historyBackend ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
+    lastRunByCron: lastByCron,
+  })
+})
+
+export default {
+  fetch: app.fetch,
+  // Cloudflare invokes scheduled() with a ScheduledController exposing
+  // `cron` (the matched expression) and `scheduledTime` (epoch ms). We map
+  // the cron expression to one of the four watched-universe offsets and
+  // run a single batch — keeps the Worker invocation lean and never
+  // approaches the subrequest cap.
+  scheduled: async (
+    controller: { cron: string; scheduledTime: number },
+    env: Bindings,
+    ctx: { waitUntil: (p: Promise<unknown>) => void },
+  ) => {
+    const work = async () => {
+      const record = await runScheduledCapture(env, controller)
+      if (env.SOURCE_SNAPSHOTS_KV) {
+        const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
+        const next: ScheduledCaptureState = {
+          lastRunByCron: { ...state.lastRunByCron, [record.cron]: record },
+          lastRun: record,
+          cumulativeRowsInserted: (state.cumulativeRowsInserted || 0) + (record.rowsInsertedToHistory || 0),
+        }
+        await writeScheduledState(env.SOURCE_SNAPSHOTS_KV, next)
+      }
+    }
+    ctx.waitUntil(work())
+  },
+}

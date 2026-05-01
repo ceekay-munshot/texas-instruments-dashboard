@@ -20,5 +20,20 @@
       "database_name": "ti-inventory-history",
       "database_id": "17f3094d-37bf-4f1b-9f9a-aa5be1dfc9a2"
     }
-  ]
+  ],
+  // Phase 21K — daily scheduled capture. Each cron tick handles ONE batch
+  // of 8 parts (offsets 0, 8, 16, 24) so a single Worker invocation never
+  // exceeds the subrequest budget. The four ticks fire 15 min apart at
+  // 04:00–04:45 UTC and rotate through the watched universe deterministically;
+  // the scheduled handler reads the current cron expression and maps it to
+  // the right offset. The manual operator capture flow continues to work
+  // exactly as before.
+  "triggers": {
+    "crons": [
+      "0 4 * * *",
+      "15 4 * * *",
+      "30 4 * * *",
+      "45 4 * * *"
+    ]
+  }
 }

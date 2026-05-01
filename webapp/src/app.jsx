@@ -1276,12 +1276,23 @@ function InventoryPanel() {
         )}
       </div>
 
-      {/* ── Shortage / Oversupply Signals (Phase 21G) ── */}
+      {/* ── Shortage / Oversupply Signals (Phase 21G / 21K) ── */}
       {(() => {
         const sigSummary = signalsResp?.summary;
         const sigList = signalsResp?.signals || [];
         const meaningful = sigList.filter(s => s.signalType !== 'insufficient_history' && s.signalType !== 'normal');
         const insufficient = sigList.filter(s => s.signalType === 'insufficient_history').length;
+        // Phase 21K — history depth read-out so customers can see how close
+        // we are to having enough observations to leave insufficient_history.
+        const obsCounts = sigList.map(s => s.observationCount || 0);
+        const minObs = obsCounts.length > 0 ? Math.min(...obsCounts) : 0;
+        const maxObs = obsCounts.length > 0 ? Math.max(...obsCounts) : 0;
+        const sortedObs = [...obsCounts].sort((a, b) => a - b);
+        const medianObs = sortedObs.length > 0
+          ? (sortedObs.length % 2 === 0
+              ? (sortedObs[sortedObs.length / 2 - 1] + sortedObs[sortedObs.length / 2]) / 2
+              : sortedObs[(sortedObs.length - 1) / 2])
+          : 0;
         const sigColor = t => t === 'shortage_pressure' ? '#f05c5c'
           : t === 'oversupply_pressure' ? '#3d8ef0'
           : t === 'inventory_tightening' ? '#f0a84e'
@@ -1378,8 +1389,17 @@ function InventoryPanel() {
                 </table>
               </div>
             )}
-            <div style={{ marginTop: 8, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic' }}>
-              Signals require at least 3 captures per part. Capture failures are not counted as out-of-stock.
+            <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#a0b8d0', lineHeight: 1.5 }}>
+              Shortage / oversupply signals require at least 3 observations. Current history depth: {medianObs} observation{medianObs === 1 ? '' : 's'} per part
+              {minObs !== maxObs && (
+                <span style={{ color: '#7a96b8' }}> (range {minObs}–{maxObs})</span>
+              )}
+              {medianObs < 3 && (
+                <span style={{ color: '#7a96b8' }}> · {3 - Math.ceil(medianObs)} more daily capture{3 - Math.ceil(medianObs) === 1 ? '' : 's'} until classifications can fire</span>
+              )}.
+            </div>
+            <div style={{ marginTop: 4, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic' }}>
+              A daily scheduled capture runs at 04:00–04:45 UTC across four batches; manual captures from Operator tools also append to history. Capture failures are not counted as out-of-stock.
             </div>
           </div>
         );
