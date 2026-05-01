@@ -1,0 +1,149 @@
+name: TI Watched-Parts Inventory Capture
+
+# Daily scheduled capture of the TI watched-parts universe via the existing
+# /api/ti/inventory/capture endpoint. Phase 21K — see ti-snapshot-capture.yml
+# for the prior pattern this mirrors.
+#
+# Why GitHub Actions and not a wrangler.jsonc cron trigger:
+#   Cloudflare Pages projects ignore `triggers.crons` in wrangler.jsonc (it's
+#   a Workers-only field). The same project already uses a GitHub Actions
+#   workflow for the Mouser/Nexar daily snapshot, so we follow the same
+#   proven pattern here. The Workers-style scheduled() handler also exists
+#   in src/index.ts so the operator can wire Pages dashboard cron triggers
+#   for an in-Cloudflare schedule if they want a redundant timer.
+#
+# What it does (in order):
+#   POST /api/ti/inventory/capture?offset=0&limit=8
+#   POST /api/ti/inventory/capture?offset=8&limit=8
+#   POST /api/ti/inventory/capture?offset=16&limit=8
+#   POST /api/ti/inventory/capture?offset=24&limit=8
+#
+# Each POST captures one batch and merges into the persisted snapshot. The
+# server appends one history row per part to D1 on every batch. NEVER calls
+# /capture-all and NEVER calls /v2/store/products/catalog.
+#
+# Required GitHub Actions secret:
+#   SNAPSHOT_CAPTURE_SECRET — same secret used by ti-snapshot-capture.yml.
+#   It must match the Cloudflare Pages env var of the same name.
+
+on:
+  schedule:
+    - cron: '15 7 * * *'   # 07:15 UTC daily — runs ~15 min before the existing snapshot capture
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ti-inventory-capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    name: Capture watched-parts universe in 4 batches
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Validate SNAPSHOT_CAPTURE_SECRET is configured
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+        run: |
+          if [ -z "${CAPTURE_SECRET:-}" ]; then
+            echo "::error::Repository secret SNAPSHOT_CAPTURE_SECRET is not set."
+            echo "Add it under: Settings → Secrets and variables → Actions → New repository secret."
+            echo "It must match the same-named secret on the Cloudflare Pages project."
+            exit 1
+          fi
+          echo "Secret is configured (value not printed)."
+
+      - name: Run four watched-parts batches sequentially
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+        run: |
+          set -uo pipefail
+
+          OVERALL_FAILED=0
+          TOTAL_CAPTURED=0
+          TOTAL_FAILED=0
+
+          for OFF in 0 8 16 24; do
+            response_file="$(mktemp)"
+            url="${BASE_URL}/api/ti/inventory/capture?offset=${OFF}&limit=8"
+
+            echo "POST ${url}"
+
+            http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+              -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              "${url}")"
+
+            echo "  HTTP ${http_status}"
+
+            if ! jq -e . < "$response_file" > /dev/null 2>&1; then
+              echo "::error::Batch offset=${OFF} returned non-JSON (HTTP ${http_status})."
+              head -c 500 "$response_file" || true
+              OVERALL_FAILED=1
+              continue
+            fi
+
+            # Print only safe fields. Never echo the secret or any TI bodies.
+            jq -c '{
+              success, status, message,
+              offset, limit, attemptedThisBatch, capturedThisBatch,
+              failedThisBatch, staleThisBatch, nextOffset, done,
+              capturedAt,
+              summary: (.summary // {}),
+              "diagnostics.history": (.diagnostics.history // null)
+            }' < "$response_file"
+
+            success=$(jq -r '.success // empty' < "$response_file")
+            captured_this=$(jq -r '.capturedThisBatch // 0' < "$response_file")
+            failed_this=$(jq -r '.failedThisBatch // 0' < "$response_file")
+            status=$(jq -r '.status // empty' < "$response_file")
+
+            TOTAL_CAPTURED=$((TOTAL_CAPTURED + captured_this))
+            TOTAL_FAILED=$((TOTAL_FAILED + failed_this))
+
+            if [ "${success}" != "true" ]; then
+              case "${status}" in
+                unauthorized)
+                  echo "::error::Batch offset=${OFF} refused (unauthorized) — verify SNAPSHOT_CAPTURE_SECRET."
+                  OVERALL_FAILED=1
+                  ;;
+                snapshot_storage_not_configured)
+                  echo "::error::SOURCE_SNAPSHOTS_KV namespace is not bound on the Cloudflare Pages project."
+                  OVERALL_FAILED=1
+                  ;;
+                capture_secret_not_configured)
+                  echo "::error::SNAPSHOT_CAPTURE_SECRET is not set on the Cloudflare Pages project."
+                  OVERALL_FAILED=1
+                  ;;
+                *)
+                  echo "::warning::Batch offset=${OFF} returned success=${success} status=${status} http=${http_status}"
+                  OVERALL_FAILED=1
+                  ;;
+              esac
+            fi
+
+            # Light pacing between batches; mirrors the operator UI loop.
+            sleep 3
+          done
+
+          echo "Total captured across batches: ${TOTAL_CAPTURED}"
+          echo "Total failed   across batches: ${TOTAL_FAILED}"
+
+          if [ "${OVERALL_FAILED}" = "1" ]; then
+            exit 1
+          fi
+
+      - name: Verify post-capture state
+        env:
+          BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+        run: |
+          set -uo pipefail
+          curl -sS "${BASE_URL}/api/ti/inventory/latest" \
+            | jq -c '{status, capturedAt, summary}'
+          curl -sS "${BASE_URL}/api/ti/inventory/schedule/status" \
+            | jq -c '{success, lastScheduledCaptureAt, lastScheduledCaptureStatus, cumulativeRowsInserted, backend, offsetsCovered}'

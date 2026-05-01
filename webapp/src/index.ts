@@ -3061,6 +3061,27 @@ async function runScheduledCapture(env: Bindings, controller: { cron: string; sc
   }
 }
 
+// GET /api/ti/scheduled/status — Phase 21K backup route, also public.
+// Mirrors the canonical /api/ti/inventory/schedule/status payload at a
+// shorter path so the operator can quickly distinguish a deploy issue
+// from a routing issue. If only one of the two returns 200 we know the
+// router is fine; if both 404, the deploy itself didn't ship.
+app.get('/api/ti/scheduled/status', async (c) => {
+  const env = c.env
+  const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
+  const cronList = Object.keys(SCHEDULED_OFFSET_BY_CRON)
+  return c.json({
+    ok: true,
+    scheduledEnabled: true,
+    backend: state.lastRun?.historyBackend ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
+    cronsConfigured: cronList,
+    lastScheduledCaptureAt: state.lastRun?.finishedAt ?? null,
+    lastScheduledCaptureStatus: state.lastRun?.status ?? null,
+    cumulativeRowsInserted: state.cumulativeRowsInserted,
+    note: 'Mirror of /api/ti/inventory/schedule/status. Cloudflare Pages cron is wired via .github/workflows/ti-inventory-capture.yml — wrangler.jsonc triggers.crons is Workers-only and is intentionally not set here.',
+  })
+})
+
 // GET /api/ti/inventory/schedule/status — public, sanitized.
 // Reports the most recent run of the daily scheduled capture per cron, plus
 // a cumulative rows-inserted counter and the active history backend. No
