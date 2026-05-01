@@ -1956,6 +1956,25 @@ app.post('/api/ti/inventory/capture', async (c) => {
     kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
   })
 
+  // Phase 21K.2 — record this external capture (GitHub Actions or operator
+  // UI) into the same KV state /api/ti/inventory/schedule/status reads from,
+  // so cumulativeRowsInserted reflects total D1 history inserts regardless
+  // of which path drove them. Best-effort; KV failures never affect the
+  // capture response below.
+  await recordExternalCapture(env, {
+    source: classifyCaptureCallerSource(c.req.header('user-agent')),
+    finishedAt: batch.capturedAt,
+    offset: batch.offset,
+    limit: batch.limit,
+    attempted: batch.attemptedThisBatch,
+    captured: batch.capturedThisBatch,
+    failed: batch.failedThisBatch,
+    stale: batch.staleThisBatch,
+    rowsInsertedToHistory: history.rowsAppended,
+    historyBackend: history.backend,
+    status: batch.failedThisBatch === 0 ? 'ok' : 'partial',
+  })
+
   return c.json({
     success: true,
     totalParts: batch.totalParts,
@@ -2965,10 +2984,35 @@ type ScheduledCaptureRunRecord = {
   errorMessage: string | null
 }
 
+// Phase 21K.2 — external-runner capture record. The /api/ti/inventory/capture
+// endpoint is invoked by the GitHub Actions daily workflow and the operator
+// UI; both produce successful captures that should bump the cumulative row
+// counter. Tracking those alongside scheduled() runs gives the schedule/status
+// endpoint a complete picture of what's actually writing to D1.
+export type ExternalCaptureRunRecord = {
+  source: 'github_actions_daily' | 'operator_ui' | 'unknown_external'
+  finishedAt: string
+  offset: number
+  limit: number
+  attempted: number
+  captured: number
+  failed: number
+  stale: number
+  rowsInsertedToHistory: number
+  historyBackend: 'd1' | 'kv' | 'none'
+  status: 'ok' | 'partial' | 'error'
+}
+
 type ScheduledCaptureState = {
   lastRunByCron: Record<string, ScheduledCaptureRunRecord>
   lastRun: ScheduledCaptureRunRecord | null
   cumulativeRowsInserted: number
+  /** Phase 21K.2 — most recent external-runner capture (GitHub Actions or
+   *  operator UI). The `lastRun` field above stays scheduled-only so the
+   *  operator can distinguish in-Cloudflare cron from external sources. */
+  lastExternalRun: ExternalCaptureRunRecord | null
+  /** Per-source most-recent records for finer-grained diagnostics. */
+  lastExternalRunBySource: Record<string, ExternalCaptureRunRecord>
 }
 
 async function readScheduledState(kv: SnapshotKV | undefined): Promise<ScheduledCaptureState> {
@@ -2976,6 +3020,8 @@ async function readScheduledState(kv: SnapshotKV | undefined): Promise<Scheduled
     lastRunByCron: {},
     lastRun: null,
     cumulativeRowsInserted: 0,
+    lastExternalRun: null,
+    lastExternalRunBySource: {},
   }
   if (!kv) return empty
   try {
@@ -2987,6 +3033,10 @@ async function readScheduledState(kv: SnapshotKV | undefined): Promise<Scheduled
         lastRunByCron: parsed.lastRunByCron && typeof parsed.lastRunByCron === 'object' ? parsed.lastRunByCron : {},
         lastRun: parsed.lastRun ?? null,
         cumulativeRowsInserted: typeof parsed.cumulativeRowsInserted === 'number' ? parsed.cumulativeRowsInserted : 0,
+        lastExternalRun: parsed.lastExternalRun ?? null,
+        lastExternalRunBySource: parsed.lastExternalRunBySource && typeof parsed.lastExternalRunBySource === 'object'
+          ? parsed.lastExternalRunBySource
+          : {},
       }
     }
   } catch { /* ignore */ }
@@ -2997,6 +3047,44 @@ async function writeScheduledState(kv: SnapshotKV, state: ScheduledCaptureState)
   try {
     await kv.put(SCHEDULED_CAPTURE_STATE_KEY, JSON.stringify(state))
   } catch { /* swallow — diagnostics are best-effort */ }
+}
+
+/** Phase 21K.2 — record a successful external capture (GitHub Actions / UI)
+ *  into the same KV state the scheduled handler uses, so cumulativeRowsInserted
+ *  reflects total D1 history inserts regardless of which path drove them.
+ *  Best-effort: KV failures never break the capture response. */
+async function recordExternalCapture(
+  env: Bindings,
+  record: ExternalCaptureRunRecord,
+): Promise<void> {
+  if (!env.SOURCE_SNAPSHOTS_KV) return
+  try {
+    const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
+    const next: ScheduledCaptureState = {
+      ...state,
+      cumulativeRowsInserted: (state.cumulativeRowsInserted || 0) + (record.rowsInsertedToHistory || 0),
+      lastExternalRun: record,
+      lastExternalRunBySource: { ...state.lastExternalRunBySource, [record.source]: record },
+    }
+    await writeScheduledState(env.SOURCE_SNAPSHOTS_KV, next)
+  } catch { /* swallow */ }
+}
+
+/** Phase 21K.2 — heuristic to label the caller of /api/ti/inventory/capture.
+ *  GitHub Actions sets a recognizable User-Agent containing "GitHub-Hookshot"
+ *  / "actions" / "curl"; browser POSTs from Operator Tools come from the
+ *  app's fetch which has a Mozilla-style UA. Anything that doesn't match is
+ *  filed under unknown_external. The label is purely diagnostic — every
+ *  caller still has to satisfy the X-Capture-Secret check. */
+function classifyCaptureCallerSource(userAgent: string | undefined): ExternalCaptureRunRecord['source'] {
+  const ua = (userAgent || '').toLowerCase()
+  if (ua.includes('github') || ua.includes('actions') || (ua.includes('curl') && !ua.includes('mozilla'))) {
+    return 'github_actions_daily'
+  }
+  if (ua.includes('mozilla') || ua.includes('chrome') || ua.includes('safari') || ua.includes('firefox') || ua.includes('webkit')) {
+    return 'operator_ui'
+  }
+  return 'unknown_external'
 }
 
 async function runScheduledCapture(env: Bindings, controller: { cron: string; scheduledTime: number }): Promise<ScheduledCaptureRunRecord> {
@@ -3070,15 +3158,29 @@ app.get('/api/ti/scheduled/status', async (c) => {
   const env = c.env
   const state = await readScheduledState(env.SOURCE_SNAPSHOTS_KV)
   const cronList = Object.keys(SCHEDULED_OFFSET_BY_CRON)
+  // Phase 21K.2 — pick the most recent across in-Cloudflare scheduled runs
+  // and external runs (GitHub Actions / operator UI). The cumulativeRows
+  // counter spans both paths.
+  const scheduledAt = state.lastRun?.finishedAt ?? null
+  const externalAt = state.lastExternalRun?.finishedAt ?? null
+  const lastAt = scheduledAt && externalAt
+    ? (scheduledAt > externalAt ? scheduledAt : externalAt)
+    : (scheduledAt ?? externalAt)
   return c.json({
     ok: true,
     scheduledEnabled: true,
-    backend: state.lastRun?.historyBackend ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
+    backend: state.lastRun?.historyBackend
+      ?? state.lastExternalRun?.historyBackend
+      ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
     cronsConfigured: cronList,
-    lastScheduledCaptureAt: state.lastRun?.finishedAt ?? null,
+    lastCaptureAt: lastAt,
+    lastScheduledCaptureAt: scheduledAt,
     lastScheduledCaptureStatus: state.lastRun?.status ?? null,
+    lastExternalCaptureAt: externalAt,
+    lastExternalCaptureStatus: state.lastExternalRun?.status ?? null,
+    lastExternalCaptureSource: state.lastExternalRun?.source ?? null,
     cumulativeRowsInserted: state.cumulativeRowsInserted,
-    note: 'Mirror of /api/ti/inventory/schedule/status. Cloudflare Pages cron is wired via .github/workflows/ti-inventory-capture.yml — wrangler.jsonc triggers.crons is Workers-only and is intentionally not set here.',
+    note: 'Mirror of /api/ti/inventory/schedule/status. Cloudflare Pages cron is wired via .github/workflows/ti-inventory-capture.yml — wrangler.jsonc triggers.crons is Workers-only and is intentionally not set here. cumulativeRowsInserted counts D1 history inserts across all paths (scheduled handler + external runners).',
   })
 })
 
@@ -3098,15 +3200,29 @@ app.get('/api/ti/inventory/schedule/status', async (c) => {
     offset: SCHEDULED_OFFSET_BY_CRON[cron],
     lastRun: state.lastRunByCron[cron] ?? null,
   }))
+  // Phase 21K.2 — surface external-runner records alongside the scheduled
+  // ones so cumulativeRowsInserted has a clear breakdown by source.
+  const scheduledAt = lastRun?.finishedAt ?? null
+  const externalAt = state.lastExternalRun?.finishedAt ?? null
+  const overallAt = scheduledAt && externalAt
+    ? (scheduledAt > externalAt ? scheduledAt : externalAt)
+    : (scheduledAt ?? externalAt)
   return c.json({
     success: true,
     cronSchedule: cronList,
     offsetsConfigured: cronList.length,
     offsetsCovered,
-    lastScheduledCaptureAt: lastRun?.finishedAt ?? null,
+    lastCaptureAt: overallAt,
+    lastScheduledCaptureAt: scheduledAt,
     lastScheduledCaptureStatus: lastRun?.status ?? null,
+    lastExternalCaptureAt: externalAt,
+    lastExternalCaptureStatus: state.lastExternalRun?.status ?? null,
+    lastExternalCaptureSource: state.lastExternalRun?.source ?? null,
+    lastExternalRunBySource: state.lastExternalRunBySource,
     cumulativeRowsInserted: state.cumulativeRowsInserted,
-    backend: lastRun?.historyBackend ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
+    backend: lastRun?.historyBackend
+      ?? state.lastExternalRun?.historyBackend
+      ?? (env.TI_INVENTORY_HISTORY_DB ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'),
     lastRunByCron: lastByCron,
   })
 })
