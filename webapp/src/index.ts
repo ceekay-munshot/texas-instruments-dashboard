@@ -73,6 +73,7 @@ import {
   getWatchedPartsCaptureInputs,
   getValidatedWatchedParts,
   getStagedWatchedParts,
+  WATCHED_BASKET_LABEL,
   WATCHED_PARTS_FALLBACK_SEED,
 } from './sources/tiWatchedParts'
 import {
@@ -2227,6 +2228,318 @@ app.get('/api/ti/inventory/history', async (c) => {
     observationCount: rows.length,
     backend,
     rows,
+  })
+})
+
+// Phase 23A — GET /api/ti/inventory/trends?scope=universe|basket|subcategory|part
+// Public, sanitized, read-only. One endpoint feeds the four drill-down
+// scopes the Trends sub-tab supports. Server-side aggregates so the UI
+// doesn't have to re-derive medians / top-movers / time-series buckets
+// for 64 parts on every render.
+//
+// Query params:
+//   scope         universe | basket | subcategory | part   (required)
+//   basket        WatchedBasket key   (required when scope=basket|subcategory)
+//   subcategory   string              (required when scope=subcategory)
+//   partNumber    string              (required when scope=part)
+//   window        7d | 30d | 90d | all  (default 30d; 'all' clamps to 90d
+//                 since that's the per-part history endpoint's max)
+//
+// Aggregate scopes return: trackedParts, capturedParts, pricedParts,
+// inStockParts, outOfStockParts, stockoutRate, medianLeadTimeWeeks,
+// medianInventoryPctChange, medianPricePctChange, signal counts (from
+// persisted /signals/latest), timeSeries grouped by 5-minute bucket of
+// capturedAt, and four topMovers lists (largest inventory drops/builds,
+// largest price increases/decreases — top 5 each).
+//
+// Part scope returns: identifier metadata + latest/previous/delta for
+// inventory and price + the per-capture series so the UI can render an
+// exact line chart. The existing /history?partNumber=X endpoint stays
+// the simpler raw-rows feed; this one carries the derived deltas + the
+// persisted-signal explanation in one round trip.
+app.get('/api/ti/inventory/trends', async (c) => {
+  const env = c.env
+  const scope = (c.req.query('scope') || '').toLowerCase()
+  if (!['universe', 'basket', 'subcategory', 'part'].includes(scope)) {
+    return c.json({
+      success: false, status: 'invalid_payload',
+      message: 'scope must be one of: universe, basket, subcategory, part',
+    }, 400)
+  }
+  const windowParam = (c.req.query('window') || '30d').toLowerCase()
+  const days = windowParam === '7d' ? 7
+    : windowParam === '90d' ? 90
+    : windowParam === 'all' ? 90
+    : 30
+  const watched = getValidatedWatchedParts()
+  const basketLabelToKey = Object.fromEntries(
+    Object.entries(WATCHED_BASKET_LABEL).map(([key, label]) => [label, key]),
+  ) as Record<string, string>
+  const basketParam = (c.req.query('basket') || '').trim()
+  // Accept either the basket key (e.g. 'power_management') OR the human
+  // label (e.g. 'Power Management') so the UI doesn't have to translate.
+  const basketKey = basketParam in WATCHED_BASKET_LABEL
+    ? basketParam
+    : (basketLabelToKey[basketParam] ?? basketParam)
+  const subcategoryParam = (c.req.query('subcategory') || '').trim()
+  const partNumberParam = (c.req.query('partNumber') || '').trim()
+  // Resolve scope → in-scope WatchedPart subset.
+  let inScope = watched
+  if (scope === 'basket') {
+    if (!basketKey) {
+      return c.json({ success: false, status: 'invalid_payload', message: 'basket query param required for scope=basket' }, 400)
+    }
+    inScope = watched.filter(p => p.basket === basketKey)
+  } else if (scope === 'subcategory') {
+    if (!basketKey || !subcategoryParam) {
+      return c.json({ success: false, status: 'invalid_payload', message: 'basket and subcategory query params required for scope=subcategory' }, 400)
+    }
+    inScope = watched.filter(p => p.basket === basketKey && (p.subcategory ?? null) === subcategoryParam)
+  } else if (scope === 'part') {
+    if (!partNumberParam) {
+      return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required for scope=part' }, 400)
+    }
+    inScope = watched.filter(p => p.preferredOrderablePartNumber.toUpperCase() === partNumberParam.toUpperCase())
+    if (inScope.length === 0) {
+      return c.json({ success: false, status: 'not_in_universe', message: 'Part is not in the validated watched universe.' }, 404)
+    }
+  }
+  if (inScope.length === 0) {
+    return c.json({
+      success: true,
+      scope, basket: basketParam || null, subcategory: subcategoryParam || null,
+      partNumber: partNumberParam || null,
+      window: windowParam, windowDays: days,
+      backend: 'd1',
+      message: 'No watched parts matched the requested scope.',
+    })
+  }
+  // Read history for the in-scope OPNs in a single D1 round-trip.
+  const partNumbers = inScope.map(p => p.preferredOrderablePartNumber)
+  const history = await readUniverseHistoryByPart(partNumbers, {
+    d1: env.TI_INVENTORY_HISTORY_DB,
+    kv: env.SOURCE_SNAPSHOTS_KV as unknown as HistoryKV,
+    days,
+  })
+  // Pull persisted signals once; filter per-scope below.
+  const allPersisted = await getLatestSignalsFromD1(env.TI_INVENTORY_HISTORY_DB ?? null)
+  const persistedByOpn = new Map(allPersisted.map(s => [s.orderablePartNumber.toUpperCase(), s]))
+  const backend: 'd1' | 'kv' | 'none' = env.TI_INVENTORY_HISTORY_DB
+    ? 'd1' : env.SOURCE_SNAPSHOTS_KV ? 'kv' : 'none'
+
+  // ── Part scope ────────────────────────────────────────────────────────
+  if (scope === 'part') {
+    const part = inScope[0]
+    const opn = part.preferredOrderablePartNumber
+    const rows = (history.get(opn.toUpperCase()) ?? []).slice()
+    // Server side already returns rows ascending by capturedAt; double-sort defensively.
+    rows.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
+    const latest = rows[rows.length - 1] ?? null
+    const previous = rows.length >= 2 ? rows[rows.length - 2] : null
+    const sig = persistedByOpn.get(opn.toUpperCase()) ?? null
+    const series = rows.map(r => ({
+      capturedAt: r.capturedAt,
+      quantityAvailable: r.quantityAvailable,
+      normalizedUnitPrice: r.normalizedUnitPrice,
+      currency: r.currency,
+      leadTimeWeeks: r.leadTimeWeeks,
+      pricingAvailability: r.pricingAvailability,
+    }))
+    const invDelta = (latest?.quantityAvailable != null && previous?.quantityAvailable != null)
+      ? latest.quantityAvailable - previous.quantityAvailable : null
+    const invPctDelta = (latest?.quantityAvailable != null && previous?.quantityAvailable != null && previous.quantityAvailable !== 0)
+      ? ((latest.quantityAvailable - previous.quantityAvailable) / Math.abs(previous.quantityAvailable)) * 100
+      : (latest?.quantityAvailable === 0 && previous?.quantityAvailable === 0 ? 0 : null)
+    const priceDelta = (latest?.normalizedUnitPrice != null && previous?.normalizedUnitPrice != null)
+      ? latest.normalizedUnitPrice - previous.normalizedUnitPrice : null
+    const pricePctDelta = (latest?.normalizedUnitPrice != null && previous?.normalizedUnitPrice != null && previous.normalizedUnitPrice !== 0)
+      ? ((latest.normalizedUnitPrice - previous.normalizedUnitPrice) / Math.abs(previous.normalizedUnitPrice)) * 100
+      : null
+    return c.json({
+      success: true,
+      scope: 'part',
+      window: windowParam, windowDays: days,
+      backend,
+      partNumber: opn,
+      genericPartNumber: part.genericPartNumber,
+      displayName: part.displayName,
+      basket: WATCHED_BASKET_LABEL[part.basket],
+      subcategory: part.subcategory ?? null,
+      latestQuantityAvailable: latest?.quantityAvailable ?? null,
+      previousQuantityAvailable: previous?.quantityAvailable ?? null,
+      inventoryDelta: invDelta,
+      inventoryPctDelta: invPctDelta,
+      latestNormalizedUnitPrice: latest?.normalizedUnitPrice ?? null,
+      previousNormalizedUnitPrice: previous?.normalizedUnitPrice ?? null,
+      currency: latest?.currency ?? null,
+      priceDelta,
+      pricePctDelta,
+      leadTimeWeeks: latest?.leadTimeWeeks ?? null,
+      signalType: sig?.signalType ?? 'insufficient_history',
+      explanation: sig?.explanation ?? '',
+      observationsCount: rows.length,
+      latestCapturedAt: latest?.capturedAt ?? null,
+      series,
+    })
+  }
+
+  // ── Aggregate scopes (universe | basket | subcategory) ───────────────
+  const inScopeOpnSet = new Set(partNumbers.map(p => p.toUpperCase()))
+  // Latest row per part inside the window (for in-stock / lead-time medians).
+  type LatestRow = {
+    opn: string; qty: number | null; price: number | null;
+    leadTimeWeeks: number | null; firstQty: number | null;
+    firstPrice: number | null; rowsCount: number;
+  }
+  const latestByOpn: LatestRow[] = []
+  for (const opn of partNumbers) {
+    const rows = history.get(opn.toUpperCase()) ?? []
+    if (rows.length === 0) {
+      latestByOpn.push({ opn, qty: null, price: null, leadTimeWeeks: null, firstQty: null, firstPrice: null, rowsCount: 0 })
+      continue
+    }
+    const sorted = rows.slice().sort((a, b) => a.capturedAt.localeCompare(b.capturedAt))
+    const first = sorted[0]
+    const latest = sorted[sorted.length - 1]
+    latestByOpn.push({
+      opn,
+      qty: latest.quantityAvailable ?? null,
+      price: latest.normalizedUnitPrice ?? null,
+      leadTimeWeeks: latest.leadTimeWeeks ?? null,
+      firstQty: first.quantityAvailable ?? null,
+      firstPrice: first.normalizedUnitPrice ?? null,
+      rowsCount: sorted.length,
+    })
+  }
+  const trackedParts = inScope.length
+  const capturedParts = latestByOpn.filter(r => r.rowsCount > 0).length
+  const pricedParts = latestByOpn.filter(r => r.price != null).length
+  const inStockParts = latestByOpn.filter(r => r.qty != null && r.qty > 0).length
+  const outOfStockParts = latestByOpn.filter(r => r.qty === 0).length
+  const stockoutRate = capturedParts > 0 ? outOfStockParts / capturedParts : null
+  const median = (xs: number[]): number | null => {
+    if (xs.length === 0) return null
+    const sorted = xs.slice().sort((a, b) => a - b)
+    const m = Math.floor(sorted.length / 2)
+    return sorted.length % 2 === 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2
+  }
+  const medianLeadTimeWeeks = median(latestByOpn.map(r => r.leadTimeWeeks).filter((v): v is number => Number.isFinite(v as number)))
+  const invPctChanges = latestByOpn
+    .filter(r => r.qty != null && r.firstQty != null && r.firstQty !== 0)
+    .map(r => ((r.qty! - r.firstQty!) / Math.abs(r.firstQty!)) * 100)
+  const medianInventoryPctChange = median(invPctChanges)
+  const pricePctChanges = latestByOpn
+    .filter(r => r.price != null && r.firstPrice != null && r.firstPrice !== 0)
+    .map(r => ((r.price! - r.firstPrice!) / Math.abs(r.firstPrice!)) * 100)
+  const medianPricePctChange = median(pricePctChanges)
+
+  // Persisted-signal counts for the in-scope subset.
+  const inScopeSignals = allPersisted.filter(s => inScopeOpnSet.has(s.orderablePartNumber.toUpperCase()))
+  const signalCount = (t: string) => inScopeSignals.filter(s => s.signalType === t).length
+  const shortagePressureCount = signalCount('shortage_pressure')
+  const oversupplyPressureCount = signalCount('oversupply_pressure')
+  const inventoryTighteningCount = signalCount('inventory_tightening')
+  const supplyEasingCount = signalCount('supply_easing')
+
+  // Time series — bucket by 5-minute window of capturedAt so all batches
+  // of one capture cycle group together.
+  const BUCKET_MS = 5 * 60 * 1000
+  type BucketRow = { ts: number; qtys: number[]; prices: number[]; partsCaptured: number }
+  const buckets = new Map<number, BucketRow>()
+  for (const opn of partNumbers) {
+    const rows = history.get(opn.toUpperCase()) ?? []
+    for (const r of rows) {
+      const t = Date.parse(r.capturedAt)
+      if (!Number.isFinite(t)) continue
+      const bucket = Math.floor(t / BUCKET_MS) * BUCKET_MS
+      let row = buckets.get(bucket)
+      if (!row) { row = { ts: bucket, qtys: [], prices: [], partsCaptured: 0 }; buckets.set(bucket, row) }
+      row.partsCaptured += 1
+      if (r.quantityAvailable != null) row.qtys.push(r.quantityAvailable)
+      if (r.normalizedUnitPrice != null) row.prices.push(r.normalizedUnitPrice)
+    }
+  }
+  const timeSeries = Array.from(buckets.values())
+    .sort((a, b) => a.ts - b.ts)
+    .map(b => ({
+      bucketAt: new Date(b.ts).toISOString(),
+      partsCaptured: b.partsCaptured,
+      medianQuantity: median(b.qtys),
+      medianNormalizedPrice: median(b.prices),
+    }))
+
+  // Top movers — derived from persisted signals (latest-vs-previous
+  // delta), filtered to in-scope OPNs. Top 5 each direction.
+  const sigByOpn = new Map(inScopeSignals.map(s => [s.orderablePartNumber.toUpperCase(), s]))
+  type Mover = {
+    partNumber: string; displayName: string | null; basket: string | null;
+    subcategory: string | null;
+    latestQuantityAvailable: number | null; previousQuantityAvailable: number | null;
+    inventoryPctDelta: number | null;
+    latestNormalizedUnitPrice: number | null; previousNormalizedUnitPrice: number | null;
+    pricePctDelta: number | null;
+  }
+  const moverFromPart = (p: typeof watched[number]): Mover | null => {
+    const sig = sigByOpn.get(p.preferredOrderablePartNumber.toUpperCase())
+    if (!sig) return null
+    return {
+      partNumber: p.preferredOrderablePartNumber,
+      displayName: p.displayName ?? null,
+      basket: WATCHED_BASKET_LABEL[p.basket],
+      subcategory: p.subcategory ?? null,
+      latestQuantityAvailable: sig.latestQuantityAvailable,
+      previousQuantityAvailable: sig.previousQuantityAvailable,
+      inventoryPctDelta: sig.inventoryPctDelta,
+      latestNormalizedUnitPrice: sig.latestNormalizedUnitPrice,
+      previousNormalizedUnitPrice: sig.previousNormalizedUnitPrice,
+      pricePctDelta: sig.pricePctDelta,
+    }
+  }
+  const moverPool = inScope.map(moverFromPart).filter((m): m is Mover => m !== null)
+  const topInventoryDrops = moverPool
+    .filter(m => m.inventoryPctDelta != null && m.inventoryPctDelta < 0)
+    .sort((a, b) => (a.inventoryPctDelta ?? 0) - (b.inventoryPctDelta ?? 0))
+    .slice(0, 5)
+  const topInventoryBuilds = moverPool
+    .filter(m => m.inventoryPctDelta != null && m.inventoryPctDelta > 0)
+    .sort((a, b) => (b.inventoryPctDelta ?? 0) - (a.inventoryPctDelta ?? 0))
+    .slice(0, 5)
+  const topPriceIncreases = moverPool
+    .filter(m => m.pricePctDelta != null && m.pricePctDelta > 0)
+    .sort((a, b) => (b.pricePctDelta ?? 0) - (a.pricePctDelta ?? 0))
+    .slice(0, 5)
+  const topPriceDecreases = moverPool
+    .filter(m => m.pricePctDelta != null && m.pricePctDelta < 0)
+    .sort((a, b) => (a.pricePctDelta ?? 0) - (b.pricePctDelta ?? 0))
+    .slice(0, 5)
+
+  return c.json({
+    success: true,
+    scope,
+    basket: scope === 'basket' || scope === 'subcategory' ? (WATCHED_BASKET_LABEL[basketKey as keyof typeof WATCHED_BASKET_LABEL] ?? basketKey) : null,
+    subcategory: scope === 'subcategory' ? subcategoryParam : null,
+    window: windowParam, windowDays: days,
+    backend,
+    trackedParts,
+    capturedParts,
+    pricedParts,
+    inStockParts,
+    outOfStockParts,
+    stockoutRate,
+    medianLeadTimeWeeks,
+    medianInventoryPctChange,
+    medianPricePctChange,
+    shortagePressureCount,
+    oversupplyPressureCount,
+    inventoryTighteningCount,
+    supplyEasingCount,
+    timeSeries,
+    topMovers: {
+      inventoryDrops: topInventoryDrops,
+      inventoryBuilds: topInventoryBuilds,
+      priceIncreases: topPriceIncreases,
+      priceDecreases: topPriceDecreases,
+    },
   })
 })
 

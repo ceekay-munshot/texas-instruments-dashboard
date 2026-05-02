@@ -961,6 +961,16 @@ function InventoryPanel() {
   const [watchedCatalog, setWatchedCatalog] = useState(null);
   // Phase 22.5 — Signal Leaderboard active sub-tab.
   const [leaderboardTab, setLeaderboardTab] = useState('shortage_pressure');
+  // Phase 23A — Trends sub-tab now supports four scopes. The existing
+  // part-scope picker (`trendPart`) keeps working untouched when scope ===
+  // 'part'; the aggregate scopes hit the new /api/ti/inventory/trends
+  // endpoint and cache by composite key so flipping back-and-forth doesn't
+  // re-fetch the same slice.
+  const [trendsScope, setTrendsScope] = useState('part');
+  const [trendsBasket, setTrendsBasket] = useState('');
+  const [trendsSubcategory, setTrendsSubcategory] = useState('');
+  const [trendsWindow, setTrendsWindow] = useState('30d');
+  const [trendsAggData, setTrendsAggData] = useState({}); // key → response
 
   // ── Operator-tools state (collapsed by default) ───────────────────────
   // Lets an operator paste the X-Capture-Secret to run a fresh capture or
@@ -1011,6 +1021,30 @@ function InventoryPanel() {
     });
     return () => { cancelled = true; };
   }, []);
+
+  // Phase 23A — fetch + cache aggregate trends responses for non-part scopes.
+  // key = `${scope}|${basket}|${subcategory}|${window}` so the cache survives
+  // tab flips. We never auto-refresh after the initial fetch; the customer
+  // can change window/scope to re-trigger.
+  async function fetchTrendsAggregate(scope, basket, subcategory, window) {
+    if (scope === 'part') return;
+    const params = new URLSearchParams({ scope, window });
+    if (basket) params.set('basket', basket);
+    if (subcategory) params.set('subcategory', subcategory);
+    const key = `${scope}|${basket || ''}|${subcategory || ''}|${window}`;
+    if (trendsAggData[key]) return;
+    try {
+      const res = await fetch(`/api/ti/inventory/trends?${params.toString()}`);
+      const j = res.ok ? await res.json().catch(() => null) : null;
+      if (j && j.success !== false) {
+        setTrendsAggData(prev => ({ ...prev, [key]: j }));
+      } else {
+        setTrendsAggData(prev => ({ ...prev, [key]: { _error: j?.message || `Server returned ${res.status}` } }));
+      }
+    } catch (e) {
+      setTrendsAggData(prev => ({ ...prev, [key]: { _error: e?.message || 'Fetch failed' } }));
+    }
+  }
 
   async function fetchPartHistory(partNumber) {
     if (!partNumber) return;
@@ -2275,10 +2309,303 @@ function InventoryPanel() {
         <div style={sectionWrap}>
           <div style={{ ...sectionTitle, marginBottom: 8 }}>Trends</div>
           <div style={{ fontSize: '0.7rem', color: '#a0b8d0', maxWidth: 920, marginBottom: 12 }}>
-            Pick a watched part to see its inventory and price history over the last 30 days.
-            Pricing series only renders when the TI Store API has returned price breaks for that part — otherwise we say so explicitly rather than fabricating a price line.
+            Drill into the watched universe at four scopes: the whole universe, a single basket,
+            a subcategory inside a basket, or one part. Inventory and direct TI Store price are
+            sourced from the captured D1 history. Pricing series only renders when the TI Store
+            API has returned price breaks — otherwise we say so explicitly rather than fabricating
+            a price line.
           </div>
+
+          {/* Phase 23A — scope + window controls. The existing part picker
+              stays visible only when scope === 'part'; basket/subcategory
+              dropdowns appear when their scope is selected. Trigger fetch
+              for aggregate scopes on change. */}
           {(() => {
+            const partsAll = (snapshot?.parts || []);
+            const catalogParts = (watchedCatalog?.parts || []);
+            const subcatByOpn = new Map(catalogParts.map(p => [p.preferredOrderablePartNumber, p.subcategory ?? null]));
+            const basketsAvailable = Array.from(new Set(partsAll.map(p => p.basket).filter(Boolean))).sort();
+            const subcategoriesAvailable = trendsBasket
+              ? Array.from(new Set(
+                  partsAll
+                    .filter(p => p.basket === trendsBasket)
+                    .map(p => subcatByOpn.get(p.partNumber))
+                    .filter(s => s != null && s !== ''),
+                )).sort()
+              : [];
+            const windowOptions = ['7d', '30d', '90d', 'all'];
+            const scopes = [
+              { id: 'universe', label: 'Universe' },
+              { id: 'basket', label: 'Basket' },
+              { id: 'subcategory', label: 'Subcategory' },
+              { id: 'part', label: 'Part' },
+            ];
+            // Auto-trigger aggregate fetch when scope/basket/subcategory/window
+            // resolves to a complete query. Defensive: subcategory needs basket.
+            if (trendsScope !== 'part') {
+              const ok =
+                (trendsScope === 'universe') ||
+                (trendsScope === 'basket' && trendsBasket) ||
+                (trendsScope === 'subcategory' && trendsBasket && trendsSubcategory);
+              if (ok) {
+                fetchTrendsAggregate(trendsScope, trendsBasket, trendsSubcategory, trendsWindow);
+              }
+            }
+            return (
+              <div style={{
+                marginBottom: 14, padding: '10px 12px',
+                background: '#0d1422', border: '1px solid #1a2740', borderRadius: 4,
+                display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
+              }}>
+                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                  {scopes.map(s => {
+                    const on = trendsScope === s.id;
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        onClick={() => {
+                          setTrendsScope(s.id);
+                          // Reset narrower selectors when widening scope so
+                          // the dropdowns don't carry stale state.
+                          if (s.id === 'universe') { setTrendsBasket(''); setTrendsSubcategory(''); }
+                          if (s.id === 'basket') { setTrendsSubcategory(''); }
+                        }}
+                        style={{
+                          background: on ? '#0d1830' : 'none',
+                          border: '1px solid ' + (on ? '#3d8ef0' : '#1a2740'),
+                          borderRadius: 3,
+                          padding: '5px 12px',
+                          fontSize: '0.62rem',
+                          letterSpacing: '0.10em',
+                          textTransform: 'uppercase',
+                          color: on ? '#e0eaf8' : '#7a96b8',
+                          cursor: 'pointer',
+                          fontFamily: 'monospace',
+                          fontWeight: on ? 'bold' : 'normal',
+                        }}
+                      >{s.label}</button>
+                    );
+                  })}
+                </div>
+                {(trendsScope === 'basket' || trendsScope === 'subcategory') && (
+                  <select
+                    value={trendsBasket}
+                    onChange={e => { setTrendsBasket(e.target.value); setTrendsSubcategory(''); }}
+                    style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.7rem', borderRadius: 3, minWidth: 200 }}
+                  >
+                    <option value="">— pick basket —</option>
+                    {basketsAvailable.map(b => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                )}
+                {trendsScope === 'subcategory' && (
+                  <select
+                    value={trendsSubcategory}
+                    onChange={e => setTrendsSubcategory(e.target.value)}
+                    disabled={!trendsBasket}
+                    style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.7rem', borderRadius: 3, minWidth: 200, opacity: trendsBasket ? 1 : 0.4 }}
+                  >
+                    <option value="">— pick subcategory —</option>
+                    {subcategoriesAvailable.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                )}
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                  {windowOptions.map(w => {
+                    const on = trendsWindow === w;
+                    return (
+                      <button
+                        key={w}
+                        type="button"
+                        onClick={() => setTrendsWindow(w)}
+                        style={{
+                          background: on ? '#0d1830' : 'none',
+                          border: '1px solid ' + (on ? '#3d8ef0' : '#1a2740'),
+                          borderRadius: 3,
+                          padding: '4px 10px',
+                          fontSize: '0.6rem',
+                          letterSpacing: '0.10em',
+                          textTransform: 'uppercase',
+                          color: on ? '#e0eaf8' : '#7a96b8',
+                          cursor: 'pointer',
+                          fontFamily: 'monospace',
+                          fontWeight: on ? 'bold' : 'normal',
+                        }}
+                      >{w}</button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Phase 23A — aggregate scope renderer. Bypassed when scope === 'part';
+              the original part-detail block below renders unchanged in that case. */}
+          {trendsScope !== 'part' && (() => {
+            const ok =
+              (trendsScope === 'universe') ||
+              (trendsScope === 'basket' && trendsBasket) ||
+              (trendsScope === 'subcategory' && trendsBasket && trendsSubcategory);
+            if (!ok) {
+              return (
+                <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
+                  {trendsScope === 'basket'
+                    ? 'Pick a basket to see its trend.'
+                    : 'Pick a basket and subcategory to see the subcategory trend.'}
+                </div>
+              );
+            }
+            const key = `${trendsScope}|${trendsBasket || ''}|${trendsSubcategory || ''}|${trendsWindow}`;
+            const data = trendsAggData[key];
+            if (!data) {
+              return <div style={{ fontSize: '0.7rem', color: '#7a96b8' }}>Loading {trendsScope} trend…</div>;
+            }
+            if (data._error) {
+              return <div style={{ fontSize: '0.7rem', color: '#f0a84e' }}>{data._error}</div>;
+            }
+            const fmtPct = v => v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
+            const fmtPrice = v => v == null ? '—' : `$${Number(v).toFixed(4)}`;
+            const fmtQty = v => v == null ? '—' : Number(v).toLocaleString();
+            const fmtTime = iso => iso ? new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+            const meaningful = (data.shortagePressureCount || 0) + (data.oversupplyPressureCount || 0)
+              + (data.inventoryTighteningCount || 0) + (data.supplyEasingCount || 0);
+            const scopeLabel = data.scope === 'universe' ? 'The 64-part TI watched universe'
+              : data.scope === 'basket' ? `${data.basket}`
+              : `${data.basket} · ${data.subcategory}`;
+            const conclusion = meaningful === 0
+              ? `${scopeLabel} is stable: no shortage or oversupply pressure detected.`
+              : data.shortagePressureCount > 0
+                ? `${scopeLabel} shows ${data.shortagePressureCount} part${data.shortagePressureCount === 1 ? '' : 's'} under shortage pressure.`
+                : data.oversupplyPressureCount > 0
+                  ? `${scopeLabel} shows ${data.oversupplyPressureCount} part${data.oversupplyPressureCount === 1 ? '' : 's'} under oversupply pressure.`
+                  : `${scopeLabel} shows ${meaningful} part${meaningful === 1 ? '' : 's'} with directional signal.`;
+            const conclusionColor = data.shortagePressureCount > 0 ? '#f05c5c'
+              : data.oversupplyPressureCount > 0 ? '#3d8ef0'
+              : data.inventoryTighteningCount > 0 ? '#f0a84e'
+              : data.supplyEasingCount > 0 ? '#00c9a7'
+              : '#4dffc3';
+            const stockoutPct = data.stockoutRate == null ? null : Math.round(data.stockoutRate * 100);
+            const inStockPct = (data.capturedParts > 0 && data.inStockParts != null)
+              ? Math.round(data.inStockParts / data.capturedParts * 100) : null;
+            const KpiTile = ({ label, value, sub, color }) => (
+              <div style={{ padding: '10px 12px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+                <div style={{ ...tinyLabel, marginBottom: 2 }}>{label}</div>
+                <div style={{ color: color || '#e0eaf8', fontSize: '1.05rem', fontFamily: 'monospace', lineHeight: 1.1 }}>{value}</div>
+                {sub && <div style={{ color: '#7a96b8', fontSize: '0.58rem', marginTop: 2, fontFamily: 'monospace' }}>{sub}</div>}
+              </div>
+            );
+            const MoverList = ({ title, rows, deltaSide, accent }) => (
+              <div>
+                <div style={{ ...tinyLabel, color: accent, marginBottom: 6 }}>{title}</div>
+                {(!rows || rows.length === 0) ? (
+                  <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic', fontFamily: 'monospace', padding: '6px 0' }}>
+                    No movement in this direction within {trendsWindow}.
+                  </div>
+                ) : (
+                  <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: 'monospace', fontSize: '0.62rem' }}>
+                    <tbody>
+                      {rows.map((r, i) => (
+                        <tr key={r.partNumber + '-' + i}>
+                          <td style={{ ...cellTD, padding: '3px 6px' }}>
+                            {r.partNumber}
+                            {r.displayName && <span style={{ color: '#7a96b8', marginLeft: 6, fontSize: '0.58rem' }}>· {r.displayName}</span>}
+                          </td>
+                          <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right', color: deltaSide === 'inventory'
+                              ? (r.inventoryPctDelta < 0 ? '#f0a84e' : '#4dffc3')
+                              : (r.pricePctDelta > 0 ? '#f05c5c' : '#4dffc3') }}>
+                            {deltaSide === 'inventory'
+                              ? `${fmtPct(r.inventoryPctDelta)} (${fmtQty(r.previousQuantityAvailable)} → ${fmtQty(r.latestQuantityAvailable)})`
+                              : `${fmtPct(r.pricePctDelta)} (${fmtPrice(r.previousNormalizedUnitPrice)} → ${fmtPrice(r.latestNormalizedUnitPrice)})`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            );
+            return (
+              <div>
+                {/* Conclusion */}
+                <div style={{
+                  padding: '10px 14px', marginBottom: 12,
+                  background: '#080c14', border: '1px solid #1a2740', borderRadius: 4,
+                  borderLeft: `3px solid ${conclusionColor}`,
+                }}>
+                  <div style={{ fontSize: '0.78rem', color: '#e0eaf8', fontFamily: 'monospace', fontWeight: 'bold', lineHeight: 1.4 }}>
+                    {conclusion}
+                  </div>
+                  <div style={{ marginTop: 6, fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+                    Window: {data.window} ({data.windowDays}d) · backend: {data.backend}
+                  </div>
+                </div>
+
+                {/* Summary cards */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 16 }}>
+                  <KpiTile label="Tracked parts" value={data.trackedParts} sub={`captured ${data.capturedParts}/${data.trackedParts}`} />
+                  <KpiTile label="Direct TI priced" value={`${data.pricedParts}/${data.trackedParts}`} sub="TI Store API" color={data.pricedParts === data.trackedParts ? '#4dffc3' : '#f0a84e'} />
+                  <KpiTile label="In stock" value={data.inStockParts ?? '—'} sub={inStockPct == null ? '' : `${inStockPct}% of captured`} color="#4dffc3" />
+                  <KpiTile label="Stockout" value={data.outOfStockParts ?? '—'} sub={stockoutPct == null ? '' : `${stockoutPct}% of captured`} color={data.outOfStockParts > 0 ? '#f0a84e' : '#7a96b8'} />
+                  <KpiTile label="Median lead" value={data.medianLeadTimeWeeks == null ? '—' : `${data.medianLeadTimeWeeks} wk`} sub="latest per part" />
+                  <KpiTile label={`Median Δ inv (${data.window})`}
+                          value={fmtPct(data.medianInventoryPctChange)}
+                          sub="window first → latest"
+                          color={data.medianInventoryPctChange == null ? '#7a96b8' : data.medianInventoryPctChange < 0 ? '#f0a84e' : '#4dffc3'} />
+                  <KpiTile label={`Median Δ price (${data.window})`}
+                          value={fmtPct(data.medianPricePctChange)}
+                          sub="window first → latest"
+                          color={data.medianPricePctChange == null ? '#7a96b8' : data.medianPricePctChange > 0 ? '#f05c5c' : '#4dffc3'} />
+                  <KpiTile label="Shortage" value={data.shortagePressureCount} sub="inv ↓ + price ↑" color={data.shortagePressureCount > 0 ? '#f05c5c' : '#7a96b8'} />
+                  <KpiTile label="Oversupply" value={data.oversupplyPressureCount} sub="inv ↑ + price ↓" color={data.oversupplyPressureCount > 0 ? '#3d8ef0' : '#7a96b8'} />
+                </div>
+
+                {/* Time series — median qty + median price per 5-min bucket */}
+                <div style={{ marginBottom: 16 }}>
+                  <div style={tinyLabel}>Inventory & price trend · {data.timeSeries?.length || 0} capture buckets</div>
+                  {(!data.timeSeries || data.timeSeries.length === 0) ? (
+                    <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic', fontFamily: 'monospace', padding: '6px 0' }}>
+                      No history rows in the selected window.
+                    </div>
+                  ) : (
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem', width: '100%', minWidth: 500 }}>
+                        <thead>
+                          <tr>
+                            <th style={cellTH}>Capture bucket</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Parts captured</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Median qty</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Median TI price</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.timeSeries.slice().reverse().map((b, i) => (
+                            <tr key={b.bucketAt + '-' + i}>
+                              <td style={{ ...cellTD, padding: '3px 6px' }}>{fmtTime(b.bucketAt)}</td>
+                              <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right' }}>{b.partsCaptured}</td>
+                              <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right' }}>{fmtQty(b.medianQuantity)}</td>
+                              <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right' }}>{fmtPrice(b.medianNormalizedPrice)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                {/* Top movers inside scope */}
+                <div style={tinyLabel}>Top movers in {trendsScope === 'universe' ? 'the universe' : trendsScope === 'basket' ? trendsBasket : `${trendsBasket} · ${trendsSubcategory}`}</div>
+                <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 14 }}>
+                  <MoverList title="Largest inventory drops"   rows={data.topMovers?.inventoryDrops}    deltaSide="inventory" accent="#f0a84e" />
+                  <MoverList title="Largest inventory builds"  rows={data.topMovers?.inventoryBuilds}   deltaSide="inventory" accent="#4dffc3" />
+                  <MoverList title="Largest price increases"   rows={data.topMovers?.priceIncreases}    deltaSide="price"     accent="#f05c5c" />
+                  <MoverList title="Largest price decreases"   rows={data.topMovers?.priceDecreases}    deltaSide="price"     accent="#4dffc3" />
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Phase 23A — original Part scope renderer (existing behaviour
+              preserved verbatim — runs only when trendsScope === 'part'). */}
+          {trendsScope === 'part' && (() => {
             const partOptions = (snapshot?.parts || []).map(p => ({ partNumber: p.partNumber, basket: p.basket, displayName: p.displayName }));
             const selected = trendPart || partOptions[0]?.partNumber || null;
             const histResp = selected ? historyByPart[selected] : null;
