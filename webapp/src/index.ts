@@ -309,7 +309,10 @@ async function fetchAllPrices(apiKey: string) {
       label: catData.label,
       avgPriceUSD: r.price,
       baselinePriceUSD: baseline,
-      qoqPct: baseline > 0 ? Math.round(((r.price - baseline) / baseline) * 1000) / 10 : null,
+      // Phase 23C.4 — preserve 2 decimal places. Previous /10 rounding
+      // truncated sub-0.05% movements to 0.0, hiding small but real
+      // changes. Live row now shows e.g. +0.03% instead of "flat".
+      qoqPct: baseline > 0 ? Math.round(((r.price - baseline) / baseline) * 10000) / 100 : null,
       parts: [{ part: r.partNumber, price: r.price, availability: r.availability }],
       fetchedAt,
       live: true
