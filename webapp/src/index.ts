@@ -72,6 +72,7 @@ import {
   summarizeWatchedBaskets,
   getWatchedPartsCaptureInputs,
   getValidatedWatchedParts,
+  getStagedWatchedParts,
   WATCHED_PARTS_FALLBACK_SEED,
 } from './sources/tiWatchedParts'
 import {
@@ -2557,6 +2558,148 @@ app.get('/api/ti/inventory/signal-simulator', async (c) => {
       total: results.length,
       matches: results.filter(r => r.matches).length,
     },
+  })
+})
+
+// Phase 22.2 — POST /api/ti/inventory/staged/validate
+// Auth-gated batch validator for the staged 68 parts. Calls Product Info
+// + Store Inventory & Pricing for each candidate OPN in the requested
+// slice and returns a sanitized per-part validation row. Never writes to
+// D1 or KV; never auto-promotes anything. Promotion happens via a code
+// commit after the operator reviews the results.
+//
+// Query params:
+//   subset = high | medium | all   (default 'high')
+//   offset = 0 (default)           — index into the deterministic OPN-sorted slice
+//   limit  = 1..8 (default 8)      — clamped to 8 to mirror the inventory-capture
+//                                     batching budget.
+//
+// Per-part validation result:
+//   'validated'         — Product Info ok AND Store Inventory ok AND a
+//                         normalized unit price was parsed.
+//   'failed'            — Product Info or Store Inventory returned an HTTP
+//                         error (404, 401/403, 5xx, unreachable). The OPN
+//                         is wrong or unauthorised; replacement needed.
+//   'needs_replacement' — Both endpoints returned 200 but no usable price
+//                         break could be parsed (TI doesn't carry pricing
+//                         for this OPN — pick a similar SKU instead).
+app.post('/api/ti/inventory/staged/validate', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const subsetRaw = (c.req.query('subset') || 'high').toLowerCase()
+  const subset: 'high' | 'medium' | 'all' =
+    subsetRaw === 'medium' ? 'medium' : subsetRaw === 'all' ? 'all' : 'high'
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10) || 0)
+  const limitRaw = parseInt(c.req.query('limit') || '8', 10) || 8
+  const limit = Math.max(1, Math.min(8, limitRaw))
+
+  // Stable input list — sort by OPN so offset/limit pagination is
+  // reproducible across calls (the operator can rely on the same 8 parts
+  // appearing for the same offset).
+  const allStaged = getStagedWatchedParts()
+    .slice()
+    .sort((a, b) => a.preferredOrderablePartNumber.localeCompare(b.preferredOrderablePartNumber))
+  const filtered = subset === 'all'
+    ? allStaged
+    : allStaged.filter(p => (p.confidence ?? 'high') === subset)
+  const slice = filtered.slice(offset, offset + limit)
+  const nextOffset = offset + slice.length
+  const done = nextOffset >= filtered.length
+
+  type ValidationResult = 'validated' | 'failed' | 'needs_replacement'
+  type Row = {
+    opn: string
+    genericPartNumber: string
+    basket: string
+    subcategory: string | null
+    confidence: 'high' | 'medium'
+    productInfoStatus: string
+    inventoryStatus: string
+    quantityAvailable: number | null
+    pricingAvailability: string
+    normalizedUnitPrice: number | null
+    normalizedPriceQty: number | null
+    currency: string | null
+    lifecycleStatus: string | null
+    validationStatus: ValidationResult
+    issue: string | null
+  }
+  const results: Row[] = []
+  for (const part of slice) {
+    const opn = part.preferredOrderablePartNumber
+    // Run Product Info + the sanitized inventory diagnostic in parallel.
+    // The diagnostic re-implements the production parser path so it tells
+    // us exactly what the next live capture would see for this OPN.
+    const [productInfo, debug] = await Promise.all([
+      fetchTiProductInfo(env, opn),
+      fetchTiInventoryPricingDebug(env, opn),
+    ])
+    const productOk = productInfo.status === 'ok'
+    const inventoryOk = debug.status === 'ok'
+    const priced = inventoryOk && (debug.parserOutput.priceBreaksCount ?? 0) > 0
+    let validationStatus: ValidationResult
+    let issue: string | null = null
+    if (!productOk) {
+      validationStatus = 'failed'
+      issue = `Product Info ${productInfo.status}` +
+        (productInfo.diagnostics?.sanitizedMessage ? ` — ${productInfo.diagnostics.sanitizedMessage}` : '')
+    } else if (!inventoryOk) {
+      validationStatus = 'failed'
+      issue = `Store Inventory ${debug.status}` +
+        (debug.sanitizedMessage ? ` — ${debug.sanitizedMessage}` : '')
+    } else if (!priced) {
+      validationStatus = 'needs_replacement'
+      issue = `TI Store returned 200 but no normalized price break parsed (${debug.diagnosis}).`
+    } else {
+      validationStatus = 'validated'
+      issue = null
+    }
+    results.push({
+      opn,
+      genericPartNumber: part.genericPartNumber,
+      basket: part.basket,
+      subcategory: part.subcategory ?? null,
+      confidence: part.confidence ?? 'high',
+      productInfoStatus: productInfo.status,
+      inventoryStatus: debug.status,
+      quantityAvailable: debug.parserOutput.quantityAvailable,
+      pricingAvailability: debug.parserOutput.pricingAvailability,
+      normalizedUnitPrice: debug.parserOutput.normalizedUnitPrice,
+      normalizedPriceQty: debug.parserOutput.normalizedPriceQty,
+      currency: debug.parserOutput.normalizedCurrency,
+      lifecycleStatus: productInfo.lifecycleStatus,
+      validationStatus,
+      issue,
+    })
+  }
+  const summary = {
+    subsetTotal: filtered.length,
+    sliceSize: slice.length,
+    validated: results.filter(r => r.validationStatus === 'validated').length,
+    failed: results.filter(r => r.validationStatus === 'failed').length,
+    needsReplacement: results.filter(r => r.validationStatus === 'needs_replacement').length,
+  }
+  return c.json({
+    success: true,
+    note: 'Read-only — never writes D1 or KV; never auto-promotes. Promotion happens via code commit after operator review.',
+    subset,
+    offset,
+    limit,
+    nextOffset,
+    done,
+    summary,
+    results,
   })
 })
 
