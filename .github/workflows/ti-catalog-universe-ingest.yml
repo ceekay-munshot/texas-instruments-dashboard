@@ -23,6 +23,10 @@ name: TI Catalog Universe Ingest (Phase 23C.1)
 on:
   workflow_dispatch:
     inputs:
+      confirm_catalog_quota_available:
+        description: 'Type YES to acknowledge TI catalog quota (1/4h, 6/day). Workflow fails fast otherwise.'
+        required: true
+        default: 'NO'
       chunk_size:
         description: 'Products per chunk POSTed to Worker (default 500)'
         required: false
@@ -51,6 +55,31 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Quota acknowledgment gate (Phase 23C.2)
+        env:
+          CONFIRM: ${{ inputs.confirm_catalog_quota_available }}
+        run: |
+          # TI's /v2/store/products/catalog endpoint is officially
+          # rate-limited to 1 call every 4 hours and 6 calls per day.
+          # The probe (Phase 23B), the experimental capture (Phase 23C),
+          # and this workflow ALL consume the same quota. We require an
+          # explicit operator acknowledgment so a casual re-run can't
+          # silently burn the next 4-hour window.
+          if [ "${CONFIRM}" != "YES" ]; then
+            echo "::error::Workflow input confirm_catalog_quota_available must be set to YES."
+            echo ""
+            echo "TI /v2/store/products/catalog quota: 1 call every 4 hours, 6 calls per day."
+            echo "The catalog probe + capture endpoints share the same quota."
+            echo ""
+            echo "Before re-running:"
+            echo "  1. Confirm at least 4 hours have passed since the last catalog fetch"
+            echo "     attempt (probe, capture, or this workflow). 24 hours is safer."
+            echo "  2. Confirm no concurrent catalog fetch is in flight."
+            echo "  3. Re-dispatch with confirm_catalog_quota_available = YES."
+            exit 1
+          fi
+          echo "Quota acknowledged. Proceeding."
+
       - name: Validate required secrets are configured
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
@@ -111,6 +140,16 @@ jobs:
             "${TI_CATALOG_URL}")"
           size=$(stat -c%s artifacts/catalog.json 2>/dev/null || stat -f%z artifacts/catalog.json)
           echo "TI catalog HTTP ${http_code}, body size: ${size} bytes"
+          if [ "${http_code}" = "429" ]; then
+            echo "::error::TI full catalog quota exhausted. Do not rerun immediately. Wait at least 4 hours; safer 24 hours."
+            echo ""
+            echo "TI's /v2/store/products/catalog endpoint is officially rate-limited to 1 call every 4 hours / 6 calls per day."
+            echo "Probe, capture, and this workflow all share the same quota — count any prior attempt against the budget."
+            echo ""
+            echo "Sanitized response head (no secrets):"
+            head -c 500 artifacts/catalog.json || true
+            exit 1
+          fi
           if [ "${http_code}" != "200" ]; then
             echo "::error::TI catalog returned HTTP ${http_code}"
             head -c 500 artifacts/catalog.json

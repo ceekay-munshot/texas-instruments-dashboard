@@ -3112,6 +3112,20 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
 // GET /api/ti/universe/catalog/status — public, sanitized.
 // Returns the current state of the catalog tables + the most recent
 // snapshot-run summary row. Read-only. Safe for the UI to call.
+//
+// Phase 23C.2 — every response carries a refreshPolicy reminder so any
+// caller (UI, operator, downstream tooling) sees that catalog refresh is
+// manual + quota-limited. The catalog endpoint itself is rate-limited
+// to 1 call every 4 hours / 6 calls per day; the GitHub Action
+// ti-catalog-universe-ingest.yml is the recommended (and quota-aware)
+// path. The probe + experimental capture endpoints share the same
+// quota.
+const CATALOG_REFRESH_POLICY = {
+  cadence: 'manual',
+  workflow: '.github/workflows/ti-catalog-universe-ingest.yml',
+  tiQuota: '1 catalog call every 4 hours, 6 per day (shared with /probe and /capture)',
+  reminder: 'Catalog refresh is manual and quota-limited. Do not retry failed catalog fetches immediately — wait at least 4 hours, safer 24 hours.',
+} as const
 app.get('/api/ti/universe/catalog/status', async (c) => {
   const env = c.env
   if (!env.TI_INVENTORY_HISTORY_DB) {
@@ -3122,6 +3136,7 @@ app.get('/api/ti/universe/catalog/status', async (c) => {
       opnCount: 0, gpnCount: 0,
       pricedOpnCount: 0, inStockOpnCount: 0, outOfStockOpnCount: 0,
       latestCapturedAt: null,
+      refreshPolicy: CATALOG_REFRESH_POLICY,
       message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.',
     })
   }
@@ -3137,6 +3152,7 @@ app.get('/api/ti/universe/catalog/status', async (c) => {
     inStockOpnCount: counts.inStockOpns,
     outOfStockOpnCount: counts.outOfStockOpns,
     latestCapturedAt: counts.latestCapturedAt,
+    refreshPolicy: CATALOG_REFRESH_POLICY,
   })
 })
 

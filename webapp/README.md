@@ -1122,11 +1122,19 @@ batch and every verify passes.
 
 ### TI universe catalog ingest — chunked (Phase 23C.1, recommended)
 
-The TI catalog endpoint (`/v2/store/products/catalog`) is rate-limited
-hard: even a single probe + capture pair can trigger HTTP 429 for
-hours. Combined with the ~150MB peak memory pressure when parsing
-50MB JSON inside a Cloudflare Worker, a single-shot Worker capture
-is fragile.
+The TI catalog endpoint (`/v2/store/products/catalog`) is officially
+rate-limited to **1 call every 4 hours and 6 calls per day**. Probe
+(Phase 23B), capture (Phase 23C, experimental), and the chunked
+ingest workflow below all consume this same quota. Even a single
+probe + capture pair can trigger HTTP 429 for hours. Combined with
+the ~150MB peak memory pressure when parsing 50MB JSON inside a
+Cloudflare Worker, a single-shot Worker capture is fragile.
+
+**Do not retry failed catalog fetches immediately.** Wait at least 4
+hours, safer 24 hours, before re-dispatching. The Phase 23C.2
+workflow has an explicit acknowledgment input
+(`confirm_catalog_quota_available = YES`) that fails fast otherwise,
+so a casual re-run can't silently burn the next 4-hour window.
 
 **Recommended path:** the GH Action [`ti-catalog-universe-ingest.yml`](../.github/workflows/ti-catalog-universe-ingest.yml)
 fetches the catalog ONCE per dispatch, parses + chunks it locally
@@ -1157,12 +1165,24 @@ into the D1 console — same flow as the 0002 migration). Verify with
 **Manual dispatch:**
 
 ```bash
-gh workflow run ti-catalog-universe-ingest.yml --ref main
-# Or browser: Repo → Actions → "TI Catalog Universe Ingest" → Run workflow → main
+gh workflow run ti-catalog-universe-ingest.yml --ref main \
+  -f confirm_catalog_quota_available=YES
+# Or browser: Repo → Actions → "TI Catalog Universe Ingest" → Run workflow → main,
+# then type YES in the "confirm_catalog_quota_available" field.
 ```
 
-The workflow exposes two inputs: `chunk_size` (default 500) and
-`dry_run` (default false; set `true` to parse + chunk without POSTing).
+The workflow exposes three inputs:
+
+  - `confirm_catalog_quota_available` (**required**, default `NO`) —
+    must be exactly `YES` or the workflow fails fast at the gate
+    step. The gate prints the quota rules + a short pre-flight
+    checklist (4-hour wait minimum, 24-hour preferred, no
+    concurrent fetch). Phase 23C.2 added this as a guard against
+    casual re-dispatch burning the next 4-hour quota window.
+  - `chunk_size` (default `500`) — products per chunk POSTed to the
+    Worker.
+  - `dry_run` (default `false`) — parse + chunk without POSTing
+    (no D1 write).
 
 ### TI universe catalog endpoints — experimental (Phase 23B / 23C, not for normal use)
 
