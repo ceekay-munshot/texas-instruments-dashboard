@@ -1283,6 +1283,186 @@ function InventoryPanel() {
         </div>
       </div>
 
+      {/* ── Phase 22.6 — Live conclusion banner + What changed since last
+              capture + signal-classification methodology. The four pieces
+              the customer reads top-to-bottom before they ever click a
+              sub-tab:
+                1. Headline (color-coded by current pressure state)
+                2. Subtext explaining the headline
+                3. Data-reliability sentence (captured / failed / stale /
+                   priced — derived from the same /inventory/latest +
+                   /signals/latest data the rest of the page uses, so
+                   numbers always match what's below)
+                4. Collapsed methodology rules so a curious customer can
+                   verify how the headline was reached without scrolling
+                   to the Signals sub-tab.
+
+              Followed by a separate "What changed since last capture?"
+              section that surfaces the single biggest mover per
+              category (inventory drop / build / price up / down) or a
+              clean "No material movement" empty state. Different from
+              the Signal Leaderboard on the Signals sub-tab — the
+              leaderboard is a ranked top-15 per category; this section
+              is a one-line answer per category.
+      */}
+      {(() => {
+        const sigSummary = signalsResp?.summary;
+        const sigList = signalsResp?.signals || [];
+        const totalParts = (summary?.totalParts ?? sigList.length) || 0;
+        const captured = summary?.capturedParts ?? snapshotParts.length;
+        const failedParts = summary?.failedParts ?? 0;
+        const staleParts = summary?.staleParts ?? 0;
+        const pricedParts = sigList.filter(s => s.latestNormalizedUnitPrice != null).length
+          || (snapshot?.parts || []).filter(p => p.normalizedUnitPrice != null).length;
+        const sp = sigSummary?.shortagePressure ?? 0;
+        const op = sigSummary?.oversupplyPressure ?? 0;
+        const it = sigSummary?.inventoryTightening ?? 0;
+        const se = sigSummary?.supplyEasing ?? 0;
+        const ip = sigSummary?.priceOnlyPressure ?? 0;
+        const totalPressure = sp + op + it + se + ip;
+        // Color-coded headline. Severity ordering: shortage > oversupply >
+        // tightening > easing > price-only > stable. Ties: highest count wins.
+        let headline, accent, headlineHint = null;
+        if (sp > 0) {
+          accent = '#f05c5c';
+          headline = `${sp} part${sp === 1 ? '' : 's'} under shortage pressure across the ${totalParts}-part TI watched universe.`;
+          headlineHint = 'Inventory is falling and price is rising for these parts — typical shortage signature.';
+        } else if (op > 0) {
+          accent = '#3d8ef0';
+          headline = `${op} part${op === 1 ? '' : 's'} under oversupply pressure across the ${totalParts}-part TI watched universe.`;
+          headlineHint = 'Inventory is rising and price is falling for these parts — typical oversupply signature.';
+        } else if (it > 0) {
+          accent = '#f0a84e';
+          headline = `${it} part${it === 1 ? '' : 's'} showing inventory tightening across the ${totalParts}-part TI watched universe.`;
+          headlineHint = 'Inventory falling but price has not yet moved.';
+        } else if (se > 0) {
+          accent = '#00c9a7';
+          headline = `${se} part${se === 1 ? '' : 's'} showing supply easing across the ${totalParts}-part TI watched universe.`;
+          headlineHint = 'Inventory rising but price has not yet moved.';
+        } else if (ip > 0) {
+          accent = '#ab6af0';
+          headline = `${ip} part${ip === 1 ? '' : 's'} showing price-only pressure across the ${totalParts}-part TI watched universe.`;
+          headlineHint = 'Price is rising while inventory has not moved.';
+        } else {
+          accent = '#4dffc3';
+          headline = `No supply pressure detected across the ${totalParts}-part TI watched universe.`;
+        }
+        const subtext = totalPressure === 0
+          ? `All ${captured}${totalParts ? `/${totalParts}` : ''} parts were captured successfully with direct TI Store pricing. Inventory and pricing are stable versus previous observations.`
+          : (headlineHint || 'See the Signal Leaderboard for the full ranked list.');
+        const reliability = `Latest run captured ${captured}/${totalParts} parts, ${failedParts} failed, ${staleParts} stale, and ${pricedParts}/${totalParts} direct TI prices.`;
+        // What-changed: top 1 per direction. inventoryPctDelta and
+        // pricePctDelta come from the persisted-signal latest-vs-previous
+        // pair (Phase 21A.3) so the answer is "what moved between the
+        // most-recent two captures" — exactly what the section title asks.
+        const invDrop  = sigList.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta < 0).sort((a, b) => a.inventoryPctDelta - b.inventoryPctDelta)[0] || null;
+        const invBuild = sigList.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta > 0).sort((a, b) => b.inventoryPctDelta - a.inventoryPctDelta)[0] || null;
+        const priceUp   = sigList.filter(s => s.pricePctDelta != null && s.pricePctDelta > 0).sort((a, b) => b.pricePctDelta - a.pricePctDelta)[0] || null;
+        const priceDown = sigList.filter(s => s.pricePctDelta != null && s.pricePctDelta < 0).sort((a, b) => a.pricePctDelta - b.pricePctDelta)[0] || null;
+        const noMovement = !invDrop && !invBuild && !priceUp && !priceDown;
+        const fmtPct = v => v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
+        const fmtPrice = v => v == null ? '—' : `$${Number(v).toFixed(4)}`;
+        const fmtQty = v => v == null ? '—' : Number(v).toLocaleString();
+        const ChangeTile = ({ title, sub, row, valueColor, deltaSide }) => (
+          <div style={{ padding: '10px 14px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+            <div style={{ ...tinyLabel, marginBottom: 4 }}>{title}</div>
+            {row ? (
+              <>
+                <div style={{ fontSize: '0.78rem', color: '#e0eaf8', fontFamily: 'monospace' }}>
+                  {row.partNumber || row.orderablePartNumber}
+                </div>
+                {row.displayName && (
+                  <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 2 }}>
+                    {row.displayName}
+                  </div>
+                )}
+                <div style={{ marginTop: 6, fontSize: '0.85rem', color: valueColor, fontFamily: 'monospace' }}>
+                  {deltaSide === 'inventory'
+                    ? `${fmtPct(row.inventoryPctDelta)} (${fmtQty(row.previousQuantityAvailable)} → ${fmtQty(row.latestQuantityAvailable)})`
+                    : `${fmtPct(row.pricePctDelta)} (${fmtPrice(row.previousNormalizedUnitPrice)} → ${fmtPrice(row.latestNormalizedUnitPrice)})`}
+                </div>
+                {row.basket && (
+                  <div style={{ fontSize: '0.6rem', color: '#7a96b8', marginTop: 2 }}>{row.basket}</div>
+                )}
+              </>
+            ) : (
+              <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic', fontFamily: 'monospace' }}>
+                {sub || 'No movement in this direction.'}
+              </div>
+            )}
+          </div>
+        );
+        return (
+          <>
+            {/* Conclusion banner */}
+            <div style={{
+              ...sectionWrap, paddingTop: 18, paddingBottom: 16,
+              borderLeft: `4px solid ${accent}`,
+            }}>
+              <div style={{ ...sectionTitle, marginBottom: 6, color: accent }}>Live conclusion</div>
+              <div style={{
+                fontSize: '0.95rem', color: '#e0eaf8', fontWeight: 'bold',
+                lineHeight: 1.4, maxWidth: 920, fontFamily: 'monospace',
+              }}>
+                {headline}
+              </div>
+              <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#a0b8d0', maxWidth: 920, lineHeight: 1.5 }}>
+                {subtext}
+              </div>
+              <div style={{ marginTop: 6, fontSize: '0.66rem', color: '#7a96b8', fontFamily: 'monospace', maxWidth: 920 }}>
+                {reliability}
+              </div>
+              <details style={{ marginTop: 10 }}>
+                <summary style={{
+                  cursor: 'pointer', fontSize: '0.6rem', color: '#7a96b8',
+                  letterSpacing: '0.12em', textTransform: 'uppercase', fontWeight: 'bold',
+                }}>
+                  How signals are classified
+                </summary>
+                <div style={{
+                  marginTop: 6, padding: '8px 12px', background: '#080c14',
+                  border: '1px solid #1a2740', borderRadius: 4,
+                  fontSize: '0.66rem', color: '#a0b8d0', lineHeight: 1.7,
+                  fontFamily: 'monospace', maxWidth: 920,
+                }}>
+                  <div>• Inventory down + price up &nbsp;→&nbsp; <span style={{ color: '#f05c5c', fontWeight: 'bold' }}>shortage pressure</span></div>
+                  <div>• Inventory up + price down &nbsp;→&nbsp; <span style={{ color: '#3d8ef0', fontWeight: 'bold' }}>oversupply pressure</span></div>
+                  <div>• Inventory down + price flat/unavailable &nbsp;→&nbsp; <span style={{ color: '#f0a84e', fontWeight: 'bold' }}>inventory tightening</span></div>
+                  <div>• Inventory up + price flat/unavailable &nbsp;→&nbsp; <span style={{ color: '#00c9a7', fontWeight: 'bold' }}>supply easing</span></div>
+                  <div>• Price up + inventory flat &nbsp;→&nbsp; <span style={{ color: '#ab6af0', fontWeight: 'bold' }}>price-only pressure</span></div>
+                </div>
+              </details>
+            </div>
+
+            {/* What changed since last capture? */}
+            <div style={sectionWrap}>
+              <div style={{ ...sectionTitle, marginBottom: 8 }}>What changed since last capture?</div>
+              {noMovement ? (
+                <div style={{
+                  fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic',
+                  padding: '8px 12px', background: '#080c14',
+                  border: '1px solid #1a2740', borderRadius: 4,
+                  fontFamily: 'monospace', maxWidth: 920,
+                }}>
+                  No material inventory or pricing movement since the last capture.
+                </div>
+              ) : (
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: 10,
+                }}>
+                  <ChangeTile title="Largest inventory drop" row={invDrop} deltaSide="inventory" valueColor={'#f0a84e'} />
+                  <ChangeTile title="Largest inventory build" row={invBuild} deltaSide="inventory" valueColor={'#4dffc3'} />
+                  <ChangeTile title="Largest price increase" row={priceUp} deltaSide="price" valueColor={'#f05c5c'} />
+                  <ChangeTile title="Largest price decrease" row={priceDown} deltaSide="price" valueColor={'#4dffc3'} />
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })()}
+
       {/* ── Phase 21C — Always-visible status strip: Automation Health,
               History Depth, Pricing Source Status. Pulled from
               /schedule/status, /history/summary and /signals/latest
