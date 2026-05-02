@@ -3831,9 +3831,29 @@ app.get('/api/ti/inventory/schedule/status', async (c) => {
   // fired" meaning. lastRunByCron below still exposes cron-only state.
   const offsetsCovered = latestAggregate?.offsetsCovered
     ?? cronList.filter(k => !!state.lastRunByCron[k]).length
+  // Phase 22.5 — surface the *active* scheduler so the UI doesn't conflate
+  // the in-Cloudflare cron list (intentionally not wired in production)
+  // with the GitHub Actions workflow that actually drives daily capture.
+  // The cron schedule is also explicitly tagged as "not active in
+  // production" so an operator reading the JSON doesn't get confused.
+  const externalSource = latestAggregate?.source ?? state.lastExternalRun?.source ?? null
+  const activeScheduler: 'github_actions_dynamic' | 'cloudflare_cron' | 'none' =
+    externalSource === 'github_actions_daily'
+      ? 'github_actions_dynamic'
+      : (lastRun ? 'cloudflare_cron' : 'none')
+  const activeSchedulerLabel = activeScheduler === 'github_actions_dynamic'
+    ? 'GitHub Actions (dynamic batching, totalParts derived from /watched-parts/catalog)'
+    : activeScheduler === 'cloudflare_cron'
+      ? 'Cloudflare Pages cron (in-Cloudflare scheduled handler)'
+      : 'No active scheduler — no captures recorded yet.'
   return c.json({
     success: true,
+    // Phase 22.5 — top-level scheduler clarity.
+    activeScheduler,
+    activeSchedulerLabel,
+    dynamicBatching: activeScheduler === 'github_actions_dynamic',
     cronSchedule: cronList,
+    cronScheduleNote: 'In-Cloudflare cron entries — defined for reference, NOT the active scheduler when activeScheduler==="github_actions_dynamic". Daily capture is driven by the GitHub Actions workflow ti-inventory-capture.yml.',
     offsetsConfigured: cronList.length,
     offsetsCovered,
     // Phase 21B.1 — daily-run aggregate fields (most recent external run).

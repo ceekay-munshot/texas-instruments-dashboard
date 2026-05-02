@@ -955,6 +955,12 @@ function InventoryPanel() {
   // strip at the top of the Inventory tab. Sanitized public response; no
   // secrets ever flow through this channel.
   const [scheduleStatus, setScheduleStatus] = useState(null);
+  // Phase 22.5 — watched-parts catalog gives us subcategory per OPN, which
+  // /inventory/latest doesn't surface. Used by the Category Heatmap so each
+  // basket can be split into the finer-grained sub-buckets.
+  const [watchedCatalog, setWatchedCatalog] = useState(null);
+  // Phase 22.5 — Signal Leaderboard active sub-tab.
+  const [leaderboardTab, setLeaderboardTab] = useState('shortage_pressure');
 
   // ── Operator-tools state (collapsed by default) ───────────────────────
   // Lets an operator paste the X-Capture-Secret to run a fresh capture or
@@ -983,7 +989,9 @@ function InventoryPanel() {
       fetch('/api/ti/inventory/history/summary').then(r => r.ok ? r.json() : null).catch(() => null),
       // Phase 21C — automation-health card on the Inventory tab.
       fetch('/api/ti/inventory/schedule/status').then(r => r.ok ? r.json() : null).catch(() => null),
-    ]).then(([snapRes, sigLatestRes, sigOnFlyRes, summaryRes, scheduleRes]) => {
+      // Phase 22.5 — sanitized watched-parts catalog (subcategory per OPN).
+      fetch('/api/ti/watched-parts/catalog').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([snapRes, sigLatestRes, sigOnFlyRes, summaryRes, scheduleRes, catalogRes]) => {
       if (cancelled) return;
       setSnapshotLoading(false);
       const j = snapRes.status === 'fulfilled' ? snapRes.value : null;
@@ -999,6 +1007,7 @@ function InventoryPanel() {
       setSignalsResp(persisted ?? onFly ?? null);
       if (summaryRes.status === 'fulfilled' && summaryRes.value) setHistorySummary(summaryRes.value);
       if (scheduleRes.status === 'fulfilled' && scheduleRes.value) setScheduleStatus(scheduleRes.value);
+      if (catalogRes.status === 'fulfilled' && catalogRes.value) setWatchedCatalog(catalogRes.value);
     });
     return () => { cancelled = true; };
   }, []);
@@ -1327,7 +1336,7 @@ function InventoryPanel() {
         return (
           <div style={{ ...sectionWrap, paddingTop: 14, paddingBottom: 14 }}>
             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-              <InfoCard title="Automation health" accent={captureStatusColor}>
+              <InfoCard title="Automation health · Data quality" accent={captureStatusColor}>
                 <InfoRow label="Status" value={captureStatus.toUpperCase()} valueColor={captureStatusColor} />
                 <InfoRow label="Source" value={sourceLabel} />
                 <InfoRow
@@ -1340,9 +1349,37 @@ function InventoryPanel() {
                   value={persisted == null ? '—' : `${persisted}/${expectedSignals}`}
                   valueColor={persisted === expectedSignals ? '#4dffc3' : persisted == null ? '#7a96b8' : '#f0a84e'}
                 />
+                {/* Phase 22.5 — Data Quality additions: failed/stale + 2+ obs */}
+                <InfoRow
+                  label="Failed parts"
+                  value={summary?.failedParts != null ? String(summary.failedParts) : '—'}
+                  valueColor={(summary?.failedParts ?? 0) > 0 ? '#f05c5c' : '#4dffc3'}
+                />
+                <InfoRow
+                  label="Stale parts"
+                  value={summary?.staleParts != null ? String(summary.staleParts) : '—'}
+                  valueColor={(summary?.staleParts ?? 0) > 0 ? '#f0a84e' : '#7a96b8'}
+                />
+                <InfoRow
+                  label="Parts with 2+ obs"
+                  value={historySummary ? `${historySummary.partsWith2PlusObservations}/${historySummary.totalTrackedParts}` : '—'}
+                  valueColor={historySummary && historySummary.partsWith2PlusObservations === historySummary.totalTrackedParts ? '#4dffc3' : '#a0b8d0'}
+                />
                 <InfoRow label="Backend" value={(sched?.backend || '—').toUpperCase()} valueColor={sched?.backend === 'd1' ? '#4dffc3' : '#7a96b8'} />
                 <InfoRow label="Last capture" value={fmtTime(sched?.lastExternalCaptureAt || sched?.lastCaptureAt)} />
-                <InfoRow label="Schedule" value="Daily 07:15 UTC" />
+                {/* Phase 22.5 — Task 3: scheduler-clarity. Uses the new
+                    activeSchedulerLabel from /schedule/status when available;
+                    falls back to the static "Daily 07:15 UTC" hint otherwise.
+                    The cron-list confusion is resolved at the source. */}
+                <InfoRow
+                  label="Schedule"
+                  value={sched?.activeScheduler === 'github_actions_dynamic'
+                    ? 'GitHub Actions · dynamic batching'
+                    : sched?.activeScheduler === 'cloudflare_cron'
+                      ? 'Cloudflare cron'
+                      : 'Daily 07:15 UTC'}
+                  valueColor={sched?.dynamicBatching ? '#4dffc3' : '#a0b8d0'}
+                />
               </InfoCard>
 
               <InfoCard title="History depth">
@@ -1439,6 +1476,81 @@ function InventoryPanel() {
       </div>
 
       {inventorySubTab === 'snapshot' && (<>
+
+      {/* ── Phase 22.5 — Executive Summary ──────────────────────────────
+           One-glance answer to "Is TI supply pressured? How does the
+           universe look right now?". Sits ABOVE the existing universe
+           cards and pulls signal counts from /signals/latest so the
+           customer sees the supply-side answer first. */}
+      {(() => {
+        const sigSummary = signalsResp?.summary;
+        const sigList = signalsResp?.signals || [];
+        const totalParts = summary?.totalParts ?? snapshotParts.length;
+        const capturedParts = summary?.capturedParts ?? snapshotParts.length;
+        const failedParts = summary?.failedParts ?? 0;
+        const inStockParts = inStock;
+        const outOfStockParts = outOfStock;
+        const pricedParts = sigList.filter(s => s.latestNormalizedUnitPrice != null).length
+          || (snapshot?.parts || []).filter(p => p.normalizedUnitPrice != null).length;
+        const shortagePressure = sigSummary?.shortagePressure ?? 0;
+        const oversupplyPressure = sigSummary?.oversupplyPressure ?? 0;
+        const inventoryTightening = sigSummary?.inventoryTightening ?? 0;
+        const supplyEasing = sigSummary?.supplyEasing ?? 0;
+        const meaningful = shortagePressure + oversupplyPressure + inventoryTightening + supplyEasing;
+        const headlineColor = shortagePressure > 0 ? '#f05c5c'
+          : oversupplyPressure > 0 ? '#3d8ef0'
+          : inventoryTightening > 0 ? '#f0a84e'
+          : supplyEasing > 0 ? '#00c9a7'
+          : '#7a96b8';
+        const headlineText = shortagePressure > 0
+          ? `${shortagePressure} part${shortagePressure === 1 ? '' : 's'} under shortage pressure`
+          : oversupplyPressure > 0
+            ? `${oversupplyPressure} part${oversupplyPressure === 1 ? '' : 's'} under oversupply pressure`
+            : meaningful > 0
+              ? `${meaningful} part${meaningful === 1 ? '' : 's'} with directional signal`
+              : 'No supply pressure detected';
+        const lastCapTxt = scheduleStatus?.lastExternalCaptureAt
+          ? new Date(scheduleStatus.lastExternalCaptureAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+          : (snapshot?.capturedAt
+              ? new Date(snapshot.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+              : '—');
+        return (
+          <div style={{ ...sectionWrap, paddingTop: 14, paddingBottom: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
+              <div style={{ ...sectionTitle, marginBottom: 0 }}>Executive summary</div>
+              <div style={{ fontSize: '0.78rem', color: headlineColor, fontWeight: 'bold', fontFamily: 'monospace' }}>
+                {headlineText}
+              </div>
+              <div style={{ marginLeft: 'auto', fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+                Last capture: {lastCapTxt}
+              </div>
+            </div>
+            <div style={{
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10,
+              fontFamily: 'monospace',
+            }}>
+              {[
+                { label: 'Tracked parts',        value: totalParts,                  sub: 'watched universe',                                color: '#e0eaf8' },
+                { label: 'Captured',             value: `${capturedParts}/${totalParts}`, sub: failedParts > 0 ? `${failedParts} failed` : 'last run', color: capturedParts === totalParts ? '#4dffc3' : '#f0a84e' },
+                { label: 'Direct TI priced',     value: `${pricedParts}/${totalParts}`,    sub: 'TI Store API',                                color: pricedParts === totalParts ? '#4dffc3' : '#f0a84e' },
+                { label: 'In stock',             value: inStockParts,                sub: totalParts ? `${Math.round(inStockParts/Math.max(1,totalParts)*100)}%` : '',         color: '#4dffc3' },
+                { label: 'Out of stock',         value: outOfStockParts,             sub: totalParts ? `${Math.round(outOfStockParts/Math.max(1,totalParts)*100)}%` : '',      color: '#f0a84e' },
+                { label: 'Shortage pressure',    value: shortagePressure,            sub: 'inv ↓ + price ↑',                                 color: shortagePressure > 0 ? '#f05c5c' : '#7a96b8' },
+                { label: 'Oversupply pressure',  value: oversupplyPressure,          sub: 'inv ↑ + price ↓',                                 color: oversupplyPressure > 0 ? '#3d8ef0' : '#7a96b8' },
+                { label: 'Inventory tightening', value: inventoryTightening,         sub: 'inv ↓ price flat',                                color: inventoryTightening > 0 ? '#f0a84e' : '#7a96b8' },
+                { label: 'Supply easing',        value: supplyEasing,                sub: 'inv ↑ price flat',                                color: supplyEasing > 0 ? '#00c9a7' : '#7a96b8' },
+              ].map(k => (
+                <div key={k.label} style={{ padding: '10px 12px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+                  <div style={{ ...tinyLabel, marginBottom: 2 }}>{k.label}</div>
+                  <div style={{ color: k.color, fontSize: '1.1rem', lineHeight: 1.1 }}>{k.value}</div>
+                  {k.sub && <div style={{ color: '#7a96b8', fontSize: '0.58rem', marginTop: 2 }}>{k.sub}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
       {/* ── Universe summary cards (Phase 20D) ── */}
       <div style={sectionWrap}>
         <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
@@ -1481,6 +1593,131 @@ function InventoryPanel() {
           </div>
         )}
       </div>
+
+      {/* ── Phase 22.5 — Category Heatmap ────────────────────────────────
+           Answers "Which TI category is tightening or easing?". Groups
+           the captured parts by basket × subcategory and rolls up
+           captured % / priced % / in-stock % / out-of-stock % / median
+           lead time / per-signal counts. Subcategory comes from
+           /watched-parts/catalog (joined by partNumber). Rendered as a
+           compact table because heatmap colour blocks added without
+           clear axes have hurt readability in past phases. */}
+      {(() => {
+        const parts = snapshot?.parts || [];
+        if (parts.length === 0) return null;
+        // Subcategory map from watched-parts catalog (Phase 22.5).
+        const subcatByOpn = new Map();
+        if (watchedCatalog?.parts) {
+          for (const p of watchedCatalog.parts) {
+            subcatByOpn.set(p.preferredOrderablePartNumber, p.subcategory ?? null);
+          }
+        }
+        // Signal type per part — used to count shortage/oversupply etc.
+        const sigByOpn = new Map();
+        for (const s of (signalsResp?.signals || [])) {
+          if (s.partNumber) sigByOpn.set(s.partNumber, s);
+        }
+        // Group by (basket, subcategory).
+        const groups = new Map();
+        for (const p of parts) {
+          const basket = p.basket || '—';
+          const subcat = subcatByOpn.get(p.partNumber) || '—';
+          const key = `${basket}${subcat}`;
+          if (!groups.has(key)) {
+            groups.set(key, {
+              basket, subcategory: subcat,
+              tracked: 0, captured: 0, priced: 0,
+              inStock: 0, outOfStock: 0,
+              leadTimes: [],
+              shortagePressure: 0, oversupplyPressure: 0,
+              inventoryTightening: 0, supplyEasing: 0,
+            });
+          }
+          const g = groups.get(key);
+          g.tracked += 1;
+          // Treat any row served by /inventory/latest as "captured" (the
+          // endpoint only returns captured parts).
+          g.captured += 1;
+          if (p.normalizedUnitPrice != null) g.priced += 1;
+          const supply = p.signals?.supplyStatus;
+          if (supply === 'in_stock') g.inStock += 1;
+          else if (supply === 'out_of_stock') g.outOfStock += 1;
+          if (p.leadTimeWeeks != null && Number.isFinite(p.leadTimeWeeks)) g.leadTimes.push(p.leadTimeWeeks);
+          const sig = sigByOpn.get(p.partNumber);
+          if (sig) {
+            switch (sig.signalType) {
+              case 'shortage_pressure':    g.shortagePressure += 1; break;
+              case 'oversupply_pressure':  g.oversupplyPressure += 1; break;
+              case 'inventory_tightening': g.inventoryTightening += 1; break;
+              case 'supply_easing':        g.supplyEasing += 1; break;
+            }
+          }
+        }
+        const rows = Array.from(groups.values()).map(g => {
+          const median = g.leadTimes.length === 0 ? null
+            : (() => {
+                const sorted = g.leadTimes.slice().sort((a,b)=>a-b);
+                const m = Math.floor(sorted.length/2);
+                return sorted.length % 2 === 1 ? sorted[m] : (sorted[m-1]+sorted[m])/2;
+              })();
+          return { ...g, medianLeadTime: median, pressureScore: g.shortagePressure*4 + g.inventoryTightening*2 + g.oversupplyPressure*1 };
+        });
+        // Sort: pressure first (descending shortage/tightening), then largest tracked.
+        rows.sort((a, b) => b.pressureScore - a.pressureScore || b.tracked - a.tracked || a.basket.localeCompare(b.basket) || a.subcategory.localeCompare(b.subcategory));
+        const pct = (n, d) => d > 0 ? `${Math.round(n/d*100)}%` : '—';
+        const colorPct = (p, hot, neutral) => p >= 0.5 ? hot : p > 0 ? neutral : '#7a96b8';
+        const totalPressure = rows.reduce((s, r) => s + r.shortagePressure + r.oversupplyPressure + r.inventoryTightening + r.supplyEasing, 0);
+        return (
+          <div style={sectionWrap}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 8 }}>
+              <div style={sectionTitle}>Category heatmap</div>
+              <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic' }}>
+                {totalPressure > 0
+                  ? `Sorted by pressure score · ${rows.length} categories`
+                  : `${rows.length} categories — no pressure detected yet, sort follows tracked-parts size`}
+              </div>
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ borderCollapse: 'collapse', minWidth: 1100, width: '100%', fontFamily: 'monospace', fontSize: '0.66rem' }}>
+                <thead>
+                  <tr>
+                    <th style={cellTH}>Basket</th>
+                    <th style={cellTH}>Subcategory</th>
+                    <th style={{ ...cellTH, textAlign: 'right' }}>Tracked</th>
+                    <th style={{ ...cellTH, textAlign: 'right' }}>Captured</th>
+                    <th style={{ ...cellTH, textAlign: 'right' }}>Priced</th>
+                    <th style={{ ...cellTH, textAlign: 'right' }}>In stock</th>
+                    <th style={{ ...cellTH, textAlign: 'right' }}>OoS</th>
+                    <th style={{ ...cellTH, textAlign: 'right' }}>Median lead</th>
+                    <th style={{ ...cellTH, textAlign: 'right', color: '#f05c5c' }}>Shortage</th>
+                    <th style={{ ...cellTH, textAlign: 'right', color: '#3d8ef0' }}>Oversupply</th>
+                    <th style={{ ...cellTH, textAlign: 'right', color: '#f0a84e' }}>Tightening</th>
+                    <th style={{ ...cellTH, textAlign: 'right', color: '#00c9a7' }}>Easing</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => (
+                    <tr key={i}>
+                      <td style={{ ...cellTD, color: '#a0b8d0' }}>{r.basket}</td>
+                      <td style={{ ...cellTD, color: r.subcategory === '—' ? '#7a96b8' : '#c4d4e8' }}>{r.subcategory}</td>
+                      <td style={{ ...cellMono, textAlign: 'right' }}>{r.tracked}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: r.captured === r.tracked ? '#4dffc3' : '#f0a84e' }}>{pct(r.captured, r.tracked)}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: r.priced === r.tracked ? '#4dffc3' : r.priced > 0 ? '#f0a84e' : '#7a96b8' }}>{pct(r.priced, r.tracked)}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: colorPct(r.inStock/Math.max(1,r.tracked), '#4dffc3', '#a0b8d0') }}>{pct(r.inStock, r.tracked)}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: colorPct(r.outOfStock/Math.max(1,r.tracked), '#f0a84e', '#a0b8d0') }}>{pct(r.outOfStock, r.tracked)}</td>
+                      <td style={{ ...cellMono, textAlign: 'right' }}>{r.medianLeadTime == null ? '—' : `${r.medianLeadTime} wk`}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: r.shortagePressure > 0 ? '#f05c5c' : '#7a96b8', fontWeight: r.shortagePressure > 0 ? 'bold' : 'normal' }}>{r.shortagePressure || '—'}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: r.oversupplyPressure > 0 ? '#3d8ef0' : '#7a96b8', fontWeight: r.oversupplyPressure > 0 ? 'bold' : 'normal' }}>{r.oversupplyPressure || '—'}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: r.inventoryTightening > 0 ? '#f0a84e' : '#7a96b8' }}>{r.inventoryTightening || '—'}</td>
+                      <td style={{ ...cellMono, textAlign: 'right', color: r.supplyEasing > 0 ? '#00c9a7' : '#7a96b8' }}>{r.supplyEasing || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
       </>)}
 
       {inventorySubTab === 'signals' && (<>
@@ -1607,85 +1844,161 @@ function InventoryPanel() {
                 color="#7a96b8"
               />
             </div>
-            {meaningful.length === 0 ? (
-              <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.5 }}>
-                {insufficient === sigList.length && sigList.length > 0
-                  ? 'Run captures over multiple days to start surfacing shortage / oversupply classifications. The engine needs at least 3 successful captures per part.'
-                  : 'No shortage or oversupply pressure detected across the watched universe right now.'}
-                {(() => {
-                  // Phase 21C — pricing-unavailable note when the entire
-                  // watched set is missing pricing.
-                  // Phase 21D.2 — once direct TI prices are flowing (priceUnavailableCount
-                  // is small / zero) we instead explain that we're waiting for the second
-                  // priced observation, since "Direct TI Store price captured;
-                  // waiting for a second pricing observation…" is the row-level
-                  // explanation the engine emits today.
-                  const total = sigList.length;
-                  const priceUnavail = sigSummary?.priceUnavailableCount ?? 0;
-                  const firstPriced = sigList.filter(s => /Direct TI Store price captured; waiting for a second pricing observation/i.test(s.explanation || '')).length;
-                  if (total > 0 && priceUnavail === total) {
-                    return (
-                      <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
-                        Current TI Store API responses are returning inventory units but no normalized
-                        price breaks for this watched set. The dashboard therefore shows
-                        inventory-only monitoring until a pricing source is available.
-                      </div>
-                    );
-                  }
-                  if (firstPriced > 0) {
-                    return (
-                      <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
-                        Direct TI Store prices are now captured for the watched universe.
-                        Price-trend classifications require two pricing-bearing captures.
-                        Currently {firstPriced} of {total} rows are waiting for the next
-                        capture before shortage / oversupply pressure can be calculated.
-                      </div>
-                    );
-                  }
-                  return null;
-                })()}
-              </div>
-            ) : (
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 900 }}>
-                  <thead>
-                    <tr>
-                      <th style={cellTH}>Signal</th>
-                      <th style={cellTH}>Strength</th>
-                      <th style={cellTH}>Part</th>
-                      <th style={cellTH}>Basket</th>
-                      <th style={cellTH}>Inventory Δ7d</th>
-                      <th style={cellTH}>Price Δ7d</th>
-                      <th style={cellTH}>Lead time Δ</th>
-                      <th style={cellTH}>Explanation</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {meaningful.slice(0, 15).map((s, idx) => (
-                      <tr key={`sig-${s.orderablePartNumber}-${idx}`}>
-                        <td style={{ ...cellTD, color: sigColor(s.signalType), fontWeight: 'bold' }}>{sigLabel(s.signalType)}</td>
-                        <td style={cellMono}>{s.signalStrength}</td>
-                        <td style={cellMono}>
-                          {s.orderablePartNumber}
-                          {s.displayName && <span style={{ color: '#7a96b8', marginLeft: 6, fontSize: '0.62rem' }}>· {s.displayName}</span>}
-                        </td>
-                        <td style={{ ...cellTD, color: '#a0b8d0' }}>{s.basket || '—'}</td>
-                        <td style={{ ...cellMono, color: s.inventoryPctDelta7d != null && s.inventoryPctDelta7d < 0 ? '#f0a84e' : s.inventoryPctDelta7d != null && s.inventoryPctDelta7d > 0 ? '#4dffc3' : '#7a96b8' }}>
-                          {s.inventoryPctDelta7d == null ? '—' : `${s.inventoryPctDelta7d > 0 ? '+' : ''}${s.inventoryPctDelta7d.toFixed(1)}%`}
-                        </td>
-                        <td style={{ ...cellMono, color: s.pricePctDelta7d != null && s.pricePctDelta7d > 0 ? '#f05c5c' : s.pricePctDelta7d != null && s.pricePctDelta7d < 0 ? '#4dffc3' : '#7a96b8' }}>
-                          {s.pricePctDelta7d == null ? '—' : `${s.pricePctDelta7d > 0 ? '+' : ''}${s.pricePctDelta7d.toFixed(1)}%`}
-                        </td>
-                        <td style={cellMono}>
-                          {s.leadTimeDelta == null ? '—' : `${s.leadTimeDelta > 0 ? '+' : ''}${s.leadTimeDelta} wk`}
-                        </td>
-                        <td style={{ ...cellTD, color: '#c4d4e8', fontSize: '0.66rem' }}>{s.explanation}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            {/* Phase 22.5 — Signal Leaderboard. 9 ranked tabs over the
+                same /signals/latest payload. Five filter by signalType
+                (shortage_pressure / oversupply_pressure / inventory_
+                tightening / supply_easing / price_only_pressure); four
+                sort by largest |delta| (inventory drops/builds, price
+                increases/decreases). Empty-state per tab is honest:
+                "No N detected." */}
+            {(() => {
+              const TABS = [
+                { id: 'shortage_pressure',    label: 'Shortage pressure',     color: '#f05c5c', kind: 'type' },
+                { id: 'oversupply_pressure',  label: 'Oversupply pressure',   color: '#3d8ef0', kind: 'type' },
+                { id: 'inventory_tightening', label: 'Inventory tightening',  color: '#f0a84e', kind: 'type' },
+                { id: 'supply_easing',        label: 'Supply easing',         color: '#00c9a7', kind: 'type' },
+                { id: 'price_only_pressure',  label: 'Price-only pressure',   color: '#ab6af0', kind: 'type' },
+                { id: 'inventory_drops',      label: 'Largest inventory drops',     color: '#f0a84e', kind: 'rank', sort: 'invDesc' },
+                { id: 'inventory_builds',     label: 'Largest inventory builds',    color: '#4dffc3', kind: 'rank', sort: 'invAsc' },
+                { id: 'price_increases',      label: 'Largest price increases',     color: '#f05c5c', kind: 'rank', sort: 'priceAsc' },
+                { id: 'price_decreases',      label: 'Largest price decreases',     color: '#4dffc3', kind: 'rank', sort: 'priceDesc' },
+              ];
+              const active = TABS.find(t => t.id === leaderboardTab) || TABS[0];
+              const fmtPct = v => v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
+              const fmtPrice = v => v == null ? '—' : `$${Number(v).toFixed(4)}`;
+              let rows = [];
+              if (active.kind === 'type') {
+                rows = sigList.filter(s => s.signalType === active.id);
+              } else {
+                // Rank tabs: sort all rows by abs delta direction. We take
+                // the per-row priceDelta / inventoryPctDelta from the
+                // persisted signal (latest-vs-previous; Phase 21A.3).
+                rows = sigList.slice();
+                if (active.sort === 'invDesc') {
+                  rows = rows.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta < 0)
+                    .sort((a, b) => a.inventoryPctDelta - b.inventoryPctDelta);
+                } else if (active.sort === 'invAsc') {
+                  rows = rows.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta > 0)
+                    .sort((a, b) => b.inventoryPctDelta - a.inventoryPctDelta);
+                } else if (active.sort === 'priceAsc') {
+                  rows = rows.filter(s => s.pricePctDelta != null && s.pricePctDelta > 0)
+                    .sort((a, b) => b.pricePctDelta - a.pricePctDelta);
+                } else if (active.sort === 'priceDesc') {
+                  rows = rows.filter(s => s.pricePctDelta != null && s.pricePctDelta < 0)
+                    .sort((a, b) => a.pricePctDelta - b.pricePctDelta);
+                }
+              }
+              const top = rows.slice(0, 15);
+              const totalUniverse = sigList.length;
+              const meaningfulTotal = sigList.filter(s => ['shortage_pressure','oversupply_pressure','inventory_tightening','supply_easing','price_only_pressure'].includes(s.signalType)).length;
+              return (
+                <div>
+                  {/* Tab strip */}
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 10, paddingBottom: 6, borderBottom: '1px solid #1a2740' }}>
+                    {TABS.map(t => {
+                      const on = t.id === active.id;
+                      const count = t.kind === 'type'
+                        ? sigList.filter(s => s.signalType === t.id).length
+                        : null;
+                      return (
+                        <button
+                          key={t.id}
+                          type="button"
+                          onClick={() => setLeaderboardTab(t.id)}
+                          style={{
+                            background: on ? '#0d1830' : 'none',
+                            border: '1px solid ' + (on ? t.color : '#1a2740'),
+                            borderRadius: 3,
+                            padding: '5px 10px',
+                            fontSize: '0.6rem',
+                            letterSpacing: '0.08em',
+                            textTransform: 'uppercase',
+                            color: on ? t.color : '#7a96b8',
+                            cursor: 'pointer',
+                            fontFamily: 'monospace',
+                            fontWeight: on ? 'bold' : 'normal',
+                          }}
+                        >{t.label}{count != null ? ` (${count})` : ''}</button>
+                      );
+                    })}
+                  </div>
+
+                  {top.length === 0 ? (
+                    <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.5, padding: '8px 0' }}>
+                      {meaningfulTotal === 0
+                        ? 'No pressure detected yet. Inventory and direct TI pricing are currently stable across the watched universe.'
+                        : `No ${active.label.toLowerCase()} in the current snapshot.`}
+                      {(() => {
+                        const priceUnavail = sigSummary?.priceUnavailableCount ?? 0;
+                        const firstPriced = sigList.filter(s => /Direct TI Store price captured; waiting for a second pricing observation/i.test(s.explanation || '')).length;
+                        if (totalUniverse > 0 && priceUnavail === totalUniverse) {
+                          return (
+                            <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
+                              Current TI Store API responses are returning inventory units but no normalized
+                              price breaks for this watched set. The dashboard therefore shows
+                              inventory-only monitoring until a pricing source is available.
+                            </div>
+                          );
+                        }
+                        if (firstPriced > 0) {
+                          return (
+                            <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
+                              Direct TI Store prices are now captured for the watched universe.
+                              Price-trend classifications require two pricing-bearing captures.
+                              Currently {firstPriced} of {totalUniverse} rows are waiting for the next
+                              capture before shortage / oversupply pressure can be calculated.
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
+                    </div>
+                  ) : (
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 900, fontFamily: 'monospace', fontSize: '0.66rem' }}>
+                        <thead>
+                          <tr>
+                            <th style={cellTH}>Part</th>
+                            <th style={cellTH}>Basket</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Inv now</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Inv prev</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Inv Δ%</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Price now</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Price prev</th>
+                            <th style={{ ...cellTH, textAlign: 'right' }}>Price Δ%</th>
+                            <th style={cellTH}>Signal</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {top.map((s, idx) => (
+                            <tr key={`lb-${active.id}-${s.partNumber || idx}`}>
+                              <td style={cellMono}>
+                                {s.partNumber || s.orderablePartNumber}
+                                {s.displayName && <span style={{ color: '#7a96b8', marginLeft: 6, fontSize: '0.6rem' }}>· {s.displayName}</span>}
+                              </td>
+                              <td style={{ ...cellTD, color: '#a0b8d0' }}>{s.basket || '—'}</td>
+                              <td style={{ ...cellMono, textAlign: 'right' }}>{s.latestQuantityAvailable != null ? Number(s.latestQuantityAvailable).toLocaleString() : '—'}</td>
+                              <td style={{ ...cellMono, textAlign: 'right', color: '#a0b8d0' }}>{s.previousQuantityAvailable != null ? Number(s.previousQuantityAvailable).toLocaleString() : '—'}</td>
+                              <td style={{ ...cellMono, textAlign: 'right', color: s.inventoryPctDelta == null ? '#7a96b8' : s.inventoryPctDelta < 0 ? '#f0a84e' : s.inventoryPctDelta > 0 ? '#4dffc3' : '#a0b8d0' }}>
+                                {fmtPct(s.inventoryPctDelta)}
+                              </td>
+                              <td style={{ ...cellMono, textAlign: 'right' }}>{fmtPrice(s.latestNormalizedUnitPrice)}</td>
+                              <td style={{ ...cellMono, textAlign: 'right', color: '#a0b8d0' }}>{fmtPrice(s.previousNormalizedUnitPrice)}</td>
+                              <td style={{ ...cellMono, textAlign: 'right', color: s.pricePctDelta == null ? '#7a96b8' : s.pricePctDelta > 0 ? '#f05c5c' : s.pricePctDelta < 0 ? '#4dffc3' : '#a0b8d0' }}>
+                                {fmtPct(s.pricePctDelta)}
+                              </td>
+                              <td style={{ ...cellTD, color: sigColor(s.signalType), fontWeight: active.kind === 'type' ? 'bold' : 'normal' }}>
+                                {sigLabel(s.signalType)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
             <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#a0b8d0', lineHeight: 1.5 }}>
               Shortage / oversupply signals require at least 3 observations. Current history depth: {medianObs} observation{medianObs === 1 ? '' : 's'} per part
               {minObs !== maxObs && (
