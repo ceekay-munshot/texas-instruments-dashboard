@@ -67,6 +67,7 @@ import {
   tokenCacheSnapshot as tiTokenCacheSnapshot,
   tiAttemptedEndpoints,
 } from './sources/tiDirect'
+import { captureTiCatalogSnapshot } from './sources/tiCatalogIngest'
 import {
   fetchWatchedPartsProductInfo,
   TI_WATCHED_PARTS,
@@ -127,6 +128,19 @@ type Bindings = {
    *  falls back to a per-day KV history tier so the dashboard still works
    *  end-to-end on a fresh deploy. */
   TI_INVENTORY_HISTORY_DB?: D1Database
+  /** Phase 23C — optional R2 binding for full-catalog raw-snapshot
+   *  archival. When unbound, /api/ti/universe/catalog/capture skips the
+   *  R2 PUT, returns rawR2Key: null + a warning, and still populates the
+   *  D1 latest tables. See wrangler.jsonc for the dashboard setup steps. */
+  TI_CATALOG_SNAPSHOTS_R2?: R2Bucket
+}
+
+// Phase 23C — minimal R2Bucket type sufficient for the catalog-archive
+// PUT we do here. The full Cloudflare R2 type is exported from
+// @cloudflare/workers-types; we only need the put() / head() surface.
+type R2Bucket = {
+  put(key: string, value: string | ArrayBuffer | ReadableStream, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>
+  head(key: string): Promise<unknown>
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -2907,6 +2921,66 @@ app.get('/api/ti/universe/catalog/probe', async (c) => {
     success: probe.status === 'ok',
     note: 'One-shot diagnostic. Not production ingestion. Does not expand the active 64-part watched universe. Does not mutate D1 / KV / R2. Used to decide whether full-universe scaling should be catalog-driven or OPN-batch-driven.',
     ...probe,
+  })
+})
+
+// Phase 23C — POST /api/ti/universe/catalog/capture
+// Auth-gated, one-shot full-catalog ingest. Fetches /v2/store/products/
+// catalog (~50MB / ~72k products), R2-archives the raw body if the
+// binding is bound, parses the catalog, upserts the latest per-OPN +
+// per-GPN state into D1, and inserts one snapshot-run summary row.
+//
+// Hard restrictions (matched in tiCatalogIngest.ts):
+//   - NEVER expands the active 64-part watched universe; the daily
+//     /inventory/capture endpoint stays on /v2/store/products/{partNumber}.
+//   - NEVER calls Product Info or any per-OPN endpoint; catalog only.
+//   - NEVER returns the raw response body, the OAuth token, or the
+//     Authorization header.
+//   - Operator-only — must not be scheduled yet, must not be called
+//     repeatedly. Designed for an explicit one-shot run.
+//
+// Pre-flight requirements:
+//   - SNAPSHOT_CAPTURE_SECRET set + provided in X-Capture-Secret header.
+//   - TI Product Information + Store API entitlement
+//     (TI_STORE_API_ENABLED='true').
+//   - D1 binding TI_INVENTORY_HISTORY_DB present + migration 0003
+//     applied (creates ti_catalog_snapshot_run, ti_catalog_latest_opn,
+//     ti_catalog_latest_gpn).
+//   - R2 binding TI_CATALOG_SNAPSHOTS_R2 OPTIONAL — endpoint degrades
+//     gracefully and returns rawR2Key: null + a warning when absent.
+app.post('/api/ti/universe/catalog/capture', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const result = await captureTiCatalogSnapshot(env as any)
+  return c.json({
+    success: result.success,
+    note: 'One-shot full-catalog ingest. NOT scheduled. Does not change the 64-part watched universe; daily capture continues unchanged.',
+    capturedAt: result.capturedAt,
+    source: result.source,
+    totalOpns: result.totalOpns,
+    totalGpns: result.totalGpns,
+    pricedOpns: result.pricedOpns,
+    inStockOpns: result.inStockOpns,
+    outOfStockOpns: result.outOfStockOpns,
+    rawR2Key: result.rawR2Key,
+    bodyByteSize: result.bodyByteSize,
+    d1RowsUpserted: result.d1RowsUpserted,
+    gpnRowsUpserted: result.gpnRowsUpserted,
+    parsedOk: result.parsedOk,
+    errors: result.errors,
+    warnings: result.warnings,
+    diagnostics: result.diagnostics,
   })
 })
 

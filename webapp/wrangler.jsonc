@@ -21,6 +21,26 @@
       "database_id": "17f3094d-37bf-4f1b-9f9a-aa5be1dfc9a2"
     }
   ]
+  // Phase 23C — TI_CATALOG_SNAPSHOTS_R2 binding (optional). Each
+  // /v2/store/products/catalog body is ~50MB raw — too big for D1 row
+  // storage and pointlessly hot for KV. R2 archives the raw body
+  // alongside the parsed D1 latest tables. The /api/ti/universe/
+  // catalog/capture endpoint degrades gracefully when this binding
+  // is absent: it skips the R2 PUT, returns rawR2Key: null + a
+  // warning, and still populates the D1 latest tables.
+  //
+  // The binding is INTENTIONALLY NOT declared here — adding an
+  // r2_buckets entry would block the Pages deploy until the bucket
+  // exists. Configure it through the Cloudflare dashboard so the
+  // deploy can ship before the bucket is created:
+  //   1. Cloudflare Dashboard → R2 → Create bucket → name:
+  //      ti-catalog-snapshots (or any name).
+  //   2. Workers & Pages → ti-price-dashboard → Settings → Bindings
+  //      → Add → R2 bucket → Variable name: TI_CATALOG_SNAPSHOTS_R2
+  //      → R2 bucket: <the bucket from step 1>.
+  //   3. Re-deploy (push any commit) — the binding becomes live on
+  //      the next deploy and the capture endpoint starts archiving.
+  //
   // Phase 21K — scheduled daily capture is driven by the GitHub Action
   // .github/workflows/ti-inventory-capture.yml, matching the existing
   // ti-snapshot-capture pattern. The wrangler.jsonc `triggers.crons` field

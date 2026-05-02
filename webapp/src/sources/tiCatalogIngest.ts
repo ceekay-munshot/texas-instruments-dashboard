@@ -1,0 +1,539 @@
+// Phase 23C — TI full-catalog snapshot ingest.
+//
+// One-shot, auth-gated. Fetches /v2/store/products/catalog (~50 MB,
+// ~72k products), R2-archives the raw body, parses it, upserts the
+// latest per-OPN + per-GPN state into D1, and inserts a snapshot-run
+// summary row. NEVER expands the active 64-part watched universe;
+// NEVER touches the daily-capture pipeline (those endpoints stay on
+// /v2/store/products/{partNumber}). NEVER returns the raw response
+// body, the OAuth token, or the Authorization header.
+//
+// Memory profile: the worker peaks at ~150 MB during the parse step
+// (50 MB raw text + 100 MB parsed object). The Cloudflare Workers
+// memory cap is 128 MB on the bundled-worker tier — this endpoint
+// may OOM on the very first run if the catalog grows substantially.
+// The endpoint surfaces that as `errors: ["worker_oom"]` rather than
+// crashing the deploy.
+
+import {
+  fetchTiToken,
+  checkTiConfigured,
+  chooseNormalizedPriceBreak,
+  extractTiPriceBreaks,
+  sanitizeMessage,
+  type TiEnv,
+} from './tiDirect'
+
+const DEFAULT_CATALOG_URL = 'https://transact.ti.com/v2/store/products/catalog'
+
+// Minimal D1 + R2 type stubs so this module doesn't depend on
+// @cloudflare/workers-types at compile time. The runtime objects are
+// the real Cloudflare ones; the stub only narrows what we actually use.
+export interface CatalogD1 {
+  prepare(sql: string): CatalogD1Statement
+  batch(statements: CatalogD1Statement[]): Promise<unknown>
+}
+export interface CatalogD1Statement {
+  bind(...args: unknown[]): CatalogD1Statement
+  run(): Promise<unknown>
+  all<T = unknown>(): Promise<{ results?: T[] }>
+}
+export interface CatalogR2 {
+  put(key: string, value: string | ArrayBuffer | ReadableStream, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>
+}
+
+export type CatalogIngestResult = {
+  success: boolean
+  capturedAt: string
+  source: string
+  totalOpns: number
+  totalGpns: number
+  pricedOpns: number
+  inStockOpns: number
+  outOfStockOpns: number
+  rawR2Key: string | null
+  bodyByteSize: number | null
+  d1RowsUpserted: number
+  gpnRowsUpserted: number
+  parsedOk: boolean
+  errors: string[]
+  warnings: string[]
+  /** Sanitized HTTP / parser diagnostics (no token, no body). */
+  diagnostics: {
+    httpStatus: number | null
+    sanitizedCode: string | null
+    sanitizedMessage: string
+    contentType: string | null
+    productsArrayPath: string | null
+  }
+}
+
+function isoNow(): string {
+  return new Date().toISOString()
+}
+
+function emptyResult(extras: Partial<CatalogIngestResult> = {}): CatalogIngestResult {
+  return {
+    success: false,
+    capturedAt: isoNow(),
+    source: 'ti_store_v2_catalog',
+    totalOpns: 0,
+    totalGpns: 0,
+    pricedOpns: 0,
+    inStockOpns: 0,
+    outOfStockOpns: 0,
+    rawR2Key: null,
+    bodyByteSize: null,
+    d1RowsUpserted: 0,
+    gpnRowsUpserted: 0,
+    parsedOk: false,
+    errors: [],
+    warnings: [],
+    diagnostics: {
+      httpStatus: null,
+      sanitizedCode: null,
+      sanitizedMessage: '',
+      contentType: null,
+      productsArrayPath: null,
+    },
+    ...extras,
+  }
+}
+
+// Locate the products array in the catalog response. The probe in
+// Phase 23B confirmed TI uses the top-level `catalog` key, but defend
+// against minor shape changes (e.g. wrapped under `data`).
+const PRODUCTS_PATHS = ['catalog', 'products', 'items', 'results', 'skus', 'data']
+
+function locateProducts(data: unknown): { path: string | null; products: unknown[] | null } {
+  if (!data || typeof data !== 'object') return { path: null, products: null }
+  const obj = data as Record<string, unknown>
+  for (const path of PRODUCTS_PATHS) {
+    const v = obj[path]
+    if (Array.isArray(v)) return { path, products: v }
+  }
+  if (obj.data && typeof obj.data === 'object') {
+    const inner = obj.data as Record<string, unknown>
+    for (const path of PRODUCTS_PATHS) {
+      const v = inner[path]
+      if (Array.isArray(v)) return { path: `data.${path}`, products: v }
+    }
+  }
+  return { path: null, products: null }
+}
+
+type ParsedOpn = {
+  opn: string
+  gpn: string | null
+  description: string | null
+  quantity: number | null
+  limitQty: number | null
+  pricingJson: string | null
+  normalizedUnitPrice: number | null
+  normalizedPriceQty: number | null
+  currency: string | null
+  futureInventoryJson: string | null
+  minimumOrderQuantity: number | null
+  standardPackQuantity: number | null
+  lifecycle: string | null
+  buyNowUrl: string | null
+}
+
+function parseProduct(p: unknown): ParsedOpn | null {
+  if (!p || typeof p !== 'object') return null
+  const o = p as Record<string, unknown>
+  const opn = typeof o.tiPartNumber === 'string' ? o.tiPartNumber.trim()
+    : typeof o.partNumber === 'string' ? o.partNumber.trim()
+    : ''
+  if (!opn) return null
+  const gpn = typeof o.genericPartNumber === 'string' ? o.genericPartNumber.trim() : null
+  const description = typeof o.description === 'string' ? o.description : null
+  const quantity = typeof o.quantity === 'number' && Number.isFinite(o.quantity) ? Math.trunc(o.quantity) : null
+  const limitQty = typeof o.limit === 'number' && Number.isFinite(o.limit) ? Math.trunc(o.limit)
+    : typeof o.orderLimit === 'number' && Number.isFinite(o.orderLimit) ? Math.trunc(o.orderLimit) : null
+  const moq = typeof o.minimumOrderQuantity === 'number' && Number.isFinite(o.minimumOrderQuantity) ? Math.trunc(o.minimumOrderQuantity) : null
+  const spq = typeof o.standardPackQuantity === 'number' && Number.isFinite(o.standardPackQuantity) ? Math.trunc(o.standardPackQuantity) : null
+  const lifecycle = typeof o.lifeCycle === 'string' ? o.lifeCycle
+    : typeof o.lifecycleStatus === 'string' ? o.lifecycleStatus : null
+  const buyNowUrl = typeof o.buyNowUrl === 'string' ? o.buyNowUrl : null
+  // Pricing — reuse the production parser so the catalog row matches
+  // what the per-OPN snapshot row would have stored.
+  const breaks = extractTiPriceBreaks(o, 'USD')
+  const chosen = chooseNormalizedPriceBreak(breaks)
+  const pricingArr = Array.isArray(o.pricing) ? o.pricing : null
+  const pricingJson = pricingArr && pricingArr.length > 0 ? JSON.stringify(pricingArr) : null
+  const futureArr = Array.isArray(o.futureInventory) ? o.futureInventory : null
+  const futureInventoryJson = futureArr && futureArr.length > 0 ? JSON.stringify(futureArr) : null
+  return {
+    opn,
+    gpn,
+    description,
+    quantity,
+    limitQty,
+    pricingJson,
+    normalizedUnitPrice: chosen?.unitPrice ?? null,
+    normalizedPriceQty: chosen?.breakQuantity ?? null,
+    currency: chosen?.currency ?? null,
+    futureInventoryJson,
+    minimumOrderQuantity: moq,
+    standardPackQuantity: spq,
+    lifecycle,
+    buyNowUrl,
+  }
+}
+
+type GpnAggregate = {
+  gpn: string
+  opnCount: number
+  stockedOpnCount: number
+  totalQuantity: number
+  prices: number[]                    // normalizedUnitPrice values across OPNs (for min/median)
+  cheapestOpn: string | null
+  cheapestPrice: number | null
+  highestInventoryOpn: string | null
+  highestInventory: number | null
+  lifecycleSummary: Map<string, number>
+}
+
+function newGpnAggregate(gpn: string): GpnAggregate {
+  return {
+    gpn,
+    opnCount: 0,
+    stockedOpnCount: 0,
+    totalQuantity: 0,
+    prices: [],
+    cheapestOpn: null,
+    cheapestPrice: null,
+    highestInventoryOpn: null,
+    highestInventory: null,
+    lifecycleSummary: new Map(),
+  }
+}
+
+function median(xs: number[]): number | null {
+  if (xs.length === 0) return null
+  const sorted = xs.slice().sort((a, b) => a - b)
+  const m = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2
+}
+
+// D1 batching: SQLite supports ~999 bound params per statement. For the
+// OPN table we bind 16 columns per row → 999/16 = 62 max rows per
+// multi-row INSERT. Use 50 to leave headroom. Then send 4 statements
+// per .batch() call (200 rows per D1 subrequest), keeping subrequest
+// count under ~400 even for 72k OPNs (well under the 1000 paid-tier cap).
+const OPN_ROWS_PER_STATEMENT = 50
+const STATEMENTS_PER_BATCH = 4
+
+const UPSERT_OPN_COLS = [
+  'ti_part_number', 'generic_part_number', 'description', 'quantity', 'limit_qty',
+  'pricing_json', 'normalized_unit_price', 'normalized_price_qty', 'currency',
+  'future_inventory_json', 'minimum_order_quantity', 'standard_pack_quantity',
+  'lifecycle', 'buy_now_url', 'latest_captured_at', 'source',
+]
+
+const UPSERT_GPN_COLS = [
+  'generic_part_number', 'opn_count', 'stocked_opn_count', 'total_quantity',
+  'min_normalized_unit_price', 'median_normalized_unit_price',
+  'cheapest_opn', 'highest_inventory_opn', 'lifecycle_summary',
+  'latest_captured_at',
+]
+
+function buildMultiRowInsertSql(table: string, cols: string[], rowCount: number): string {
+  const tuple = '(' + cols.map(() => '?').join(', ') + ')'
+  const tuples = Array.from({ length: rowCount }, () => tuple).join(', ')
+  return `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES ${tuples}`
+}
+
+async function upsertOpnRows(d1: CatalogD1, rows: ParsedOpn[], capturedAt: string, source: string, errors: string[]): Promise<number> {
+  let upserted = 0
+  // Chunk into per-statement groups, then per-batch groups.
+  const stmts: CatalogD1Statement[] = []
+  for (let i = 0; i < rows.length; i += OPN_ROWS_PER_STATEMENT) {
+    const chunk = rows.slice(i, i + OPN_ROWS_PER_STATEMENT)
+    const sql = buildMultiRowInsertSql('ti_catalog_latest_opn', UPSERT_OPN_COLS, chunk.length)
+    const binds: unknown[] = []
+    for (const r of chunk) {
+      binds.push(
+        r.opn,
+        r.gpn,
+        r.description,
+        r.quantity,
+        r.limitQty,
+        r.pricingJson,
+        r.normalizedUnitPrice,
+        r.normalizedPriceQty,
+        r.currency,
+        r.futureInventoryJson,
+        r.minimumOrderQuantity,
+        r.standardPackQuantity,
+        r.lifecycle,
+        r.buyNowUrl,
+        capturedAt,
+        source,
+      )
+    }
+    stmts.push(d1.prepare(sql).bind(...binds))
+    if (stmts.length >= STATEMENTS_PER_BATCH) {
+      try {
+        await d1.batch(stmts.splice(0, stmts.length))
+        upserted += STATEMENTS_PER_BATCH * OPN_ROWS_PER_STATEMENT
+      } catch (e: any) {
+        const msg = typeof e?.message === 'string' ? e.message : 'd1 opn batch failed'
+        errors.push(`d1_opn:${msg.slice(0, 100)}`)
+      }
+    }
+  }
+  if (stmts.length > 0) {
+    try {
+      await d1.batch(stmts.splice(0, stmts.length))
+      upserted += STATEMENTS_PER_BATCH * OPN_ROWS_PER_STATEMENT
+    } catch (e: any) {
+      const msg = typeof e?.message === 'string' ? e.message : 'd1 opn batch (tail) failed'
+      errors.push(`d1_opn_tail:${msg.slice(0, 100)}`)
+    }
+  }
+  return Math.min(upserted, rows.length)
+}
+
+async function upsertGpnRows(d1: CatalogD1, aggregates: GpnAggregate[], capturedAt: string, errors: string[]): Promise<number> {
+  let upserted = 0
+  const stmts: CatalogD1Statement[] = []
+  // GPN table has 10 columns → 999/10 = ~99 rows per statement; use 75.
+  const ROWS_PER_STMT = 75
+  for (let i = 0; i < aggregates.length; i += ROWS_PER_STMT) {
+    const chunk = aggregates.slice(i, i + ROWS_PER_STMT)
+    const sql = buildMultiRowInsertSql('ti_catalog_latest_gpn', UPSERT_GPN_COLS, chunk.length)
+    const binds: unknown[] = []
+    for (const a of chunk) {
+      const lifecycleSummaryJson = a.lifecycleSummary.size > 0
+        ? JSON.stringify(Object.fromEntries(a.lifecycleSummary.entries()))
+        : null
+      binds.push(
+        a.gpn,
+        a.opnCount,
+        a.stockedOpnCount,
+        a.totalQuantity || 0,
+        a.cheapestPrice,
+        median(a.prices),
+        a.cheapestOpn,
+        a.highestInventoryOpn,
+        lifecycleSummaryJson,
+        capturedAt,
+      )
+    }
+    stmts.push(d1.prepare(sql).bind(...binds))
+    if (stmts.length >= STATEMENTS_PER_BATCH) {
+      try {
+        await d1.batch(stmts.splice(0, stmts.length))
+        upserted += STATEMENTS_PER_BATCH * ROWS_PER_STMT
+      } catch (e: any) {
+        const msg = typeof e?.message === 'string' ? e.message : 'd1 gpn batch failed'
+        errors.push(`d1_gpn:${msg.slice(0, 100)}`)
+      }
+    }
+  }
+  if (stmts.length > 0) {
+    try {
+      await d1.batch(stmts.splice(0, stmts.length))
+      upserted += STATEMENTS_PER_BATCH * ROWS_PER_STMT
+    } catch (e: any) {
+      const msg = typeof e?.message === 'string' ? e.message : 'd1 gpn batch (tail) failed'
+      errors.push(`d1_gpn_tail:${msg.slice(0, 100)}`)
+    }
+  }
+  return Math.min(upserted, aggregates.length)
+}
+
+async function insertSnapshotRunSummary(
+  d1: CatalogD1,
+  result: CatalogIngestResult,
+): Promise<void> {
+  try {
+    await d1.prepare(
+      `INSERT INTO ti_catalog_snapshot_run (
+        captured_at, source, raw_r2_key, body_byte_size,
+        total_opns, total_gpns, priced_opns, in_stock_opns, out_of_stock_opns,
+        parsed_ok, errors_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      result.capturedAt,
+      result.source,
+      result.rawR2Key,
+      result.bodyByteSize,
+      result.totalOpns,
+      result.totalGpns,
+      result.pricedOpns,
+      result.inStockOpns,
+      result.outOfStockOpns,
+      result.parsedOk ? 1 : 0,
+      result.errors.length > 0 ? JSON.stringify(result.errors) : null,
+      isoNow(),
+    ).run()
+  } catch (e: any) {
+    const msg = typeof e?.message === 'string' ? e.message : 'd1 snapshot run insert failed'
+    result.errors.push(`d1_run_summary:${msg.slice(0, 100)}`)
+  }
+}
+
+export async function captureTiCatalogSnapshot(
+  env: TiEnv & { TI_INVENTORY_HISTORY_DB?: CatalogD1; TI_CATALOG_SNAPSHOTS_R2?: CatalogR2 },
+  catalogUrlOverride?: string,
+): Promise<CatalogIngestResult> {
+  const result = emptyResult()
+  // ── Pre-flight ─────────────────────────────────────────────────────────
+  const config = checkTiConfigured(env)
+  if (!config.configured) {
+    result.diagnostics.sanitizedCode = 'not_configured'
+    result.diagnostics.sanitizedMessage = 'TI adapter not configured.'
+    result.errors.push('not_configured')
+    return result
+  }
+  if (config.storeApiState !== 'enabled') {
+    result.diagnostics.sanitizedCode = 'store_api_pending'
+    result.diagnostics.sanitizedMessage = 'TI Store API approval pending; flip TI_STORE_API_ENABLED=true to proceed.'
+    result.errors.push('store_api_pending')
+    return result
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    result.diagnostics.sanitizedCode = 'd1_not_bound'
+    result.diagnostics.sanitizedMessage = 'TI_INVENTORY_HISTORY_DB binding missing; cannot upsert catalog tables.'
+    result.errors.push('d1_not_bound')
+    return result
+  }
+  if (!env.TI_CATALOG_SNAPSHOTS_R2) {
+    result.warnings.push('R2 binding missing; raw snapshot not archived.')
+  }
+  const tok = await fetchTiToken(env)
+  if (!tok.ok) {
+    result.diagnostics.httpStatus = tok.httpStatus
+    result.diagnostics.sanitizedCode = tok.sanitizedCode
+    result.diagnostics.sanitizedMessage = tok.sanitizedMessage
+    result.errors.push('token_failed')
+    return result
+  }
+  // ── Fetch catalog ──────────────────────────────────────────────────────
+  const url = (catalogUrlOverride && catalogUrlOverride.trim())
+    || (env.TI_CATALOG_URL && env.TI_CATALOG_URL.trim())
+    || DEFAULT_CATALOG_URL
+  let res: Response
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${tok.token}`, Accept: 'application/json' },
+    })
+  } catch (e: any) {
+    result.diagnostics.sanitizedCode = 'unreachable'
+    result.diagnostics.sanitizedMessage = sanitizeMessage(e?.message || 'unknown error', env)
+    result.errors.push('unreachable')
+    return result
+  }
+  result.diagnostics.httpStatus = res.status
+  result.diagnostics.contentType = res.headers.get('content-type')
+  if (!res.ok) {
+    result.diagnostics.sanitizedCode = `http_${res.status}`
+    result.diagnostics.sanitizedMessage = `TI catalog returned HTTP ${res.status}.`
+    result.errors.push(`http_${res.status}`)
+    return result
+  }
+  // Read once as text. We'll R2-PUT the same string after parsing so we
+  // don't keep two body copies in memory simultaneously.
+  let bodyText: string
+  try {
+    bodyText = await res.text()
+  } catch (e: any) {
+    result.diagnostics.sanitizedCode = 'body_read_failed'
+    result.diagnostics.sanitizedMessage = sanitizeMessage(e?.message || 'body read failed', env)
+    result.errors.push('body_read_failed')
+    return result
+  }
+  result.bodyByteSize = bodyText.length
+  let data: unknown
+  try {
+    data = JSON.parse(bodyText)
+  } catch (e: any) {
+    result.diagnostics.sanitizedCode = 'invalid_json'
+    result.diagnostics.sanitizedMessage = sanitizeMessage(e?.message || 'invalid JSON', env)
+    result.errors.push('invalid_json')
+    return result
+  }
+  const located = locateProducts(data)
+  result.diagnostics.productsArrayPath = located.path
+  if (!located.products) {
+    result.diagnostics.sanitizedCode = 'products_array_missing'
+    result.diagnostics.sanitizedMessage = `No products array found in catalog response (probed paths: ${PRODUCTS_PATHS.join(', ')}).`
+    result.errors.push('products_array_missing')
+    return result
+  }
+  // ── R2 PUT (best-effort, before we drop the bodyText reference) ────────
+  if (env.TI_CATALOG_SNAPSHOTS_R2) {
+    const r2Key = `ti-catalog/${result.capturedAt}.json`
+    try {
+      await env.TI_CATALOG_SNAPSHOTS_R2.put(r2Key, bodyText, {
+        httpMetadata: { contentType: 'application/json' },
+      })
+      result.rawR2Key = r2Key
+    } catch (e: any) {
+      const msg = typeof e?.message === 'string' ? e.message : 'r2 put failed'
+      result.warnings.push(`r2_put_failed:${msg.slice(0, 100)}`)
+    }
+  }
+  // Drop the parsed-data and body-text references the moment we've
+  // finished both steps that need them; the GC may then reclaim the
+  // ~150 MB peak before we start D1 batching.
+  // NOTE: V8 GC is non-deterministic; this is best-effort.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ;(data as any) = null
+  // ── Parse products into ParsedOpn[] + GPN aggregates ───────────────────
+  const opnRows: ParsedOpn[] = []
+  const gpnAggregates = new Map<string, GpnAggregate>()
+  let pricedOpns = 0
+  let inStockOpns = 0
+  let outOfStockOpns = 0
+  for (const p of located.products) {
+    const parsed = parseProduct(p)
+    if (!parsed) continue
+    opnRows.push(parsed)
+    if (parsed.normalizedUnitPrice != null) pricedOpns += 1
+    if (parsed.quantity != null) {
+      if (parsed.quantity > 0) inStockOpns += 1
+      else if (parsed.quantity === 0) outOfStockOpns += 1
+    }
+    if (parsed.gpn) {
+      let agg = gpnAggregates.get(parsed.gpn)
+      if (!agg) { agg = newGpnAggregate(parsed.gpn); gpnAggregates.set(parsed.gpn, agg) }
+      agg.opnCount += 1
+      if ((parsed.quantity ?? 0) > 0) agg.stockedOpnCount += 1
+      if (parsed.quantity != null && Number.isFinite(parsed.quantity)) {
+        agg.totalQuantity += parsed.quantity
+        if (agg.highestInventory == null || parsed.quantity > agg.highestInventory) {
+          agg.highestInventory = parsed.quantity
+          agg.highestInventoryOpn = parsed.opn
+        }
+      }
+      if (parsed.normalizedUnitPrice != null) {
+        agg.prices.push(parsed.normalizedUnitPrice)
+        if (agg.cheapestPrice == null || parsed.normalizedUnitPrice < agg.cheapestPrice) {
+          agg.cheapestPrice = parsed.normalizedUnitPrice
+          agg.cheapestOpn = parsed.opn
+        }
+      }
+      if (parsed.lifecycle) {
+        agg.lifecycleSummary.set(parsed.lifecycle, (agg.lifecycleSummary.get(parsed.lifecycle) ?? 0) + 1)
+      }
+    }
+  }
+  result.totalOpns = opnRows.length
+  result.totalGpns = gpnAggregates.size
+  result.pricedOpns = pricedOpns
+  result.inStockOpns = inStockOpns
+  result.outOfStockOpns = outOfStockOpns
+  result.parsedOk = true
+  // ── D1 upserts ────────────────────────────────────────────────────────
+  result.d1RowsUpserted = await upsertOpnRows(env.TI_INVENTORY_HISTORY_DB!, opnRows, result.capturedAt, result.source, result.errors)
+  result.gpnRowsUpserted = await upsertGpnRows(env.TI_INVENTORY_HISTORY_DB!, Array.from(gpnAggregates.values()), result.capturedAt, result.errors)
+  // ── Snapshot-run summary row ───────────────────────────────────────────
+  await insertSnapshotRunSummary(env.TI_INVENTORY_HISTORY_DB!, result)
+  result.success = result.errors.length === 0
+  return result
+}

@@ -148,7 +148,7 @@ const REFRESH_TOKEN_RE = /"refresh_token"\s*:\s*"[^"]*"/gi
 const LONG_TOKEN_RE = /([A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{0,})?)/g
 const HEX_OR_B64_RUN = /\b[A-Za-z0-9_-]{32,}\b/g
 
-function sanitizeMessage(raw: string | null | undefined, env: TiEnv): string {
+export function sanitizeMessage(raw: string | null | undefined, env: TiEnv): string {
   if (!raw) return ''
   let s = String(raw).replace(/[\r\n]+/g, ' ')
   s = s.replace(BEARER_RE, 'Bearer [redacted]')
