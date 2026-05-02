@@ -1108,18 +1108,20 @@ export async function fetchTiInventoryPricing(
     }, ['ti_invalid_json'])
   }
   const p = data?.product ?? data?.data ?? data
-  // Defensive normalization — TI's exact field names will solidify with the
-  // first successful Store API call. Each access is null-safe.
+  // Phase 21D.1 — TI Store production shape is nested:
+  //   pricing[] -> { currency, priceBreaks[] -> { priceBreakQuantity, price } }
+  // extractTiPriceBreaks handles that AND the legacy flat shape; both come
+  // back as a single flat normalized array so the rest of the pipeline can
+  // stay shape-agnostic. Returns [] (not null) when nothing extractable.
+  const extracted = extractTiPriceBreaks(p, 'USD')
   const pricing: Array<{ breakQuantity: number; unitPrice: number; currency: string }> | null =
-    Array.isArray(p?.pricing)
-      ? p.pricing
-          .map((b: any) => ({
-            breakQuantity: Number(b?.breakQuantity ?? b?.quantity ?? 0),
-            unitPrice: Number(b?.unitPrice ?? b?.price ?? 0),
-            currency: typeof b?.currency === 'string' ? b.currency : 'USD',
-          }))
-          .filter((r: any) => Number.isFinite(r.breakQuantity) && Number.isFinite(r.unitPrice) && r.unitPrice > 0)
-      : null
+    extracted.length > 0
+      ? extracted.map(b => ({
+          breakQuantity: b.breakQuantity,
+          unitPrice: b.unitPrice,
+          currency: b.currency ?? 'USD',
+        }))
+      : (Array.isArray(p?.pricing) ? [] : null)
   const futureInventory: Array<{ forecastDate: string; forecastQuantity: number }> | null =
     Array.isArray(p?.futureInventory)
       ? p.futureInventory
@@ -1152,18 +1154,119 @@ export async function fetchTiInventoryPricing(
   }
 }
 
-// ── Phase 21D — pricing normalization + diagnostic ─────────────────────────
+// ── Phase 21D / 21D.1 — pricing normalization + diagnostic ─────────────────
+
+/** Phase 21D.1 — robust extractor for TI Store price breaks. Handles two
+ *  shapes that we've actually observed in the wild:
+ *
+ *  A) Nested (TI's current production shape):
+ *       pricing: [
+ *         { currency: "USD",
+ *           priceBreaks: [
+ *             { priceBreakQuantity: 1,  price: 2.03 },
+ *             { priceBreakQuantity: 10, price: 1.43 },
+ *             { priceBreakQuantity: 25, price: 1.35 } ] } ]
+ *
+ *  B) Legacy flat:
+ *       pricing: [{ breakQuantity, unitPrice, currency }]
+ *
+ *  Quantity field aliases:  priceBreakQuantity, breakQuantity, quantity, qty,
+ *                           minimumQuantity
+ *  Price field aliases:     price, unitPrice, value, priceEach
+ *  Currency aliases:        break.currency, container.currency, p.currency,
+ *                           defaultCurrency fallback (caller-supplied; the
+ *                           production parser passes 'USD' since the URL is
+ *                           ?currency=USD).
+ *
+ *  Drops entries with non-finite breakQuantity ≤ 0 or unitPrice ≤ 0. Returns
+ *  a flat normalized array with a `sourceShape` marker so diagnostics can
+ *  report which path matched. */
+export type ExtractedPriceBreak = {
+  breakQuantity: number
+  unitPrice: number
+  currency: string | null
+  sourceShape: 'ti_nested_priceBreaks' | 'flat_pricing'
+}
+
+const PRICE_BREAK_QTY_ALIASES = ['priceBreakQuantity', 'breakQuantity', 'quantity', 'qty', 'minimumQuantity'] as const
+const PRICE_BREAK_PRICE_ALIASES = ['price', 'unitPrice', 'value', 'priceEach'] as const
+
+function readNumberAlias(obj: any, keys: readonly string[]): number {
+  if (!obj || typeof obj !== 'object') return NaN
+  for (const k of keys) {
+    const v = (obj as any)[k]
+    if (v != null) {
+      const n = typeof v === 'number' ? v : Number(v)
+      if (Number.isFinite(n)) return n
+    }
+  }
+  return NaN
+}
+
+export function extractTiPriceBreaks(
+  productLike: any,
+  defaultCurrency: string | null = 'USD',
+): ExtractedPriceBreak[] {
+  const out: ExtractedPriceBreak[] = []
+  if (!productLike || typeof productLike !== 'object') return out
+  const pricingArr = Array.isArray(productLike.pricing) ? productLike.pricing : []
+  const productCurrency = typeof productLike.currency === 'string' ? productLike.currency : null
+  for (const container of pricingArr) {
+    if (!container || typeof container !== 'object') continue
+    const containerCurrency =
+      typeof (container as any).currency === 'string' ? (container as any).currency : null
+    // Shape A — nested priceBreaks (current TI Store production shape).
+    if (Array.isArray((container as any).priceBreaks)) {
+      for (const br of (container as any).priceBreaks) {
+        if (!br || typeof br !== 'object') continue
+        const breakQuantity = readNumberAlias(br, PRICE_BREAK_QTY_ALIASES)
+        const unitPrice = readNumberAlias(br, PRICE_BREAK_PRICE_ALIASES)
+        if (!Number.isFinite(breakQuantity) || breakQuantity <= 0) continue
+        if (!Number.isFinite(unitPrice) || unitPrice <= 0) continue
+        const breakCurrency =
+          typeof (br as any).currency === 'string' ? (br as any).currency : null
+        out.push({
+          breakQuantity,
+          unitPrice,
+          currency: breakCurrency ?? containerCurrency ?? productCurrency ?? defaultCurrency,
+          sourceShape: 'ti_nested_priceBreaks',
+        })
+      }
+      continue
+    }
+    // Shape B — legacy flat pricing entries.
+    const breakQuantity = readNumberAlias(container, PRICE_BREAK_QTY_ALIASES)
+    const unitPrice = readNumberAlias(container, PRICE_BREAK_PRICE_ALIASES)
+    if (!Number.isFinite(breakQuantity) || breakQuantity <= 0) continue
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) continue
+    out.push({
+      breakQuantity,
+      unitPrice,
+      currency: containerCurrency ?? productCurrency ?? defaultCurrency,
+      sourceShape: 'flat_pricing',
+    })
+  }
+  return out
+}
 
 /** Pick the price break that the dashboard uses as `normalizedUnitPrice`.
- *  Spec: prefer 1000-piece, then 100, then 1, then the largest break ≤ 1000.
- *  Returns null if no positive-priced break exists. */
+ *  Spec: prefer 1000-piece, then 100, then 1, then the largest break ≤ 1000,
+ *  else the lowest available break. Returns null if no usable break exists. */
 export function chooseNormalizedPriceBreak(
-  pricing: TiInventoryPricing['pricing'],
+  pricing: TiInventoryPricing['pricing'] | ExtractedPriceBreak[] | null | undefined,
 ): { breakQuantity: number; unitPrice: number; currency: string } | null {
   if (!Array.isArray(pricing) || pricing.length === 0) return null
-  const valid = pricing.filter(b =>
-    Number.isFinite(b.breakQuantity) && Number.isFinite(b.unitPrice) && b.unitPrice > 0,
-  )
+  const valid = pricing
+    .filter(b =>
+      Number.isFinite((b as any).breakQuantity) &&
+      Number.isFinite((b as any).unitPrice) &&
+      (b as any).unitPrice > 0,
+    )
+    .map(b => ({
+      breakQuantity: Number((b as any).breakQuantity),
+      unitPrice: Number((b as any).unitPrice),
+      currency: typeof (b as any).currency === 'string' ? (b as any).currency : 'USD',
+    }))
   if (valid.length === 0) return null
   const at = (q: number) => valid.find(b => b.breakQuantity === q) ?? null
   const at1000 = at(1000)
@@ -1172,10 +1275,12 @@ export function chooseNormalizedPriceBreak(
   if (at100) return at100
   const at1 = at(1)
   if (at1) return at1
-  // Largest break <= 1000; falls back to the smallest break if all > 1000.
+  // Largest break <= 1000; falls back to the lowest break if all > 1000.
   const sortedDesc = valid.slice().sort((a, b) => b.breakQuantity - a.breakQuantity)
   const leMax = sortedDesc.find(b => b.breakQuantity <= 1000)
-  return leMax ?? sortedDesc[sortedDesc.length - 1]
+  if (leMax) return leMax
+  // All breaks > 1000 — return the smallest (cheapest fully-qualified break).
+  return valid.slice().sort((a, b) => a.breakQuantity - b.breakQuantity)[0]
 }
 
 /** Sanitized debug shape used by the auth-gated pricing-diagnostic endpoint.
@@ -1201,6 +1306,12 @@ export type TiInventoryPricingDebug = {
   parsedFutureInventoryLength: number
   pricingFirstBreakKeys: string[]
   pricingFirstBreakSample: { breakQuantity: number; unitPrice: number; currency: string } | null
+  // Phase 21D.1 — nested-shape evidence so the diagnostic can prove that the
+  // refactored extractor sees what TI actually returns.
+  pricingContainerLength: number
+  nestedPriceBreaksLength: number
+  firstPriceBreakKeys: string[]
+  extractedSourceShape: ExtractedPriceBreak['sourceShape'] | null
   parserOutput: {
     pricingAvailability: 'available' | 'unavailable' | 'pending_approval' | 'unknown'
     normalizedUnitPrice: number | null
@@ -1241,6 +1352,10 @@ export async function fetchTiInventoryPricingDebug(
     parsedFutureInventoryLength: 0,
     pricingFirstBreakKeys: [],
     pricingFirstBreakSample: null,
+    pricingContainerLength: 0,
+    nestedPriceBreaksLength: 0,
+    firstPriceBreakKeys: [],
+    extractedSourceShape: null,
     parserOutput: {
       pricingAvailability: 'unknown',
       normalizedUnitPrice: null,
@@ -1321,35 +1436,40 @@ export async function fetchTiInventoryPricingDebug(
     }
     return { key, type: Array.isArray(v) ? 'array' : (v == null ? 'absent' : typeof v), arrayLength, firstItemKeys }
   })
-  // Reuse the production parser logic so the debug output exactly matches
-  // what the live capture would have written for this part.
-  const pricing: Array<{ breakQuantity: number; unitPrice: number; currency: string }> | null =
-    Array.isArray(p?.pricing)
-      ? p.pricing
-          .map((b: any) => ({ breakQuantity: Number(b?.breakQuantity ?? b?.quantity ?? 0), unitPrice: Number(b?.unitPrice ?? b?.price ?? 0), currency: typeof b?.currency === 'string' ? b.currency : 'USD' }))
-          .filter((r: any) => Number.isFinite(r.breakQuantity) && Number.isFinite(r.unitPrice) && r.unitPrice > 0)
-      : null
+  // Phase 21D.1 — route through the same extractor the production parser
+  // uses (handles BOTH the nested TI Store shape and the legacy flat shape).
+  const extracted = extractTiPriceBreaks(p, 'USD')
   const futureInventory: Array<any> | null =
     Array.isArray(p?.futureInventory)
       ? p.futureInventory.filter((r: any) => r && typeof r === 'object')
       : null
-  const chosen = chooseNormalizedPriceBreak(pricing)
-  const pricingAvailability = Array.isArray(pricing) && pricing.length > 0 ? 'available' : 'unavailable'
+  const chosen = chooseNormalizedPriceBreak(extracted)
+  const pricingAvailability = extracted.length > 0 ? 'available' : 'unavailable'
   const quantityAvailable = typeof p?.quantity === 'number' ? p.quantity : (typeof p?.availableQuantity === 'number' ? p.availableQuantity : null)
   const orderLimit = typeof p?.orderLimit === 'number' ? p.orderLimit : null
-  const pricingFirstBreakKeys = Array.isArray(p?.pricing) && p.pricing[0] && typeof p.pricing[0] === 'object'
-    ? Object.keys(p.pricing[0])
+  // Nested-shape evidence for the diagnostic — counts that prove which
+  // shape the extractor saw, without leaking raw prices.
+  const pricingArr = Array.isArray(p?.pricing) ? p.pricing : []
+  const pricingFirstBreakKeys = pricingArr[0] && typeof pricingArr[0] === 'object' ? Object.keys(pricingArr[0]) : []
+  const nestedContainerWithBreaks = pricingArr.find((c: any) => c && Array.isArray(c.priceBreaks) && c.priceBreaks.length > 0)
+  const nestedPriceBreaks = nestedContainerWithBreaks ? nestedContainerWithBreaks.priceBreaks : []
+  const firstPriceBreakKeys = nestedPriceBreaks[0] && typeof nestedPriceBreaks[0] === 'object'
+    ? Object.keys(nestedPriceBreaks[0])
     : []
+  const extractedSourceShape: ExtractedPriceBreak['sourceShape'] | null = extracted[0]?.sourceShape ?? null
   const altCandidate = candidateKeyProbe.find(c => c.key !== 'pricing' && c.arrayLength != null && c.arrayLength > 0)
   let diagnosis = ''
-  if (pricing && pricing.length > 0) {
-    diagnosis = `TI returned ${pricing.length} price break(s); chosen normalized unit price = ${chosen?.unitPrice ?? 'n/a'} ${chosen?.currency ?? ''} at qty=${chosen?.breakQuantity ?? 'n/a'}.`
+  if (extracted.length > 0) {
+    const shapeLabel = extractedSourceShape === 'ti_nested_priceBreaks'
+      ? 'TI nested pricing[].priceBreaks[] (priceBreakQuantity/price)'
+      : 'legacy flat pricing[] (breakQuantity/unitPrice)'
+    diagnosis = `Parsed ${extracted.length} price break(s) via ${shapeLabel}; chosen normalized unit price = ${chosen?.unitPrice ?? 'n/a'} ${chosen?.currency ?? ''} at qty=${chosen?.breakQuantity ?? 'n/a'}.`
   } else if (altCandidate) {
-    diagnosis = `Parser missed pricing — TI returned data under "${altCandidate.key}" (length=${altCandidate.arrayLength}), not "pricing". First-item keys: ${altCandidate.firstItemKeys.join(',')}.`
-  } else if (Array.isArray(p?.pricing) && p.pricing.length > 0) {
-    diagnosis = 'TI returned a "pricing" array but every entry was filtered (non-finite breakQuantity / unitPrice or unitPrice ≤ 0). Inspect pricingFirstBreakKeys.'
+    diagnosis = `Pricing not under "pricing" — TI returned data under "${altCandidate.key}" (length=${altCandidate.arrayLength}). First-item keys: ${altCandidate.firstItemKeys.join(',')}.`
+  } else if (pricingArr.length > 0) {
+    diagnosis = `TI returned a "pricing" container with ${pricingArr.length} entries, but no usable break (every priceBreaks entry filtered: non-finite/zero qty or price). first-item keys: ${pricingFirstBreakKeys.join(',')}.`
   } else {
-    diagnosis = 'TI Store API returned the part successfully, but the response carries no pricing array under any known candidate key — pricing is genuinely unavailable for this part/account.'
+    diagnosis = 'TI Store API returned the part successfully, but the response carries no pricing container under any known candidate key — pricing is genuinely unavailable for this part/account.'
   }
   return {
     ...baseDebug,
@@ -1361,16 +1481,20 @@ export async function fetchTiInventoryPricingDebug(
     productLevelKeys,
     productLevelKeysFound,
     candidateKeyProbe,
-    parsedPricingArrayLength: Array.isArray(p?.pricing) ? p.pricing.length : 0,
+    parsedPricingArrayLength: pricingArr.length,
     parsedFutureInventoryLength: Array.isArray(futureInventory) ? futureInventory.length : 0,
     pricingFirstBreakKeys,
     pricingFirstBreakSample: chosen,
+    pricingContainerLength: pricingArr.length,
+    nestedPriceBreaksLength: nestedPriceBreaks.length,
+    firstPriceBreakKeys,
+    extractedSourceShape,
     parserOutput: {
       pricingAvailability,
       normalizedUnitPrice: chosen?.unitPrice ?? null,
       normalizedPriceQty: chosen?.breakQuantity ?? null,
       normalizedCurrency: chosen?.currency ?? null,
-      priceBreaksCount: pricing?.length ?? 0,
+      priceBreaksCount: extracted.length,
       quantityAvailable,
       orderLimit,
     },

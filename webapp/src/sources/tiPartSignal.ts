@@ -250,6 +250,17 @@ export type TiPartSignalPublic = {
   normalizedUnitPrice: number | null
   normalizedPriceQty: number | null
   currency: string | null
+  // Phase 21D.1 — provenance fields that the dashboard surfaces in the
+  // Pricing Source Status card and in /signals/latest rows. pricingSource
+  // = 'direct_ti_store_price' once the TI Store I&P parser returned at
+  // least one usable break; 'unavailable' otherwise. pricingConfidence is
+  // a coarse high/medium/none — high when direct TI Store breaks parsed.
+  // priceBreaks carries the full normalized array so the UI can render
+  // alternate qty=1/100/1000 prices without an extra round-trip; it's
+  // public commerce info, no secrets.
+  pricingSource: 'direct_ti_store_price' | 'unavailable'
+  pricingConfidence: 'high' | 'medium' | 'none'
+  priceBreaks: Array<{ breakQuantity: number; unitPrice: number; currency: string }> | null
   orderLimit: number | null
   futureInventoryVisibility: {
     forecastCount: number
@@ -366,11 +377,24 @@ export function toPublicPartSignal(
     pricingAvailability: signal.signals.pricingSignal,
     // Phase 21D — derive normalized pricing from the TI Store price breaks
     // using the 1000 → 100 → 1 → nearest-lowest priority. When TI returned
-    // no usable break (most parts today) all three fields stay null and
+    // no usable break the three normalized fields stay null and
     // pricingAvailability is already 'unavailable'.
-    normalizedUnitPrice: chooseNormalizedPriceBreak(signal.pricing)?.unitPrice ?? null,
-    normalizedPriceQty: chooseNormalizedPriceBreak(signal.pricing)?.breakQuantity ?? null,
-    currency: signal.currency,
+    // Phase 21D.1 — also surface pricingSource / pricingConfidence /
+    // priceBreaks so /signals/latest can show a per-source breakdown and
+    // the UI can show alternate qty breaks for the selected part.
+    ...(() => {
+      const chosen = chooseNormalizedPriceBreak(signal.pricing)
+      const hasDirectTiPrice = chosen != null
+      const breaks = Array.isArray(signal.pricing) ? signal.pricing : null
+      return {
+        normalizedUnitPrice: chosen?.unitPrice ?? null,
+        normalizedPriceQty: chosen?.breakQuantity ?? null,
+        currency: chosen?.currency ?? signal.currency,
+        pricingSource: hasDirectTiPrice ? ('direct_ti_store_price' as const) : ('unavailable' as const),
+        pricingConfidence: hasDirectTiPrice ? ('high' as const) : ('none' as const),
+        priceBreaks: breaks,
+      }
+    })(),
     orderLimit: signal.orderLimit,
     futureInventoryVisibility: {
       forecastCount: futureRows.length,
@@ -437,6 +461,9 @@ function buildExceptionRow(
     normalizedUnitPrice: null,
     normalizedPriceQty: null,
     currency: null,
+    pricingSource: 'unavailable',
+    pricingConfidence: 'none',
+    priceBreaks: null,
     orderLimit: null,
     futureInventoryVisibility: { forecastCount: 0, nextForecastDate: null, nextForecastQuantity: null },
     leadTimeWeeks: null,

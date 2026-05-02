@@ -81,6 +81,10 @@ export type HistoryRow = {
   currency: string | null
   normalizedUnitPrice: number | null
   normalizedPriceQty: number | null
+  /** Phase 21D.1 — full normalized break array, JSON-serialized into the
+   *  D1 price_breaks_json column on every capture. Null when TI returned
+   *  no breaks. Public commerce info, no secrets. */
+  priceBreaks: Array<{ breakQuantity: number; unitPrice: number; currency: string }> | null
   orderLimit: number | null
   leadTimeWeeks: number | null
   lifecycleStatus: string | null
@@ -123,6 +127,7 @@ export function toHistoryRow(p: TiPartSignalPublic, capturedAt: string): History
     currency: p.currency ?? (priceAvailable ? 'USD' : null),
     normalizedUnitPrice: p.normalizedUnitPrice ?? null,
     normalizedPriceQty: p.normalizedPriceQty ?? null,
+    priceBreaks: p.priceBreaks ?? null,
     orderLimit: p.orderLimit ?? null,
     leadTimeWeeks: p.leadTimeWeeks ?? null,
     lifecycleStatus: p.lifecycleStatus ?? null,
@@ -221,7 +226,7 @@ async function appendInventoryHistoryD1(d1: D1Database, rows: HistoryRow[]): Pro
               r.quantityAvailable,
               r.priceAvailable ? 1 : 0,
               r.currency,
-              null,
+              r.priceBreaks && r.priceBreaks.length > 0 ? JSON.stringify(r.priceBreaks) : null,
               r.normalizedUnitPrice,
               r.normalizedPriceQty,
               r.orderLimit,
@@ -271,7 +276,7 @@ async function appendInventoryHistoryD1(d1: D1Database, rows: HistoryRow[]): Pro
           r.quantityAvailable,
           r.priceAvailable ? 1 : 0,
           r.currency,
-          null,
+          r.priceBreaks && r.priceBreaks.length > 0 ? JSON.stringify(r.priceBreaks) : null,
           r.normalizedUnitPrice,
           r.normalizedPriceQty,
           r.orderLimit,
@@ -487,6 +492,7 @@ function rowFromD1(r: any): HistoryRow {
     currency: r.currency ?? null,
     normalizedUnitPrice: r.normalized_unit_price ?? null,
     normalizedPriceQty: r.normalized_price_qty ?? null,
+    priceBreaks: tryParsePriceBreaks(r.price_breaks_json),
     orderLimit: r.order_limit ?? null,
     leadTimeWeeks: r.lead_time_weeks ?? null,
     lifecycleStatus: r.lifecycle_status ?? null,
@@ -510,6 +516,26 @@ function tryParseArray(s: unknown): string[] {
     return Array.isArray(v) ? v : []
   } catch {
     return []
+  }
+}
+
+function tryParsePriceBreaks(
+  s: unknown,
+): Array<{ breakQuantity: number; unitPrice: number; currency: string }> | null {
+  if (typeof s !== 'string' || !s) return null
+  try {
+    const v = JSON.parse(s)
+    if (!Array.isArray(v)) return null
+    const out = v
+      .map((b: any) => ({
+        breakQuantity: Number(b?.breakQuantity ?? b?.quantity ?? 0),
+        unitPrice: Number(b?.unitPrice ?? b?.price ?? 0),
+        currency: typeof b?.currency === 'string' ? b.currency : 'USD',
+      }))
+      .filter(b => Number.isFinite(b.breakQuantity) && b.breakQuantity > 0 && Number.isFinite(b.unitPrice) && b.unitPrice > 0)
+    return out.length > 0 ? out : null
+  } catch {
+    return null
   }
 }
 
@@ -647,17 +673,31 @@ export function computeInventoryPriceSignal(rows: HistoryRow[]): InventorySignal
   const priceMoves = price7 != null && Math.abs(price7) >= 1
   const priceFlat = price7 != null && !priceMoves
   const priceMissing = !priceFlagLatest && price7 == null
+  // Phase 21D.1 — count how many rows in the rolling window carry a
+  // normalized unit price. We need at least 2 to compute a price trend.
+  const pricedObservations = rows.filter(r =>
+    r.priceAvailable && r.normalizedUnitPrice != null,
+  ).length
+  // First-priced state: latest has a TI Store price but no other priced
+  // observation exists yet in the window. The dashboard must NOT classify
+  // shortage/oversupply on the back of one priced sample.
+  const firstPriced = priceFlagLatest && priceLatest != null && pricedObservations < 2
 
   let signalType: InventorySignalType = 'normal'
   let signalStrength: InventorySignalStrength = 'low'
   // Phase 21A.3 — when pricing wasn't returned by the TI Store API, the
   // default "Inventory and pricing within typical bounds" line implied we
   // analysed pricing and found it unremarkable. Be explicit instead.
-  let explanation = priceMissing
-    ? (inv7 == null || Math.abs(inv7) < 1
-        ? 'Inventory unchanged; pricing unavailable from current TI Store API response.'
-        : 'Inventory signal only — pricing unavailable from current TI Store API response.')
-    : 'Inventory and pricing within typical bounds.'
+  // Phase 21D.1 — when this is the first priced observation we say so,
+  // so the customer knows the baseline is captured but the trend isn't
+  // computable yet.
+  let explanation = firstPriced
+    ? 'Direct TI Store price captured; waiting for a second pricing observation before price-trend classification.'
+    : priceMissing
+      ? (inv7 == null || Math.abs(inv7) < 1
+          ? 'Inventory unchanged; pricing unavailable from current TI Store API response.'
+          : 'Inventory signal only — pricing unavailable from current TI Store API response.')
+      : 'Inventory and pricing within typical bounds.'
   let confidence = 0.3
 
   if (inv7 != null && inv7 <= -25 && price7 != null && price7 >= 5) {
