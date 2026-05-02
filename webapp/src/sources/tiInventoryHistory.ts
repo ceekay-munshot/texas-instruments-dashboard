@@ -685,19 +685,38 @@ export function computeInventoryPriceSignal(rows: HistoryRow[]): InventorySignal
 
   let signalType: InventorySignalType = 'normal'
   let signalStrength: InventorySignalStrength = 'low'
+  // Phase 21E — split the normal-state line into two source-specific
+  // variants so the customer can tell "completely unchanged versus
+  // previous capture" apart from "moved within threshold". Compare the
+  // immediately-previous capture (rows[length-2]) since that's what the
+  // dashboard's mini-trend already shows.
+  const prevRow = rows.length >= 2 ? rows[rows.length - 2] : null
+  const prevQty = prevRow?.quantityAvailable ?? null
+  const prevPrice = prevRow?.normalizedUnitPrice ?? null
+  const invUnchangedSinceLast =
+    invLatest != null && prevQty != null && invLatest === prevQty
+  const priceUnchangedSinceLast =
+    priceLatest != null && prevPrice != null && priceLatest === prevPrice
+  const completelyStable = invUnchangedSinceLast && priceUnchangedSinceLast
+
   // Phase 21A.3 — when pricing wasn't returned by the TI Store API, the
   // default "Inventory and pricing within typical bounds" line implied we
   // analysed pricing and found it unremarkable. Be explicit instead.
   // Phase 21D.1 — when this is the first priced observation we say so,
   // so the customer knows the baseline is captured but the trend isn't
   // computable yet.
+  // Phase 21E — when both inventory and price are present and unchanged
+  // versus the previous capture, say so directly; small movement below
+  // the classification thresholds gets a separate line.
   let explanation = firstPriced
     ? 'Direct TI Store price captured; waiting for a second pricing observation before price-trend classification.'
     : priceMissing
       ? (inv7 == null || Math.abs(inv7) < 1
           ? 'Inventory unchanged; pricing unavailable from current TI Store API response.'
           : 'Inventory signal only — pricing unavailable from current TI Store API response.')
-      : 'Inventory and pricing within typical bounds.'
+      : completelyStable
+        ? 'Direct TI inventory and direct TI price are unchanged versus the previous capture.'
+        : 'Direct TI inventory and price moved within threshold; no shortage or oversupply pressure detected.'
   let confidence = 0.3
 
   if (inv7 != null && inv7 <= -25 && price7 != null && price7 >= 5) {

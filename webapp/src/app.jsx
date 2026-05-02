@@ -1520,6 +1520,61 @@ function InventoryPanel() {
         return (
           <div style={sectionWrap}>
             <div style={{ ...sectionTitle, marginBottom: 8 }}>Shortage / Oversupply Signals</div>
+            {/* Phase 21E — Signal Readiness card. Compact panel above the
+                KPIs that confirms the engine is wired and shows what
+                inputs it has. Numbers come from the same data sources
+                the rest of the strip uses; no new fetches. */}
+            {(() => {
+              const totalParts = sigList.length || (signalsResp?.summary?.total ?? 0);
+              const partsWithInvHistory = historySummary?.partsWithHistory ?? 0;
+              const partsWithDirectPrice = sigList.filter(s => s.latestNormalizedUnitPrice != null).length;
+              const partsWith2PlusPriced = sigList.filter(s =>
+                s.latestNormalizedUnitPrice != null && s.previousNormalizedUnitPrice != null,
+              ).length;
+              const meaningfulCount = (sigSummary?.shortagePressure ?? 0)
+                + (sigSummary?.oversupplyPressure ?? 0)
+                + (sigSummary?.inventoryTightening ?? 0)
+                + (sigSummary?.supplyEasing ?? 0)
+                + (sigSummary?.priceOnlyPressure ?? 0);
+              const engineActive = partsWithInvHistory > 0;
+              return (
+                <div style={{
+                  marginBottom: 12, padding: '10px 14px',
+                  background: '#080c14', border: '1px solid #1a2740', borderRadius: 4,
+                  display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '4px 18px',
+                  fontFamily: 'monospace', fontSize: '0.66rem',
+                }}>
+                  <div>
+                    <div style={{ ...tinyLabel, marginBottom: 2 }}>Signal readiness</div>
+                    <div style={{ color: engineActive ? '#4dffc3' : '#7a96b8', fontSize: '0.78rem' }}>
+                      {engineActive ? 'Engine active' : 'Engine inactive'}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Inventory history</div>
+                    <div style={{ color: '#e0eaf8', marginTop: 2 }}>{partsWithInvHistory}/{totalParts}</div>
+                  </div>
+                  <div>
+                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Direct TI price history</div>
+                    <div style={{ color: partsWithDirectPrice > 0 ? '#4dffc3' : '#a0b8d0', marginTop: 2 }}>
+                      {partsWithDirectPrice}/{totalParts}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>2+ priced observations</div>
+                    <div style={{ color: partsWith2PlusPriced > 0 ? '#4dffc3' : '#f0a84e', marginTop: 2 }}>
+                      {partsWith2PlusPriced}/{totalParts}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Current result</div>
+                    <div style={{ color: meaningfulCount > 0 ? '#f0a84e' : '#a0b8d0', marginTop: 2 }}>
+                      {meaningfulCount > 0 ? `${meaningfulCount} active` : 'No pressure detected'}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
               <KpiCard
                 label="Shortage pressure"
@@ -1643,6 +1698,63 @@ function InventoryPanel() {
             <div style={{ marginTop: 4, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic' }}>
               A daily scheduled capture runs at 04:00–04:45 UTC across four batches; manual captures from Operator tools also append to history. Capture failures are not counted as out-of-stock.
             </div>
+            {/* Phase 21E — collapsed "Example signal logic" explainer.
+                Static rules table; explicitly labelled as illustrative
+                so the customer never confuses these examples with the
+                live signal table above. */}
+            <details style={{ marginTop: 14, padding: '8px 12px', background: '#0d1422', border: '1px solid #1a2740', borderRadius: 4 }}>
+              <summary style={{ cursor: 'pointer', fontSize: '0.62rem', color: '#a0b8d0', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>
+                Example signal logic
+              </summary>
+              <div style={{ marginTop: 10, fontSize: '0.66rem', color: '#c4d4e8', lineHeight: 1.6 }}>
+                <div style={{ marginBottom: 8, color: '#7a96b8', fontStyle: 'italic' }}>
+                  These examples are illustrative. The live signal table above uses direct TI captured data only.
+                </div>
+                <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: 'monospace', fontSize: '0.64rem' }}>
+                  <thead>
+                    <tr>
+                      <th style={cellTH}>Inventory</th>
+                      <th style={cellTH}>Price</th>
+                      <th style={cellTH}>Classification</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style={{ ...cellMono, color: '#f0a84e' }}>down ≥25% (7d)</td>
+                      <td style={{ ...cellMono, color: '#f05c5c' }}>up ≥5% (7d)</td>
+                      <td style={{ ...cellMono, color: '#f05c5c', fontWeight: 'bold' }}>shortage_pressure</td>
+                    </tr>
+                    <tr>
+                      <td style={{ ...cellMono, color: '#4dffc3' }}>up ≥50% (7d)</td>
+                      <td style={{ ...cellMono, color: '#4dffc3' }}>down ≥5% (7d)</td>
+                      <td style={{ ...cellMono, color: '#3d8ef0', fontWeight: 'bold' }}>oversupply_pressure</td>
+                    </tr>
+                    <tr>
+                      <td style={{ ...cellMono, color: '#f0a84e' }}>down ≥25% (7d)</td>
+                      <td style={{ ...cellMono, color: '#7a96b8' }}>flat or unavailable</td>
+                      <td style={{ ...cellMono, color: '#f0a84e', fontWeight: 'bold' }}>inventory_tightening</td>
+                    </tr>
+                    <tr>
+                      <td style={{ ...cellMono, color: '#4dffc3' }}>up ≥50% (7d)</td>
+                      <td style={{ ...cellMono, color: '#7a96b8' }}>flat or unavailable</td>
+                      <td style={{ ...cellMono, color: '#00c9a7', fontWeight: 'bold' }}>supply_easing</td>
+                    </tr>
+                    <tr>
+                      <td style={{ ...cellMono, color: '#7a96b8' }}>flat / up</td>
+                      <td style={{ ...cellMono, color: '#f05c5c' }}>up ≥5% (7d)</td>
+                      <td style={{ ...cellMono, color: '#ab6af0', fontWeight: 'bold' }}>price_only_pressure</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div style={{ marginTop: 10, fontSize: '0.6rem', color: '#7a96b8', lineHeight: 1.5 }}>
+                  Operators can verify these rules end-to-end against the production engine via
+                  <code style={{ marginLeft: 4, padding: '1px 4px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 2, color: '#a0b8d0' }}>
+                    GET /api/ti/inventory/signal-simulator
+                  </code>
+                  (auth-gated, read-only, no D1 write).
+                </div>
+              </div>
+            </details>
           </div>
         );
       })()}

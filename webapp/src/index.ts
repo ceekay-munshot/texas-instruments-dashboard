@@ -90,6 +90,7 @@ import {
   readPartHistory,
   readUniverseHistoryByPart,
   computeWatchedSignals,
+  computeInventoryPriceSignal,
   summarizeSignals,
   type HistoryRow,
   recomputeAndPersistSignals,
@@ -2433,6 +2434,124 @@ app.get('/api/ti/inventory/pricing-diagnostic', async (c) => {
   }
   const report = await fetchTiInventoryPricingDebug(env, partNumber)
   return c.json({ success: report.status === 'ok', ...report })
+})
+
+// Phase 21E — GET /api/ti/inventory/signal-simulator
+// Auth-gated, READ-ONLY. Runs the production computeInventoryPriceSignal
+// classifier against five SYNTHETIC scenarios so the operator can prove
+// shortage/oversupply/tightening/easing/price-only logic works end-to-end
+// without waiting for real-world movement and without writing anything
+// to D1 or KV. The response is clearly labelled `synthetic: true` and
+// every row carries scenario / inputs / expected vs actual classification.
+//
+// Hard restrictions: never persists, never calls TI Store, never returns
+// any TI body or token. The "data" is hard-coded inside this handler.
+app.get('/api/ti/inventory/signal-simulator', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  // Build a 3-row HistoryRow trace per scenario so the rolling-window
+  // classifier (uses r7d) has something to compare against. Times are
+  // anchored to "now" so the latest row is at t=0, the prior baseline
+  // sits ≥ 7 days back, and a middle row keeps the t-1d window populated.
+  const now = Date.now()
+  const ms = (daysAgo: number) => new Date(now - daysAgo * 86_400_000).toISOString()
+  type Scenario = {
+    id: string
+    label: string
+    expectedSignalType: string
+    rationale: string
+    previousInventory: number
+    latestInventory: number
+    previousPrice: number | null
+    latestPrice: number | null
+  }
+  const scenarios: Scenario[] = [
+    { id: 'A', label: 'Shortage pressure',     expectedSignalType: 'shortage_pressure',     rationale: 'Inventory down 80%, price up 30% — likely shortage.',         previousInventory: 100, latestInventory: 20,   previousPrice: 10, latestPrice: 13 },
+    { id: 'B', label: 'Oversupply pressure',   expectedSignalType: 'oversupply_pressure',   rationale: 'Inventory up 10×, price down 20% — likely oversupply.',      previousInventory: 100, latestInventory: 1000, previousPrice: 10, latestPrice: 8 },
+    { id: 'C', label: 'Inventory tightening',  expectedSignalType: 'inventory_tightening',  rationale: 'Inventory down 80% with price flat — tightening, no clear price pressure.', previousInventory: 100, latestInventory: 20,   previousPrice: 10, latestPrice: 10 },
+    { id: 'D', label: 'Supply easing',         expectedSignalType: 'supply_easing',         rationale: 'Inventory up 5× with price flat — supply easing.',           previousInventory: 100, latestInventory: 500,  previousPrice: 10, latestPrice: 10 },
+    { id: 'E', label: 'Price-only pressure',   expectedSignalType: 'price_only_pressure',   rationale: 'Inventory unchanged, price up 20% — price-led signal only.', previousInventory: 100, latestInventory: 100,  previousPrice: 10, latestPrice: 12 },
+  ]
+  const buildRow = (qty: number, price: number | null, capturedAt: string): HistoryRow => ({
+    capturedAt,
+    orderablePartNumber: '__SYNTHETIC__',
+    genericPartNumber: null,
+    basket: null,
+    category: null,
+    subcategory: null,
+    displayName: null,
+    demandProxyType: null,
+    dashboardPriority: null,
+    quantityAvailable: qty,
+    pricingAvailability: price != null ? 'available' : 'unavailable',
+    priceAvailable: price != null,
+    currency: price != null ? 'USD' : null,
+    normalizedUnitPrice: price,
+    normalizedPriceQty: price != null ? 1000 : null,
+    priceBreaks: price != null ? [{ breakQuantity: 1000, unitPrice: price, currency: 'USD' }] : null,
+    orderLimit: null,
+    leadTimeWeeks: null,
+    lifecycleStatus: null,
+    okayToOrder: null,
+    supplyStatus: null,
+    inventorySignal: null,
+    pricingSignal: null,
+    leadTimeSignal: null,
+    sourceConfidence: null,
+    captureStatus: 'ok',
+    sourceInventory: 'synthetic_simulator',
+    sourcePricing: price != null ? 'direct_ti_store_price' : 'unavailable',
+    warnings: [],
+  })
+  const results = scenarios.map(s => {
+    // Three captures: t-8d (baseline), t-1d (mid; mirrors baseline so the
+    // 1d window has data without polluting the 7d delta), t-0 (latest).
+    const rows: HistoryRow[] = [
+      buildRow(s.previousInventory, s.previousPrice, ms(8)),
+      buildRow(s.previousInventory, s.previousPrice, ms(1)),
+      buildRow(s.latestInventory,  s.latestPrice,  ms(0)),
+    ]
+    const sig = computeInventoryPriceSignal(rows)
+    const matches = sig.signalType === s.expectedSignalType
+    return {
+      scenario: s.id,
+      label: s.label,
+      previousInventory: s.previousInventory,
+      latestInventory: s.latestInventory,
+      previousPrice: s.previousPrice,
+      latestPrice: s.latestPrice,
+      inventoryPctDelta: sig.inventoryPctDelta7d,
+      pricePctDelta: sig.pricePctDelta7d,
+      expectedSignalType: s.expectedSignalType,
+      actualSignalType: sig.signalType,
+      actualSignalStrength: sig.signalStrength,
+      actualConfidence: sig.confidence,
+      explanation: sig.explanation,
+      rationale: s.rationale,
+      matches,
+    }
+  })
+  return c.json({
+    success: true,
+    synthetic: true,
+    note: 'Hard-coded synthetic scenarios — no TI Store call, no D1/KV write. For QA / customer demo only.',
+    scenarios: results,
+    summary: {
+      total: results.length,
+      matches: results.filter(r => r.matches).length,
+    },
+  })
 })
 
 // GET /api/ti/inventory-pricing?partNumber=XYZ — auth-gated.
