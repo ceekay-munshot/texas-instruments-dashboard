@@ -37,8 +37,13 @@ const HIST = {
 const HP=["Jun-22","Sep-22","Dec-22","Mar-23","Jun-23","Sep-23","Dec-23","Mar-24","Jun-24","Sep-24","Dec-24","Mar-25","Jun-25","Sep-25","Dec-25","Mar-26"];
 
 function fmt(v){
+  // Phase 23C.3 — distinguish "live price unchanged" (real reading at the
+  // baseline) from "no data" (null). Previously both rendered as '—',
+  // which made 23 of 28 live cells look unfetched even when Mouser had
+  // returned a valid price equal to the baseline. Now sub-0.05% movement
+  // (rounds to 0.0%) shows as 'flat' in a muted color; null still shows '—'.
   if(v==null)return{txt:"—",col:"#2a4060",bold:false};
-  if(Math.abs(v)<0.05)return{txt:"—",col:"#2a4060",bold:false};
+  if(Math.abs(v)<0.05)return{txt:"flat",col:"#5a7a98",bold:false};
   const big=Math.abs(v)>=5,pos=v>0;
   return{txt:pos?`+${v.toFixed(1)}%`:`(${Math.abs(v).toFixed(1)}%)`,col:pos?(big?"#4dffc3":"#00c9a7"):(big?"#ff7575":"#f05c5c"),bold:big};
 }
