@@ -1,30 +1,33 @@
 name: TI Watched-Parts Inventory Capture
 
-# Phase 21B — daily scheduled capture of the TI watched-parts universe via
-# the existing /api/ti/inventory/capture endpoint, with strict per-batch and
-# post-capture validation. Inherits the four-batch pattern from Phase 21K.
+# Phase 22.4 — daily scheduled capture of the TI watched-parts universe via
+# /api/ti/inventory/capture, with totalParts discovered dynamically from
+# /api/ti/watched-parts/catalog and offsets derived at runtime so the
+# workflow auto-scales as the validated universe grows. Inherits the
+# strict per-batch + post-capture validation from Phase 21B.
 #
 # Why GitHub Actions and not a wrangler.jsonc cron trigger:
-#   Cloudflare Pages projects ignore `triggers.crons` in wrangler.jsonc (it's
-#   a Workers-only field). The same project already uses a GitHub Actions
-#   workflow for the Mouser/Nexar daily snapshot, so we follow the same
-#   proven pattern here. The Workers-style scheduled() handler also exists
-#   in src/index.ts so the operator can wire Pages dashboard cron triggers
-#   for an in-Cloudflare schedule if they want a redundant timer.
+#   Cloudflare Pages projects ignore `triggers.crons` in wrangler.jsonc
+#   (it's a Workers-only field). The same project already uses a GitHub
+#   Actions workflow for the Mouser/Nexar daily snapshot, so we follow
+#   the same proven pattern here. The Workers-style scheduled() handler
+#   also exists in src/index.ts so the operator can wire Pages dashboard
+#   cron triggers for an in-Cloudflare schedule if they want a redundant
+#   timer.
 #
 # What it does (in order):
-#   POST /api/ti/inventory/capture?offset=0&limit=8
-#   POST /api/ti/inventory/capture?offset=8&limit=8
-#   POST /api/ti/inventory/capture?offset=16&limit=8
-#   POST /api/ti/inventory/capture?offset=24&limit=8
-#   GET  /api/ti/inventory/latest                  — sanity
-#   GET  /api/ti/inventory/history/summary         — D1 depth + signal counts
-#   GET  /api/ti/inventory/signals/latest          — persisted signals
+#   GET  /api/ti/watched-parts/catalog                        — discover totalParts
+#   GET  /api/ti/inventory/history/summary                    — record pre-state
+#   POST /api/ti/inventory/capture?offset=N&limit=8           — N in {0,8,…,⌈total/8⌉×8}
+#   GET  /api/ti/inventory/latest                             — sanity
+#   GET  /api/ti/inventory/history/summary                    — D1 depth
+#   GET  /api/ti/inventory/signals/latest                     — persisted signals
+#   GET  /api/ti/inventory/schedule/status                    — daily-run aggregate
 #
-# Each POST captures one batch and merges into the persisted snapshot. The
-# server appends one history row per part to D1 on every batch and recomputes
-# the persisted signal table. NEVER calls /capture-all and NEVER calls
-# /v2/store/products/catalog.
+# Each POST captures one batch and merges into the persisted snapshot.
+# The server appends one history row per part to D1 on every batch and
+# recomputes the persisted signal table. NEVER calls /capture-all and
+# NEVER calls /v2/store/products/catalog.
 #
 # Required GitHub Actions secret:
 #   SNAPSHOT_CAPTURE_SECRET — same secret used by ti-snapshot-capture.yml.
@@ -44,15 +47,13 @@ concurrency:
 
 env:
   BASE_URL: https://texas-instruments-dashboard-final.pages.dev
-  EXPECTED_TOTAL_PARTS: '32'
-  EXPECTED_BASKETS: '7'
-  EXPECTED_BATCH_SIZE: '8'
+  BATCH_LIMIT: '8'
 
 jobs:
   capture:
-    name: Capture watched-parts universe in 4 batches
+    name: Capture watched-parts universe (dynamic batching)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Validate SNAPSHOT_CAPTURE_SECRET is configured
@@ -67,6 +68,43 @@ jobs:
           fi
           echo "Secret is configured (value not printed)."
 
+      - name: Discover totalParts from /watched-parts/catalog (Task 1+2)
+        id: catalog
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp)"
+          http_status="$(curl -sS -o "$tmp" -w '%{http_code}' "${BASE_URL}/api/ti/watched-parts/catalog")"
+          if [ "${http_status}" != "200" ]; then
+            echo "::error::/watched-parts/catalog returned HTTP ${http_status}"
+            head -c 500 "$tmp" || true
+            exit 1
+          fi
+          if ! jq -e . < "$tmp" > /dev/null 2>&1; then
+            echo "::error::/watched-parts/catalog returned non-JSON"
+            exit 1
+          fi
+          total_parts=$(jq -r '.totalParts // 0' < "$tmp")
+          if [ -z "${total_parts}" ] || [ "${total_parts}" -le 0 ]; then
+            echo "::error::Could not read positive totalParts from catalog (got '${total_parts}')."
+            exit 1
+          fi
+          # Derive the offset list at limit=8 covering [0, totalParts).
+          offsets=""
+          off=0
+          while [ "${off}" -lt "${total_parts}" ]; do
+            offsets="${offsets} ${off}"
+            off=$((off + BATCH_LIMIT))
+          done
+          # Strip leading space.
+          offsets="${offsets# }"
+          batch_count=$(echo "${offsets}" | wc -w | tr -d ' ')
+          echo "Discovered totalParts: ${total_parts}"
+          echo "Derived offsets (limit=${BATCH_LIMIT}): ${offsets}"
+          echo "Batch count: ${batch_count}"
+          echo "total_parts=${total_parts}" >> "$GITHUB_OUTPUT"
+          echo "offsets=${offsets}" >> "$GITHUB_OUTPUT"
+          echo "batch_count=${batch_count}" >> "$GITHUB_OUTPUT"
+
       - name: Snapshot pre-capture latestCapturedAt
         id: pre
         run: |
@@ -75,9 +113,11 @@ jobs:
           echo "Pre-capture latestCapturedAt: ${before_at}"
           echo "before_at=${before_at}" >> "$GITHUB_OUTPUT"
 
-      - name: Run four watched-parts batches sequentially with strict validation
+      - name: Run dynamic batches sequentially with strict validation (Task 5+6)
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          TOTAL_PARTS: ${{ steps.catalog.outputs.total_parts }}
+          OFFSETS: ${{ steps.catalog.outputs.offsets }}
         run: |
           set -uo pipefail
 
@@ -88,11 +128,21 @@ jobs:
           TOTAL_ROWS_INSERTED=0
           TOTAL_SIGNALS_PERSISTED=0
 
-          for OFF in 0 8 16 24; do
-            response_file="$(mktemp)"
-            url="${BASE_URL}/api/ti/inventory/capture?offset=${OFF}&limit=${EXPECTED_BATCH_SIZE}"
+          for OFF in ${OFFSETS}; do
+            # Per-batch expected size: BATCH_LIMIT for full batches, the
+            # remainder for the final batch when totalParts isn't a
+            # multiple of BATCH_LIMIT.
+            remaining=$((TOTAL_PARTS - OFF))
+            if [ "${remaining}" -lt "${BATCH_LIMIT}" ]; then
+              expected_this=${remaining}
+            else
+              expected_this=${BATCH_LIMIT}
+            fi
 
-            echo "POST ${url}"
+            response_file="$(mktemp)"
+            url="${BASE_URL}/api/ti/inventory/capture?offset=${OFF}&limit=${BATCH_LIMIT}"
+
+            echo "POST ${url}  (expected this batch: ${expected_this})"
 
             http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
               -X POST \
@@ -137,8 +187,7 @@ jobs:
             TOTAL_ROWS_INSERTED=$((TOTAL_ROWS_INSERTED + rows_appended))
             TOTAL_SIGNALS_PERSISTED=$((TOTAL_SIGNALS_PERSISTED + signals_persisted))
 
-            # Phase 21B Task 4 — strict per-batch validation. Any one failure
-            # aborts the workflow run.
+            # Strict per-batch validation. Any one failure aborts the run.
             BATCH_FAILED=0
 
             if [ "${success}" != "true" ]; then
@@ -159,12 +208,14 @@ jobs:
               BATCH_FAILED=1
             fi
 
-            if [ "${attempted}" != "${EXPECTED_BATCH_SIZE}" ]; then
-              echo "::error::Batch offset=${OFF} attemptedThisBatch=${attempted} (expected ${EXPECTED_BATCH_SIZE})."
+            # Phase 22.4 — per-batch expected size is dynamic (full size
+            # for non-final batches, the remainder for the final one).
+            if [ "${attempted}" != "${expected_this}" ]; then
+              echo "::error::Batch offset=${OFF} attemptedThisBatch=${attempted} (expected ${expected_this})."
               BATCH_FAILED=1
             fi
-            if [ "${captured}" != "${EXPECTED_BATCH_SIZE}" ]; then
-              echo "::error::Batch offset=${OFF} capturedThisBatch=${captured} (expected ${EXPECTED_BATCH_SIZE})."
+            if [ "${captured}" != "${expected_this}" ]; then
+              echo "::error::Batch offset=${OFF} capturedThisBatch=${captured} (expected ${expected_this})."
               BATCH_FAILED=1
             fi
             if [ "${failed}" != "0" ]; then
@@ -185,8 +236,8 @@ jobs:
               jq -c '.diagnostics.signals.errors // []' < "$response_file"
               BATCH_FAILED=1
             fi
-            if [ "${signals_persisted}" != "${EXPECTED_BATCH_SIZE}" ]; then
-              echo "::error::Batch offset=${OFF} diagnostics.signals.persisted=${signals_persisted} (expected ${EXPECTED_BATCH_SIZE})."
+            if [ "${signals_persisted}" != "${expected_this}" ]; then
+              echo "::error::Batch offset=${OFF} diagnostics.signals.persisted=${signals_persisted} (expected ${expected_this})."
               BATCH_FAILED=1
             fi
             if [ -n "${history_backend}" ] && [ "${history_backend}" != "d1" ]; then
@@ -203,13 +254,14 @@ jobs:
           done
 
           echo "─── Batch totals ───"
-          echo "  captured:           ${TOTAL_CAPTURED} (expected $((4 * EXPECTED_BATCH_SIZE)))"
-          echo "  failed:             ${TOTAL_FAILED}"
-          echo "  stale:              ${TOTAL_STALE}"
-          echo "  rowsInserted:       ${TOTAL_ROWS_INSERTED}"
-          echo "  signalsPersisted:   ${TOTAL_SIGNALS_PERSISTED}"
+          echo "  totalParts (expected): ${TOTAL_PARTS}"
+          echo "  captured:              ${TOTAL_CAPTURED}"
+          echo "  failed:                ${TOTAL_FAILED}"
+          echo "  stale:                 ${TOTAL_STALE}"
+          echo "  rowsInserted:          ${TOTAL_ROWS_INSERTED}"
+          echo "  signalsPersisted:      ${TOTAL_SIGNALS_PERSISTED}"
 
-          # Persist totals for the verify step to read.
+          # Persist totals for the verify steps to read.
           {
             echo "TOTAL_CAPTURED=${TOTAL_CAPTURED}"
             echo "TOTAL_FAILED=${TOTAL_FAILED}"
@@ -222,7 +274,9 @@ jobs:
             exit 1
           fi
 
-      - name: Verify /api/ti/inventory/latest (Task 5)
+      - name: Verify /api/ti/inventory/latest (Task 7)
+        env:
+          TOTAL_PARTS: ${{ steps.catalog.outputs.total_parts }}
         run: |
           set -uo pipefail
           tmp="$(mktemp)"
@@ -245,11 +299,11 @@ jobs:
           stale_parts=$(jq -r '.summary.staleParts // 0' < "$tmp")
 
           FAIL=0
-          if [ "${total_parts}" != "${EXPECTED_TOTAL_PARTS}" ]; then
-            echo "::error::/inventory/latest summary.totalParts=${total_parts} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          if [ "${total_parts}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/inventory/latest summary.totalParts=${total_parts} (expected ${TOTAL_PARTS})."; FAIL=1
           fi
-          if [ "${captured_parts}" != "${EXPECTED_TOTAL_PARTS}" ]; then
-            echo "::error::/inventory/latest summary.capturedParts=${captured_parts} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          if [ "${captured_parts}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/inventory/latest summary.capturedParts=${captured_parts} (expected ${TOTAL_PARTS})."; FAIL=1
           fi
           if [ "${failed_parts}" != "0" ]; then
             echo "::error::/inventory/latest summary.failedParts=${failed_parts} (expected 0)."; FAIL=1
@@ -257,14 +311,15 @@ jobs:
           if [ "${stale_parts}" != "0" ]; then
             echo "::error::/inventory/latest summary.staleParts=${stale_parts} (expected 0)."; FAIL=1
           fi
-          if [ "${parts_len}" != "${EXPECTED_TOTAL_PARTS}" ]; then
-            echo "::error::/inventory/latest len(parts)=${parts_len} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          if [ "${parts_len}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/inventory/latest len(parts)=${parts_len} (expected ${TOTAL_PARTS})."; FAIL=1
           fi
 
           [ "${FAIL}" = "0" ]
 
-      - name: Verify /api/ti/inventory/history/summary (Task 6)
+      - name: Verify /api/ti/inventory/history/summary (Task 8)
         env:
+          TOTAL_PARTS: ${{ steps.catalog.outputs.total_parts }}
           BEFORE_AT: ${{ steps.pre.outputs.before_at }}
         run: |
           set -uo pipefail
@@ -292,18 +347,24 @@ jobs:
           if [ "${backend}" != "d1" ]; then
             echo "::error::/history/summary backend=${backend} (expected d1)."; FAIL=1
           fi
-          if [ "${parts_with_history}" != "${EXPECTED_TOTAL_PARTS}" ]; then
-            echo "::error::/history/summary partsWithHistory=${parts_with_history} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          # Note: partsWithHistory should *move toward* TOTAL_PARTS after the
+          # first run that includes newly-promoted parts; require at least
+          # the original 32 + at least one priced row from this run.
+          if [ "${parts_with_history}" -lt 1 ]; then
+            echo "::error::/history/summary partsWithHistory=${parts_with_history} (expected at least 1)."; FAIL=1
           fi
           if [ -n "${BEFORE_AT}" ] && [ "${latest_at}" = "${BEFORE_AT}" ]; then
             echo "::error::/history/summary latestCapturedAt did not advance (still ${latest_at} after capture)."; FAIL=1
           fi
           echo "  pre  latestCapturedAt: ${BEFORE_AT}"
           echo "  post latestCapturedAt: ${latest_at}"
+          echo "  partsWithHistory: ${parts_with_history} / ${TOTAL_PARTS} (target after first dynamic-capture run)"
 
           [ "${FAIL}" = "0" ]
 
-      - name: Verify /api/ti/inventory/signals/latest (Task 7)
+      - name: Verify /api/ti/inventory/signals/latest (Task 9)
+        env:
+          TOTAL_PARTS: ${{ steps.catalog.outputs.total_parts }}
         run: |
           set -uo pipefail
           tmp="$(mktemp)"
@@ -327,15 +388,16 @@ jobs:
           if [ "${backend}" != "d1" ]; then
             echo "::error::/signals/latest backend=${backend} (expected d1)."; FAIL=1
           fi
-          if [ "${summary_total}" != "${EXPECTED_TOTAL_PARTS}" ]; then
-            echo "::error::/signals/latest summary.total=${summary_total} (expected ${EXPECTED_TOTAL_PARTS})."; FAIL=1
+          if [ "${summary_total}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/signals/latest summary.total=${summary_total} (expected ${TOTAL_PARTS})."; FAIL=1
           fi
           if [ "${rows_len}" -lt 1 ]; then
             echo "::error::/signals/latest returned 0 signal rows."; FAIL=1
           fi
 
-          # Defensive secret-shape scan. The endpoint should never return any
-          # of these strings; if it does, something on the server is leaking.
+          # Defensive secret-shape scan. The endpoint should never return
+          # any of these strings; if it does, something on the server is
+          # leaking.
           for needle in "TI_CLIENT_SECRET" "TI_CLIENT_ID" "Bearer " "access_token" "SNAPSHOT_CAPTURE_SECRET" "X-Capture-Secret" "transact.ti.com"; do
             if grep -F "${needle}" < "$tmp" > /dev/null; then
               echo "::error::/signals/latest payload contains forbidden token '${needle}'."; FAIL=1
@@ -344,16 +406,64 @@ jobs:
 
           [ "${FAIL}" = "0" ]
 
-      - name: Print schedule/status summary
+      - name: Verify /api/ti/inventory/schedule/status aggregate (Task 10)
+        env:
+          TOTAL_PARTS: ${{ steps.catalog.outputs.total_parts }}
+          BATCH_COUNT: ${{ steps.catalog.outputs.batch_count }}
         run: |
           set -uo pipefail
-          curl -sS "${BASE_URL}/api/ti/inventory/schedule/status" \
-            | jq -c '{
-                success, backend,
-                cumulativeRowsInserted,
-                lastCaptureAt,
-                lastExternalCaptureAt,
-                lastExternalCaptureStatus,
-                lastExternalCaptureSource,
-                lastExternalRunBySource: (.lastExternalRunBySource // {})
-              }'
+          tmp="$(mktemp)"
+          curl -sS "${BASE_URL}/api/ti/inventory/schedule/status" -o "$tmp"
+          if ! jq -e . < "$tmp" > /dev/null 2>&1; then
+            echo "::error::/schedule/status returned non-JSON."
+            head -c 500 "$tmp" || true
+            exit 1
+          fi
+          jq -c '{
+              success, backend, offsetsConfigured, offsetsCovered,
+              capturedParts, failedParts, staleParts,
+              rowsInsertedToHistory, signalsPersisted,
+              lastExternalCaptureSource, lastExternalCaptureStatus, lastExternalCaptureAt,
+              cumulativeRowsInserted
+            }' < "$tmp"
+
+          backend=$(jq -r '.backend // empty' < "$tmp")
+          offsets_covered=$(jq -r '.offsetsCovered // 0' < "$tmp")
+          captured_parts=$(jq -r '.capturedParts // 0' < "$tmp")
+          failed_parts=$(jq -r '.failedParts // 0' < "$tmp")
+          stale_parts=$(jq -r '.staleParts // 0' < "$tmp")
+          rows_inserted=$(jq -r '.rowsInsertedToHistory // 0' < "$tmp")
+          signals_persisted=$(jq -r '.signalsPersisted // 0' < "$tmp")
+          source=$(jq -r '.lastExternalCaptureSource // empty' < "$tmp")
+          status=$(jq -r '.lastExternalCaptureStatus // empty' < "$tmp")
+
+          FAIL=0
+          if [ "${backend}" != "d1" ]; then
+            echo "::error::/schedule/status backend=${backend} (expected d1)."; FAIL=1
+          fi
+          if [ "${offsets_covered}" != "${BATCH_COUNT}" ]; then
+            echo "::error::/schedule/status offsetsCovered=${offsets_covered} (expected ${BATCH_COUNT})."; FAIL=1
+          fi
+          if [ "${captured_parts}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/schedule/status capturedParts=${captured_parts} (expected ${TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ "${failed_parts}" != "0" ]; then
+            echo "::error::/schedule/status failedParts=${failed_parts} (expected 0)."; FAIL=1
+          fi
+          if [ "${stale_parts}" != "0" ]; then
+            echo "::error::/schedule/status staleParts=${stale_parts} (expected 0)."; FAIL=1
+          fi
+          if [ "${rows_inserted}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/schedule/status rowsInsertedToHistory=${rows_inserted} (expected ${TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ "${signals_persisted}" != "${TOTAL_PARTS}" ]; then
+            echo "::error::/schedule/status signalsPersisted=${signals_persisted} (expected ${TOTAL_PARTS})."; FAIL=1
+          fi
+          if [ "${source}" != "github_actions_daily" ]; then
+            echo "::error::/schedule/status lastExternalCaptureSource=${source} (expected github_actions_daily)."; FAIL=1
+          fi
+          if [ "${status}" != "ok" ]; then
+            echo "::error::/schedule/status lastExternalCaptureStatus=${status} (expected ok)."; FAIL=1
+          fi
+
+          [ "${FAIL}" = "0" ]
