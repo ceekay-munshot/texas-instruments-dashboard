@@ -459,7 +459,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Low-Iq voltage supervisor; broad attach across portable, industrial sensor, and battery-backed designs.',
     demandProxyType: 'analog_franchise',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS3700',
@@ -471,7 +471,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Window-comparator supervisor; legacy design-in across industrial control. Breadth corroboration for the supervisor sub-bucket.',
     demandProxyType: 'analog_franchise',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'UCC28C40',
@@ -483,7 +483,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Industry-standard current-mode PWM controller; long-cycle TI part, useful for white-goods and industrial PSU demand.',
     demandProxyType: 'industrial_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS62150A',
@@ -495,7 +495,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '3A synchronous buck with DCS-Control; widely used in industrial and POL rails. A clean read on industrial DC-DC demand.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS62840',
@@ -507,7 +507,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '60nA Iq buck for battery-powered IoT and wearables. Reads as TI\'s low-power consumer-IoT franchise signal.',
     demandProxyType: 'consumer_iot',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS61089',
@@ -531,7 +531,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Wide-VIN buck-boost — bridges the LM5176 controller signal at the converter level for portable and battery-backed rails.',
     demandProxyType: 'consumer_iot',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TLV70233',
@@ -543,7 +543,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Cost-sensitive 300mA LDO; broad consumer/IoT attach. Breadth check for the LDO sub-bucket alongside TPS7A8300.',
     demandProxyType: 'analog_franchise',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS7A20',
@@ -567,7 +567,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Low-noise 250mA LDO; long-cycle workhorse with steady consumer-electronics attach.',
     demandProxyType: 'consumer_iot',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS25940',
@@ -603,7 +603,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Wide-VIN hot-swap controller; legacy server and telecom rails, secondary corroboration for data-center capex.',
     demandProxyType: 'data_center_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'LM5145',
@@ -665,7 +665,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Wideband RF PLL/VCO; complements LMX2820 at lower frequency end. Test-equipment and wireless infra read.',
     demandProxyType: 'wireless_5g_buildout',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'LMX1204',
@@ -689,7 +689,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '2.4GHz range-extender front-end; consumer-IoT and smart-home attach.',
     demandProxyType: 'consumer_iot',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'AWR1843AOP',
@@ -739,7 +739,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Octal 12-bit DAC for industrial PLC and process-control loops. Industrial automation attach.',
     demandProxyType: 'industrial_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'ADS131M08',
@@ -751,7 +751,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '24-bit simultaneous-sampling ADC for energy metering and motor protection — high-priority industrial sensing read.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'ADS127L01',
@@ -763,7 +763,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Wide-bandwidth 24-bit ADC for vibration analysis and high-end audio. Precision instrumentation read.',
     demandProxyType: 'precision_instrumentation',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'ADS9224',
@@ -787,7 +787,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'High-speed JESD204B ADC for software-defined radio and wireless infra. Direct read on radio capex.',
     demandProxyType: 'wireless_5g_buildout',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'INA826',
@@ -799,7 +799,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Low-noise in-amp for medical and industrial sensor front-ends. Precision-analog franchise read.',
     demandProxyType: 'precision_instrumentation',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'INA333',
@@ -823,7 +823,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '32-bit stereo audio DAC; consumer-electronics and pro-audio attach. Breadth corroboration.',
     demandProxyType: 'consumer_iot',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
 
   // ── Motor Drivers additions (9) ──────────────────────────────────────────
@@ -837,7 +837,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Brushed-DC H-bridge for cordless tools, appliances, and toys. Industrial motor-driver attach.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'DRV8313',
@@ -849,7 +849,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '3-phase BLDC pre-driver; complements DRV8323 at lower current node. Industrial motor-electrification read.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'DRV8316R',
@@ -873,7 +873,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Stepper motor driver; widely used in 3D printers, CNC, and lab automation. Industrial breadth read.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'DRV8434',
@@ -947,7 +947,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Flagship MSPM0 Arm Cortex-M0+ MCU; current-generation general-purpose MCU. Reads as TI\'s embedded-cycle replacement signal.',
     demandProxyType: 'embedded_lifecycle',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'MSPM0L1306',
@@ -971,7 +971,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'C2000 Piccolo real-time MCU; legacy power-electronics and motor-control attach.',
     demandProxyType: 'industrial_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TMS320F280049C',
@@ -995,7 +995,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Dual-core C2000 with CLA accelerators; high-end power-conversion and EV charger control.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'CC2652R1',
@@ -1007,7 +1007,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Prior-gen multi-protocol wireless MCU; complements CC2652R7 for cycle comparison.',
     demandProxyType: 'consumer_iot',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'CC2640R2',
@@ -1019,7 +1019,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'BLE-only wireless MCU; legacy attach for the BLE end of the wireless basket.',
     demandProxyType: 'consumer_iot',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'AM3352',
@@ -1031,7 +1031,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Sitara ARM Cortex-A8 MPU; HMI and gateway attach, complements AM3358.',
     demandProxyType: 'industrial_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'AM3359',
@@ -1093,7 +1093,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'CAN-FD with integrated controller; partial-network and zonal-architecture attach.',
     demandProxyType: 'auto_volume',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TLIN1029-Q1',
@@ -1179,7 +1179,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Multi-phase D-CAP+ controller for AI/server CPU rails. Direct hyperscaler/AI capex read.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS53689',
@@ -1191,7 +1191,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Sibling to TPS53688 for accelerator/GPU power planes; AI buildout signal.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS53622',
@@ -1215,7 +1215,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Higher-current power stage for next-gen AI accelerator core rails.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS23861',
@@ -1227,7 +1227,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Quad-port PoE PSE controller for switches and Wi-Fi APs; enterprise networking attach.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS2484',
@@ -1275,7 +1275,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '48V/100V flyback bus converter; OCP / hyperscaler rack power attach.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
 ]
 
