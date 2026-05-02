@@ -61,6 +61,38 @@ export type DemandProxyType =
   | 'battery_management_ev'
   | 'general_purpose'
 
+/** Phase 22.1 — sub-category one level finer than the 7 baskets, used by
+ *  the customer-facing category heatmap (e.g. 'Buck converters', 'GaN power',
+ *  'CAN/LIN transceivers'). Free-form because TI's taxonomy is broad and
+ *  the dashboard never has to enumerate every value — just bucket and tally. */
+export type WatchedSubcategory =
+  | 'LDO regulators' | 'Buck converters' | 'Buck-boost converters' | 'Boost converters'
+  | 'PFC controllers' | 'Supervisors' | 'Hot-swap / eFuse' | 'Gate drivers'
+  | 'Op-amps' | 'Instrumentation amps' | 'Audio amps' | 'Current/power monitors'
+  | 'ADCs' | 'DACs' | 'Isolation amps' | 'Digital isolators'
+  | 'CAN/LIN transceivers' | 'RS-485 transceivers' | 'Ethernet PHYs'
+  | 'Battery management' | 'Safety PMIC' | 'LED drivers'
+  | 'Motor drivers'
+  | 'Embedded MCU' | 'Embedded MPU' | 'Safety MCU'
+  | 'Wireless MCU' | 'RF synthesizers' | 'Clock distribution' | 'Radar'
+  | 'Multi-phase VR' | 'Power stages' | 'GaN power' | 'Power MOSFETs'
+  | 'PoE controllers' | 'Bus converters'
+  | (string & {})
+
+/** Phase 22.1 — confidence in the OPN suffix being correct. HIGH = the
+ *  Mouser snapshot pipeline already hits this part successfully OR a prior
+ *  capture validated it. MEDIUM = real TI part family but the exact OPN
+ *  suffix needs the diagnostic to confirm before joining production. */
+export type WatchedConfidence = 'high' | 'medium'
+
+/** Phase 22.1 — gate that controls whether a part flows into daily capture.
+ *  Production capture filters on 'validated' (default for the original 32);
+ *  staged additions start as 'pending' and only flip to 'validated' after
+ *  the auth-gated validation endpoint confirms TI Store responds 200 with
+ *  parsed price breaks. 'failed' rows stay out of capture forever (until an
+ *  operator replaces the OPN). */
+export type WatchedValidationStatus = 'pending' | 'validated' | 'failed'
+
 export type WatchedPart = {
   /** What an analyst usually types (TI's "Generic Product Identifier"). */
   genericPartNumber: string
@@ -70,12 +102,30 @@ export type WatchedPart = {
   /** Investor-facing display label (concise, no package suffix). */
   displayName: string
   basket: WatchedBasket
+  /** Phase 22.1 — finer-than-basket grouping for the category heatmap. */
+  subcategory?: WatchedSubcategory
   dashboardPriority: DashboardPriority
   /** One-line investment thesis tied to this specific part. */
   thesisReason: string
   demandProxyType: DemandProxyType
+  /** Phase 22.1 — diagnostic confidence in this OPN. Defaults to 'high'
+   *  when omitted (preserves the original 32 watched parts). */
+  confidence?: WatchedConfidence
+  /** Phase 22.1 — production capture is gated on this. Defaults to
+   *  'validated' when omitted (preserves the original 32). New entries
+   *  start at 'pending' and only flip to 'validated' after Stage 2 of
+   *  Phase 22 (the validation endpoint). */
+  validationStatus?: WatchedValidationStatus
   /** Operator-facing notes — never customer-visible. */
   notes?: string
+}
+
+/** Phase 22.1 — single source of truth for "is this part eligible for
+ *  daily production capture". All 9 capture / signal / summary call sites
+ *  in index.ts go through getWatchedPartsCaptureInputs() which filters on
+ *  this; basket summary and product-info bundle filter on this too. */
+export function isValidatedForCapture(p: WatchedPart): boolean {
+  return (p.validationStatus ?? 'validated') === 'validated'
 }
 
 // ── Master watched-parts universe (32 parts across 7 baskets) ───────────────
@@ -387,6 +437,846 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Multi-protocol wireless MCU — IoT and smart-meter end markets, breadth corroboration for the wireless basket.',
     demandProxyType: 'consumer_iot',
   },
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Phase 22.1 — staged 68-part expansion. validationStatus: 'pending'
+  // means these parts are NOT included in daily production capture until
+  // the auth-gated validation endpoint (Phase 22.2) confirms each one
+  // returns Product Info ok + Store Inventory ok + parsed price breaks.
+  // confidence: 'high' = OPN already proven by the Mouser snapshot
+  // pipeline; 'medium' = real TI part family but the exact suffix needs
+  // diagnostic confirmation before joining production.
+  // ────────────────────────────────────────────────────────────────────────
+
+  // ── Power Management additions (14) ──────────────────────────────────────
+  {
+    genericPartNumber: 'TPS3839',
+    preferredOrderablePartNumber: 'TPS3839G33DQNR',
+    displayName: 'TPS3839 Supervisor & Reset',
+    basket: 'power_management',
+    subcategory: 'Supervisors',
+    dashboardPriority: 'medium',
+    thesisReason: 'Low-Iq voltage supervisor; broad attach across portable, industrial sensor, and battery-backed designs.',
+    demandProxyType: 'analog_franchise',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS3700',
+    preferredOrderablePartNumber: 'TPS3700DDCR2',
+    displayName: 'TPS3700 Window Comparator',
+    basket: 'power_management',
+    subcategory: 'Supervisors',
+    dashboardPriority: 'low',
+    thesisReason: 'Window-comparator supervisor; legacy design-in across industrial control. Breadth corroboration for the supervisor sub-bucket.',
+    demandProxyType: 'analog_franchise',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'UCC28C40',
+    preferredOrderablePartNumber: 'UCC28C40DR',
+    displayName: 'UCC28C40 Current-Mode PWM',
+    basket: 'power_management',
+    subcategory: 'PFC controllers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Industry-standard current-mode PWM controller; long-cycle TI part, useful for white-goods and industrial PSU demand.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS62150A',
+    preferredOrderablePartNumber: 'TPS62150ARGTR',
+    displayName: 'TPS62150A 3A Buck (low Iq)',
+    basket: 'power_management',
+    subcategory: 'Buck converters',
+    dashboardPriority: 'high',
+    thesisReason: '3A synchronous buck with DCS-Control; widely used in industrial and POL rails. A clean read on industrial DC-DC demand.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS62840',
+    preferredOrderablePartNumber: 'TPS62840DLCR',
+    displayName: 'TPS62840 750mA Nano-Iq Buck',
+    basket: 'power_management',
+    subcategory: 'Buck converters',
+    dashboardPriority: 'high',
+    thesisReason: '60nA Iq buck for battery-powered IoT and wearables. Reads as TI\'s low-power consumer-IoT franchise signal.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS61089',
+    preferredOrderablePartNumber: 'TPS61089RNNT',
+    displayName: 'TPS61089 12V Boost',
+    basket: 'power_management',
+    subcategory: 'Boost converters',
+    dashboardPriority: 'medium',
+    thesisReason: 'High-current boost for displays, USB-PD adapters; consumer-IoT and portable read.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS63070',
+    preferredOrderablePartNumber: 'TPS63070RNMR',
+    displayName: 'TPS63070 Buck-Boost',
+    basket: 'power_management',
+    subcategory: 'Buck-boost converters',
+    dashboardPriority: 'medium',
+    thesisReason: 'Wide-VIN buck-boost — bridges the LM5176 controller signal at the converter level for portable and battery-backed rails.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TLV70233',
+    preferredOrderablePartNumber: 'TLV70233DBVR',
+    displayName: 'TLV70233 300mA LDO',
+    basket: 'power_management',
+    subcategory: 'LDO regulators',
+    dashboardPriority: 'low',
+    thesisReason: 'Cost-sensitive 300mA LDO; broad consumer/IoT attach. Breadth check for the LDO sub-bucket alongside TPS7A8300.',
+    demandProxyType: 'analog_franchise',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS7A20',
+    preferredOrderablePartNumber: 'TPS7A2033DBVR',
+    displayName: 'TPS7A2033 200mA Low-Iq LDO',
+    basket: 'power_management',
+    subcategory: 'LDO regulators',
+    dashboardPriority: 'medium',
+    thesisReason: 'Ultra-low-Iq LDO for battery-powered IoT and wearables; complements the TPS62840 buck.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LP5907',
+    preferredOrderablePartNumber: 'LP5907MFX-3.3/NOPB',
+    displayName: 'LP5907 250mA LDO',
+    basket: 'power_management',
+    subcategory: 'LDO regulators',
+    dashboardPriority: 'low',
+    thesisReason: 'Low-noise 250mA LDO; long-cycle workhorse with steady consumer-electronics attach.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS25940',
+    preferredOrderablePartNumber: 'TPS25940RVCR',
+    displayName: 'TPS25940 eFuse',
+    basket: 'power_management',
+    subcategory: 'Hot-swap / eFuse',
+    dashboardPriority: 'medium',
+    thesisReason: '12V eFuse with current monitoring; server, telecom, and storage hot-plug rails — direct data-center attach.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS2595',
+    preferredOrderablePartNumber: 'TPS2595DRCR',
+    displayName: 'TPS2595 12V eFuse',
+    basket: 'power_management',
+    subcategory: 'Hot-swap / eFuse',
+    dashboardPriority: 'medium',
+    thesisReason: '12V eFuse with reverse-current blocking; server hot-swap signal alongside TPS25940.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS2492',
+    preferredOrderablePartNumber: 'TPS2492PW',
+    displayName: 'TPS2492 Hot-Swap Controller',
+    basket: 'power_management',
+    subcategory: 'Hot-swap / eFuse',
+    dashboardPriority: 'medium',
+    thesisReason: 'Wide-VIN hot-swap controller; legacy server and telecom rails, secondary corroboration for data-center capex.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LM5145',
+    preferredOrderablePartNumber: 'LM5145QPWPRQ1',
+    displayName: 'LM5145-Q1 Buck Controller',
+    basket: 'automotive',
+    subcategory: 'Buck converters',
+    dashboardPriority: 'medium',
+    thesisReason: 'AEC-Q100 wide-VIN buck controller; designed into 48V mild-hybrid and infotainment rails.',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Wireless Infra / RF additions (8) ────────────────────────────────────
+  {
+    genericPartNumber: 'CC2652R7',
+    preferredOrderablePartNumber: 'CC2652R7RGZR',
+    displayName: 'CC2652R7 Multi-Protocol Wireless MCU',
+    basket: 'wireless_infra_rf',
+    subcategory: 'Wireless MCU',
+    dashboardPriority: 'high',
+    thesisReason: 'Current-generation multi-protocol wireless MCU (Thread/Zigbee/BLE/Matter). Reads as TI\'s smart-home and industrial-IoT signal.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'CC1312R7',
+    preferredOrderablePartNumber: 'CC1312R7RGZR',
+    displayName: 'CC1312R7 Sub-1GHz MCU',
+    basket: 'wireless_infra_rf',
+    subcategory: 'Wireless MCU',
+    dashboardPriority: 'medium',
+    thesisReason: 'Sub-1GHz wireless MCU for smart-meter and long-range IoT; complements CC1352P at the next-gen node.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMK00308',
+    preferredOrderablePartNumber: 'LMK00308SQX',
+    displayName: 'LMK00308 LVPECL Clock Buffer',
+    basket: 'wireless_infra_rf',
+    subcategory: 'Clock distribution',
+    dashboardPriority: 'medium',
+    thesisReason: 'Low-jitter clock buffer for high-speed serdes and wireless infra LO chains.',
+    demandProxyType: 'wireless_5g_buildout',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMX2592',
+    preferredOrderablePartNumber: 'LMX2592RHAR',
+    displayName: 'LMX2592 12.6GHz PLL',
+    basket: 'wireless_infra_rf',
+    subcategory: 'RF synthesizers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Wideband RF PLL/VCO; complements LMX2820 at lower frequency end. Test-equipment and wireless infra read.',
+    demandProxyType: 'wireless_5g_buildout',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMX1204',
+    preferredOrderablePartNumber: 'LMX1204RTQR',
+    displayName: 'LMX1204 RF Synth Clock Distrib.',
+    basket: 'wireless_infra_rf',
+    subcategory: 'Clock distribution',
+    dashboardPriority: 'medium',
+    thesisReason: 'High-frequency clock distribution + synthesizer; modern radio reference signal alongside LMK04832.',
+    demandProxyType: 'wireless_5g_buildout',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'CC2592',
+    preferredOrderablePartNumber: 'CC2592RGVR',
+    displayName: 'CC2592 2.4GHz Range Extender',
+    basket: 'wireless_infra_rf',
+    subcategory: 'Wireless MCU',
+    dashboardPriority: 'low',
+    thesisReason: '2.4GHz range-extender front-end; consumer-IoT and smart-home attach.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'AWR1843AOP',
+    preferredOrderablePartNumber: 'AWR1843AOPAQGABLQ1',
+    displayName: 'AWR1843-AOP 77GHz Auto Radar',
+    basket: 'wireless_infra_rf',
+    subcategory: 'Radar',
+    dashboardPriority: 'high',
+    thesisReason: 'Antenna-on-package automotive radar; ADAS L2/L3 attach signal. Direct read on TI\'s mmWave radar growth.',
+    demandProxyType: 'auto_adas',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'IWR6843AOP',
+    preferredOrderablePartNumber: 'IWR6843AOPAQGABLQ1',
+    displayName: 'IWR6843-AOP 60GHz Industrial Radar',
+    basket: 'industrial',
+    subcategory: 'Radar',
+    dashboardPriority: 'medium',
+    thesisReason: 'Industrial 60GHz radar; building automation, robotics, factory sensing. Complements automotive radar with industrial demand.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Data Converters / Analog additions (9) ───────────────────────────────
+  {
+    genericPartNumber: 'DAC8552',
+    preferredOrderablePartNumber: 'DAC8552IDGK',
+    displayName: 'DAC8552 16-bit Dual DAC',
+    basket: 'analog_signal_chain',
+    subcategory: 'DACs',
+    dashboardPriority: 'medium',
+    thesisReason: '16-bit precision dual DAC; test equipment and industrial control attach. Counterpoint to ADS series.',
+    demandProxyType: 'precision_instrumentation',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DAC60508',
+    preferredOrderablePartNumber: 'DAC60508ZCRTET',
+    displayName: 'DAC60508 12-bit 8-ch DAC',
+    basket: 'analog_signal_chain',
+    subcategory: 'DACs',
+    dashboardPriority: 'medium',
+    thesisReason: 'Octal 12-bit DAC for industrial PLC and process-control loops. Industrial automation attach.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ADS131M08',
+    preferredOrderablePartNumber: 'ADS131M08IPBSR',
+    displayName: 'ADS131M08 24-bit 8-ch ADC',
+    basket: 'analog_signal_chain',
+    subcategory: 'ADCs',
+    dashboardPriority: 'high',
+    thesisReason: '24-bit simultaneous-sampling ADC for energy metering and motor protection — high-priority industrial sensing read.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ADS127L01',
+    preferredOrderablePartNumber: 'ADS127L01IPBS',
+    displayName: 'ADS127L01 24-bit Wide-BW ADC',
+    basket: 'analog_signal_chain',
+    subcategory: 'ADCs',
+    dashboardPriority: 'medium',
+    thesisReason: 'Wide-bandwidth 24-bit ADC for vibration analysis and high-end audio. Precision instrumentation read.',
+    demandProxyType: 'precision_instrumentation',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ADS9224',
+    preferredOrderablePartNumber: 'ADS9224IRHBR',
+    displayName: 'ADS9224 16-bit 3MSPS SAR ADC',
+    basket: 'analog_signal_chain',
+    subcategory: 'ADCs',
+    dashboardPriority: 'medium',
+    thesisReason: 'Mid-speed 16-bit SAR for closed-loop control; test equipment and motor-control attach.',
+    demandProxyType: 'precision_instrumentation',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ADS54J60',
+    preferredOrderablePartNumber: 'ADS54J60IRMP',
+    displayName: 'ADS54J60 16-bit 1GSPS ADC',
+    basket: 'wireless_infra_rf',
+    subcategory: 'ADCs',
+    dashboardPriority: 'medium',
+    thesisReason: 'High-speed JESD204B ADC for software-defined radio and wireless infra. Direct read on radio capex.',
+    demandProxyType: 'wireless_5g_buildout',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'INA826',
+    preferredOrderablePartNumber: 'INA826AIDR',
+    displayName: 'INA826 Instrumentation Amp',
+    basket: 'analog_signal_chain',
+    subcategory: 'Instrumentation amps',
+    dashboardPriority: 'medium',
+    thesisReason: 'Low-noise in-amp for medical and industrial sensor front-ends. Precision-analog franchise read.',
+    demandProxyType: 'precision_instrumentation',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'INA333',
+    preferredOrderablePartNumber: 'INA333AIDR',
+    displayName: 'INA333 Low-Power Inst Amp',
+    basket: 'analog_signal_chain',
+    subcategory: 'Instrumentation amps',
+    dashboardPriority: 'medium',
+    thesisReason: 'Low-power in-amp for portable medical and battery-powered sensors. Complements INA826 at lower power node.',
+    demandProxyType: 'precision_instrumentation',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'PCM5102A',
+    preferredOrderablePartNumber: 'PCM5102APWR',
+    displayName: 'PCM5102A 32-bit Audio DAC',
+    basket: 'analog_signal_chain',
+    subcategory: 'Audio amps',
+    dashboardPriority: 'low',
+    thesisReason: '32-bit stereo audio DAC; consumer-electronics and pro-audio attach. Breadth corroboration.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Motor Drivers additions (9) ──────────────────────────────────────────
+  {
+    genericPartNumber: 'DRV8870',
+    preferredOrderablePartNumber: 'DRV8870DDAR',
+    displayName: 'DRV8870 3.6A Brushed Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Brushed-DC H-bridge for cordless tools, appliances, and toys. Industrial motor-driver attach.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8313',
+    preferredOrderablePartNumber: 'DRV8313PWPR',
+    displayName: 'DRV8313 BLDC Pre-Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: '3-phase BLDC pre-driver; complements DRV8323 at lower current node. Industrial motor-electrification read.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8316R',
+    preferredOrderablePartNumber: 'DRV8316RRSSR',
+    displayName: 'DRV8316R BLDC Smart Gate Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'high',
+    thesisReason: 'Integrated 8A BLDC driver with current sensing; flagship modern motor-control IC for cordless and robotics.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8825',
+    preferredOrderablePartNumber: 'DRV8825PWPR',
+    displayName: 'DRV8825 Stepper Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Stepper motor driver; widely used in 3D printers, CNC, and lab automation. Industrial breadth read.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8434',
+    preferredOrderablePartNumber: 'DRV8434PWPR',
+    displayName: 'DRV8434 Stepper Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Modern stepper driver with stall detection; factory automation and printer attach.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8702D',
+    preferredOrderablePartNumber: 'DRV8702DDQDAQ1',
+    displayName: 'DRV8702D-Q1 H-Bridge Pre-Driver',
+    basket: 'automotive',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'AEC-Q100 H-bridge pre-driver for automotive actuators (window lifts, seat motors, pumps).',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8703',
+    preferredOrderablePartNumber: 'DRV8703FRGER',
+    displayName: 'DRV8703 BLDC Pre-Driver',
+    basket: 'automotive',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'BLDC gate driver for automotive pump and fan motors; supports the 48V mild-hybrid trend.',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8242S',
+    preferredOrderablePartNumber: 'DRV8242SDDDR',
+    displayName: 'DRV8242S Brushed Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'low',
+    thesisReason: 'Brushed-DC driver with SPI; appliance and small-actuator attach.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DRV8311H',
+    preferredOrderablePartNumber: 'DRV8311HRSMR',
+    displayName: 'DRV8311H BLDC Driver',
+    basket: 'industrial',
+    subcategory: 'Motor drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Integrated 3-phase BLDC driver for cordless garden tools, fans, and small appliances.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Embedded Processing additions (10) ───────────────────────────────────
+  {
+    genericPartNumber: 'MSPM0G3507',
+    preferredOrderablePartNumber: 'MSPM0G3507SPTR',
+    displayName: 'MSPM0G3507 Cortex-M0+ MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MCU',
+    dashboardPriority: 'high',
+    thesisReason: 'Flagship MSPM0 Arm Cortex-M0+ MCU; current-generation general-purpose MCU. Reads as TI\'s embedded-cycle replacement signal.',
+    demandProxyType: 'embedded_lifecycle',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'MSPM0L1306',
+    preferredOrderablePartNumber: 'MSPM0L1306SRHAR',
+    displayName: 'MSPM0L1306 Cortex-M0+ MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MCU',
+    dashboardPriority: 'medium',
+    thesisReason: 'Low-cost MSPM0 sibling for high-volume consumer/IoT designs.',
+    demandProxyType: 'embedded_lifecycle',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TMS320F28035',
+    preferredOrderablePartNumber: 'TMS320F28035PNT',
+    displayName: 'C2000 Piccolo F28035 MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MCU',
+    dashboardPriority: 'medium',
+    thesisReason: 'C2000 Piccolo real-time MCU; legacy power-electronics and motor-control attach.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TMS320F280049C',
+    preferredOrderablePartNumber: 'TMS320F280049CPMS',
+    displayName: 'C2000 F280049 MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MCU',
+    dashboardPriority: 'high',
+    thesisReason: 'Modern C2000 real-time MCU for digital power and motor control. High-priority industrial signal.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TMS320F28379D',
+    preferredOrderablePartNumber: 'TMS320F28379DPTPT',
+    displayName: 'C2000 Dual-Core F28379D MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MCU',
+    dashboardPriority: 'medium',
+    thesisReason: 'Dual-core C2000 with CLA accelerators; high-end power-conversion and EV charger control.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'CC2652R1',
+    preferredOrderablePartNumber: 'CC2652R1FRGZR',
+    displayName: 'CC2652R1 Multi-Protocol MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Wireless MCU',
+    dashboardPriority: 'medium',
+    thesisReason: 'Prior-gen multi-protocol wireless MCU; complements CC2652R7 for cycle comparison.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'CC2640R2',
+    preferredOrderablePartNumber: 'CC2640R2FRGZR',
+    displayName: 'CC2640R2 BLE MCU',
+    basket: 'embedded_processing',
+    subcategory: 'Wireless MCU',
+    dashboardPriority: 'low',
+    thesisReason: 'BLE-only wireless MCU; legacy attach for the BLE end of the wireless basket.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'AM3352',
+    preferredOrderablePartNumber: 'AM3352BZCZD80',
+    displayName: 'AM3352 Sitara MPU',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MPU',
+    dashboardPriority: 'medium',
+    thesisReason: 'Sitara ARM Cortex-A8 MPU; HMI and gateway attach, complements AM3358.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'AM3359',
+    preferredOrderablePartNumber: 'AM3359BZCZD80',
+    displayName: 'AM3359 Sitara MPU (PRU-ICSS)',
+    basket: 'embedded_processing',
+    subcategory: 'Embedded MPU',
+    dashboardPriority: 'medium',
+    thesisReason: 'Sitara MPU with industrial PRU-ICSS for EtherCAT/Profinet; factory-automation gateway read.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TMS570LS1224',
+    preferredOrderablePartNumber: 'TMS570LS1224ZWTQQ1',
+    displayName: 'Hercules TMS570 Safety MCU',
+    basket: 'automotive',
+    subcategory: 'Safety MCU',
+    dashboardPriority: 'medium',
+    thesisReason: 'AEC-Q100 ASIL-D safety MCU for ADAS and EV powertrain control. Reads as ADAS / EV growth signal.',
+    demandProxyType: 'auto_adas',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Automotive / Safety additions (9) ────────────────────────────────────
+  {
+    genericPartNumber: 'TPS6594-Q1',
+    preferredOrderablePartNumber: 'TPS6594J33QRWERQ1',
+    displayName: 'TPS6594-Q1 Safety PMIC',
+    basket: 'automotive',
+    subcategory: 'Safety PMIC',
+    dashboardPriority: 'high',
+    thesisReason: 'Multi-rail functional-safety PMIC for ADAS / autonomy compute platforms. Direct ADAS power-attach signal.',
+    demandProxyType: 'auto_adas',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'BQ79616-Q1',
+    preferredOrderablePartNumber: 'BQ79616PFBQ1',
+    displayName: 'BQ79616-Q1 16S EV Battery Monitor',
+    basket: 'automotive',
+    subcategory: 'Battery management',
+    dashboardPriority: 'high',
+    thesisReason: 'High-voltage 16S battery monitor for full-EV packs; complements BQ76952 at the EV-grade tier.',
+    demandProxyType: 'battery_management_ev',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TCAN4550-Q1',
+    preferredOrderablePartNumber: 'TCAN4550RGYRQ1',
+    displayName: 'TCAN4550-Q1 CAN-FD + SPI',
+    basket: 'automotive',
+    subcategory: 'CAN/LIN transceivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'CAN-FD with integrated controller; partial-network and zonal-architecture attach.',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TLIN1029-Q1',
+    preferredOrderablePartNumber: 'TLIN1029DRBQ1',
+    displayName: 'TLIN1029-Q1 LIN Transceiver',
+    basket: 'automotive',
+    subcategory: 'CAN/LIN transceivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'AEC-Q100 LIN transceiver; body-control and HVAC node attach.',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TLIN1021-Q1',
+    preferredOrderablePartNumber: 'TLIN1021DRBRQ1',
+    displayName: 'TLIN1021-Q1 LIN Transceiver',
+    basket: 'automotive',
+    subcategory: 'CAN/LIN transceivers',
+    dashboardPriority: 'low',
+    thesisReason: 'Legacy LIN transceiver — auto-volume breadth, complements newer TLIN1029.',
+    demandProxyType: 'auto_volume',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'SN65HVDA100',
+    preferredOrderablePartNumber: 'SN65HVDA100DR',
+    displayName: 'SN65HVDA100 LIN Bus Transceiver',
+    basket: 'automotive',
+    subcategory: 'CAN/LIN transceivers',
+    dashboardPriority: 'low',
+    thesisReason: 'Long-cycle LIN transceiver; auto-volume breadth check.',
+    demandProxyType: 'auto_volume',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS7B82-Q1',
+    preferredOrderablePartNumber: 'TPS7B8233QDCYRQ1',
+    displayName: 'TPS7B82-Q1 300mA Auto LDO',
+    basket: 'automotive',
+    subcategory: 'LDO regulators',
+    dashboardPriority: 'low',
+    thesisReason: 'AEC-Q100 high-PSRR LDO for body electronics; auto-volume breadth.',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'UCC27614-Q1',
+    preferredOrderablePartNumber: 'UCC27614DRSRQ1',
+    displayName: 'UCC27614-Q1 10A Gate Driver',
+    basket: 'automotive',
+    subcategory: 'Gate drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'AEC-Q100 high-current gate driver for 48V mild-hybrid and DC-fast-charging power stages.',
+    demandProxyType: 'battery_management_ev',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS3702-Q1',
+    preferredOrderablePartNumber: 'TPS3702QDDCRQ1',
+    displayName: 'TPS3702-Q1 Window Supervisor',
+    basket: 'automotive',
+    subcategory: 'Supervisors',
+    dashboardPriority: 'low',
+    thesisReason: 'AEC-Q100 window-comparator supervisor; ADAS rail monitoring attach.',
+    demandProxyType: 'auto_volume',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Data Center / Server Power additions (9) ─────────────────────────────
+  {
+    genericPartNumber: 'TPS53688',
+    preferredOrderablePartNumber: 'TPS53688RSBT',
+    displayName: 'TPS53688 Multi-Phase Controller',
+    basket: 'data_center_server_power',
+    subcategory: 'Multi-phase VR',
+    dashboardPriority: 'high',
+    thesisReason: 'Multi-phase D-CAP+ controller for AI/server CPU rails. Direct hyperscaler/AI capex read.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS53689',
+    preferredOrderablePartNumber: 'TPS53689RSBR',
+    displayName: 'TPS53689 Multi-Phase Controller',
+    basket: 'data_center_server_power',
+    subcategory: 'Multi-phase VR',
+    dashboardPriority: 'high',
+    thesisReason: 'Sibling to TPS53688 for accelerator/GPU power planes; AI buildout signal.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS53622',
+    preferredOrderablePartNumber: 'TPS53622RSLR',
+    displayName: 'TPS53622 AI Power Stage',
+    basket: 'data_center_server_power',
+    subcategory: 'Power stages',
+    dashboardPriority: 'high',
+    thesisReason: 'Smart power stage paired with TPS536xx controllers; AI accelerator rail attach.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS53681',
+    preferredOrderablePartNumber: 'TPS53681RSBT',
+    displayName: 'TPS53681 AI Power Stage',
+    basket: 'data_center_server_power',
+    subcategory: 'Power stages',
+    dashboardPriority: 'high',
+    thesisReason: 'Higher-current power stage for next-gen AI accelerator core rails.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS23861',
+    preferredOrderablePartNumber: 'TPS23861PW',
+    displayName: 'TPS23861 PoE PSE Controller',
+    basket: 'data_center_server_power',
+    subcategory: 'PoE controllers',
+    dashboardPriority: 'medium',
+    thesisReason: 'Quad-port PoE PSE controller for switches and Wi-Fi APs; enterprise networking attach.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS2484',
+    preferredOrderablePartNumber: 'TPS2484PWR',
+    displayName: 'TPS2484 Hot-Swap Controller',
+    basket: 'data_center_server_power',
+    subcategory: 'Hot-swap / eFuse',
+    dashboardPriority: 'medium',
+    thesisReason: 'Server hot-swap controller for high-current 12V boards.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMG3422R030',
+    preferredOrderablePartNumber: 'LMG3422R030RQZT',
+    displayName: 'LMG3422 600V GaN FET',
+    basket: 'data_center_server_power',
+    subcategory: 'GaN power',
+    dashboardPriority: 'high',
+    thesisReason: '600V GaN integrated power stage; complements LMG3522 at the 600V tier — server PSU and high-density AC-DC.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMG3410R070',
+    preferredOrderablePartNumber: 'LMG3410R070RJZR',
+    displayName: 'LMG3410 600V GaN FET',
+    basket: 'data_center_server_power',
+    subcategory: 'GaN power',
+    dashboardPriority: 'medium',
+    thesisReason: '600V GaN FET for higher-power AC-DC stages; complements LMG3422 at lower current.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LM5180',
+    preferredOrderablePartNumber: 'LM5180NGUR',
+    displayName: 'LM5180 48V Bus Converter',
+    basket: 'data_center_server_power',
+    subcategory: 'Bus converters',
+    dashboardPriority: 'medium',
+    thesisReason: '48V/100V flyback bus converter; OCP / hyperscaler rack power attach.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
 ]
 
 // ── Aggregate metadata ──────────────────────────────────────────────────────
@@ -399,8 +1289,12 @@ export type WatchedBasketSummary = {
 }
 
 export function summarizeWatchedBaskets(): WatchedBasketSummary[] {
+  // Phase 22.1 — basket summary reflects production-eligible parts only
+  // (validated). Staged 'pending' parts are surfaced via summarizeStagedBaskets()
+  // which the validation endpoint uses.
   const buckets = new Map<WatchedBasket, WatchedBasketSummary>()
   for (const part of TI_WATCHED_PARTS) {
+    if (!isValidatedForCapture(part)) continue
     const existing = buckets.get(part.basket)
     if (existing) {
       existing.partCount += 1
@@ -415,6 +1309,42 @@ export function summarizeWatchedBaskets(): WatchedBasketSummary[] {
     }
   }
   return Array.from(buckets.values())
+}
+
+/** Phase 22.1 — staged-only basket summary. Used by the validation endpoint
+ *  in Phase 22.2 to show how many candidate OPNs are waiting per basket. */
+export function summarizeStagedBaskets(): WatchedBasketSummary[] {
+  const buckets = new Map<WatchedBasket, WatchedBasketSummary>()
+  for (const part of TI_WATCHED_PARTS) {
+    if (isValidatedForCapture(part)) continue
+    const existing = buckets.get(part.basket)
+    if (existing) {
+      existing.partCount += 1
+      if (part.dashboardPriority === 'high') existing.highPriorityCount += 1
+    } else {
+      buckets.set(part.basket, {
+        basket: part.basket,
+        basketLabel: WATCHED_BASKET_LABEL[part.basket],
+        partCount: 1,
+        highPriorityCount: part.dashboardPriority === 'high' ? 1 : 0,
+      })
+    }
+  }
+  return Array.from(buckets.values())
+}
+
+/** Phase 22.1 — every WatchedPart whose validationStatus is 'validated'
+ *  (or omitted, which defaults to 'validated' for backward-compat). The
+ *  daily capture pipeline is fed exclusively from this list. */
+export function getValidatedWatchedParts(): WatchedPart[] {
+  return TI_WATCHED_PARTS.filter(isValidatedForCapture)
+}
+
+/** Phase 22.1 — every WatchedPart whose validationStatus is 'pending' or
+ *  'failed'. Used by the auth-gated validation endpoint (Phase 22.2) to
+ *  hand the diagnostic the candidate set. Never flows into daily capture. */
+export function getStagedWatchedParts(): WatchedPart[] {
+  return TI_WATCHED_PARTS.filter(p => !isValidatedForCapture(p))
 }
 
 // ── Phase 20D — Inventory snapshot capture adapter ──────────────────────────
@@ -443,10 +1373,14 @@ export const WATCHED_PARTS_FALLBACK_SEED: WatchedPartCaptureSeed = {
 }
 
 export function getWatchedPartsCaptureInputs(): WatchedPartCaptureSeed[] {
-  if (!Array.isArray(TI_WATCHED_PARTS) || TI_WATCHED_PARTS.length === 0) {
+  // Phase 22.1 — production capture is fed by validated parts only.
+  // Pending/failed parts live in TI_WATCHED_PARTS for the validation
+  // endpoint to inspect, but never reach the daily Worker invocation.
+  const eligible = getValidatedWatchedParts()
+  if (eligible.length === 0) {
     return [WATCHED_PARTS_FALLBACK_SEED]
   }
-  return TI_WATCHED_PARTS.map(p => ({
+  return eligible.map(p => ({
     partNumber: p.preferredOrderablePartNumber,
     basket: WATCHED_BASKET_LABEL[p.basket],
     displayName: p.displayName,
@@ -573,26 +1507,31 @@ export async function fetchWatchedPartsProductInfo(
   env: TiEnv,
 ): Promise<WatchedPartsProductInfoBundle> {
   const generatedAt = new Date().toISOString()
-  const baskets = basketCoverage(TI_WATCHED_PARTS)
+  // Phase 22.1 — only iterate validated parts. Staged 'pending' parts are
+  // queried via the auth-gated validation endpoint (Phase 22.2) instead, so
+  // this bundle's shape and totalParts stay at the production 32 until an
+  // operator promotes new parts through validation.
+  const eligible = getValidatedWatchedParts()
+  const baskets = basketCoverage(eligible)
   // Surface the not-configured case with a friendly bundle rather than calling
-  // through to the adapter for every part — avoids 32 wasted fetch attempts
+  // through to the adapter for every part — avoids N wasted fetch attempts
   // in misconfigured environments.
-  const probe = await fetchWatchedPartProductInfo(env, TI_WATCHED_PARTS[0])
+  const probe = await fetchWatchedPartProductInfo(env, eligible[0])
   if (probe.status === 'not_configured' || probe.status === 'token_failed') {
     return {
       generatedAt,
-      totalParts: TI_WATCHED_PARTS.length,
+      totalParts: eligible.length,
       configured: false,
       parts: [],
       baskets,
       summary: {
-        totalWatchedParts: TI_WATCHED_PARTS.length,
+        totalWatchedParts: eligible.length,
         activeParts: 0,
         longestLeadTimeWeeks: null,
         longestLeadTimePart: null,
         partsOkayToOrder: 0,
         basketsCovered: baskets.length,
-        failedFetches: TI_WATCHED_PARTS.length,
+        failedFetches: eligible.length,
       },
       notConfiguredReason:
         probe.status === 'not_configured'
@@ -603,11 +1542,11 @@ export async function fetchWatchedPartsProductInfo(
 
   // First call already populated `probe`. Iterate the remaining parts.
   const parts: WatchedPartProductInfo[] = [probe]
-  for (let i = 1; i < TI_WATCHED_PARTS.length; i++) {
+  for (let i = 1; i < eligible.length; i++) {
     if (INTER_CALL_DELAY_MS > 0) {
       await new Promise(r => setTimeout(r, INTER_CALL_DELAY_MS))
     }
-    parts.push(await fetchWatchedPartProductInfo(env, TI_WATCHED_PARTS[i]))
+    parts.push(await fetchWatchedPartProductInfo(env, eligible[i]))
   }
 
   // ── Summary cards ────────────────────────────────────────────────────────
@@ -639,12 +1578,12 @@ export async function fetchWatchedPartsProductInfo(
   }
   return {
     generatedAt,
-    totalParts: TI_WATCHED_PARTS.length,
+    totalParts: eligible.length,
     configured: true,
     parts,
     baskets,
     summary: {
-      totalWatchedParts: TI_WATCHED_PARTS.length,
+      totalWatchedParts: eligible.length,
       activeParts,
       longestLeadTimeWeeks: longest?.weeks ?? null,
       longestLeadTimePart: longest?.label ?? null,

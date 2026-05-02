@@ -71,6 +71,7 @@ import {
   TI_WATCHED_PARTS,
   summarizeWatchedBaskets,
   getWatchedPartsCaptureInputs,
+  getValidatedWatchedParts,
   WATCHED_PARTS_FALLBACK_SEED,
 } from './sources/tiWatchedParts'
 import {
@@ -1844,15 +1845,20 @@ app.get('/api/ti/watched-parts/product-info', async (c) => {
 // GET /api/ti/watched-parts/catalog — public, secret-free metadata about the
 // watched-parts universe. Useful for the UI to show basket counts before any
 // authenticated fetch. NEVER returns TI data — only the static config.
+// Phase 22.1 — only validated parts are exposed publicly. Staged 'pending'
+// parts live in the same TI_WATCHED_PARTS array but are surfaced only via
+// the auth-gated validation endpoint (Phase 22.2).
 app.get('/api/ti/watched-parts/catalog', (c) => {
+  const eligible = getValidatedWatchedParts()
   return c.json({
-    totalParts: TI_WATCHED_PARTS.length,
+    totalParts: eligible.length,
     baskets: summarizeWatchedBaskets(),
-    parts: TI_WATCHED_PARTS.map(p => ({
+    parts: eligible.map(p => ({
       genericPartNumber: p.genericPartNumber,
       preferredOrderablePartNumber: p.preferredOrderablePartNumber,
       displayName: p.displayName,
       basket: p.basket,
+      subcategory: p.subcategory ?? null,
       dashboardPriority: p.dashboardPriority,
       thesisReason: p.thesisReason,
       demandProxyType: p.demandProxyType,
