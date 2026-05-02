@@ -1303,10 +1303,27 @@ function InventoryPanel() {
         // Pricing source breakdown — derive from /signals/latest summary
         // (priceUnavailableCount is set by Phase 21A.3 onwards). Fall back
         // to counting parts whose latestNormalizedUnitPrice is null.
+        // Phase 21D.2 — count direct-TI vs other vs unavailable using the
+        // pricingSource field on the snapshot (not the persisted-signal
+        // row, which doesn't carry pricingSource yet); falls back to the
+        // signals shape when snapshot.parts isn't loaded.
         const sigList = signalsResp?.signals || [];
-        const priceUnavailableCount = sigSummary?.priceUnavailableCount
-          ?? sigList.filter(s => s.latestNormalizedUnitPrice == null && s.pricePctDelta == null).length;
-        const pricedCount = (sigSummary?.total ?? sigList.length) - priceUnavailableCount;
+        const snapshotParts21D2 = snapshot?.parts || [];
+        const directTiCount = snapshotParts21D2.length > 0
+          ? snapshotParts21D2.filter(p => p.pricingSource === 'direct_ti_store_price' && p.normalizedUnitPrice != null).length
+          : sigList.filter(s => s.latestNormalizedUnitPrice != null).length;
+        const priceUnavailableCount = snapshotParts21D2.length > 0
+          ? snapshotParts21D2.filter(p => p.pricingSource !== 'direct_ti_store_price' || p.normalizedUnitPrice == null).length
+          : (sigSummary?.priceUnavailableCount
+              ?? sigList.filter(s => s.latestNormalizedUnitPrice == null && s.pricePctDelta == null).length);
+        const dashboardPriceCount = 0; // Mouser blending intentionally not wired yet (Phase 21D.2 hard restriction).
+        const pricedCount = directTiCount + dashboardPriceCount;
+        // Sample a few normalized prices for the operator-friendly subtitle.
+        const samplePriced = snapshotParts21D2
+          .filter(p => p.pricingSource === 'direct_ti_store_price' && p.normalizedUnitPrice != null)
+          .slice(0, 3)
+          .map(p => `${p.partNumber} $${Number(p.normalizedUnitPrice).toFixed(4)}`)
+          .join(' · ');
         return (
           <div style={{ ...sectionWrap, paddingTop: 14, paddingBottom: 14 }}>
             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
@@ -1349,18 +1366,33 @@ function InventoryPanel() {
                 </div>
               </InfoCard>
 
-              <InfoCard title="Pricing source status">
-                <InfoRow
-                  label="Price unavailable"
-                  value={priceUnavailableCount != null ? `${priceUnavailableCount} parts` : '—'}
-                  valueColor={priceUnavailableCount > 0 ? '#f0a84e' : '#7a96b8'}
-                />
+              <InfoCard title="Pricing source status" accent={directTiCount > 0 ? '#4dffc3' : undefined}>
                 <InfoRow
                   label="Direct TI Store price"
-                  value={pricedCount != null ? `${pricedCount} parts` : '—'}
-                  valueColor={pricedCount > 0 ? '#4dffc3' : '#7a96b8'}
+                  value={`${directTiCount} parts`}
+                  valueColor={directTiCount > 0 ? '#4dffc3' : '#7a96b8'}
+                />
+                <InfoRow
+                  label="Existing dashboard / Mouser"
+                  value={`${dashboardPriceCount} parts`}
+                  valueColor="#7a96b8"
+                />
+                <InfoRow
+                  label="Price unavailable"
+                  value={`${priceUnavailableCount} parts`}
+                  valueColor={priceUnavailableCount > 0 ? '#f0a84e' : '#7a96b8'}
                 />
                 <InfoRow label="Source" value="Texas Instruments Store API" />
+                <InfoRow
+                  label="Confidence"
+                  value={directTiCount > 0 ? 'High (TI direct)' : '—'}
+                  valueColor={directTiCount > 0 ? '#4dffc3' : '#7a96b8'}
+                />
+                {samplePriced && (
+                  <div style={{ marginTop: 6, fontSize: '0.58rem', color: '#7a96b8', fontFamily: 'monospace' }}>
+                    {samplePriced}
+                  </div>
+                )}
                 <div style={{ marginTop: 6, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.45 }}>
                   Pricing series only renders when TI Store returns price breaks. We never fabricate a price line.
                 </div>
@@ -1525,17 +1557,38 @@ function InventoryPanel() {
                 {insufficient === sigList.length && sigList.length > 0
                   ? 'Run captures over multiple days to start surfacing shortage / oversupply classifications. The engine needs at least 3 successful captures per part.'
                   : 'No shortage or oversupply pressure detected across the watched universe right now.'}
-                {/* Phase 21C — pricing-unavailable plain-English note. Only
-                    when the entire watched set is missing pricing AND the
-                    table is empty: that's the situation where the customer
-                    needs to know the dashboard is in inventory-only mode. */}
-                {sigList.length > 0 && (sigSummary?.priceUnavailableCount ?? 0) === sigList.length && (
-                  <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
-                    Current TI Store API responses are returning inventory units but no normalized
-                    price breaks for this watched set. The dashboard therefore shows
-                    inventory-only monitoring until a pricing source is available.
-                  </div>
-                )}
+                {(() => {
+                  // Phase 21C — pricing-unavailable note when the entire
+                  // watched set is missing pricing.
+                  // Phase 21D.2 — once direct TI prices are flowing (priceUnavailableCount
+                  // is small / zero) we instead explain that we're waiting for the second
+                  // priced observation, since "Direct TI Store price captured;
+                  // waiting for a second pricing observation…" is the row-level
+                  // explanation the engine emits today.
+                  const total = sigList.length;
+                  const priceUnavail = sigSummary?.priceUnavailableCount ?? 0;
+                  const firstPriced = sigList.filter(s => /Direct TI Store price captured; waiting for a second pricing observation/i.test(s.explanation || '')).length;
+                  if (total > 0 && priceUnavail === total) {
+                    return (
+                      <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
+                        Current TI Store API responses are returning inventory units but no normalized
+                        price breaks for this watched set. The dashboard therefore shows
+                        inventory-only monitoring until a pricing source is available.
+                      </div>
+                    );
+                  }
+                  if (firstPriced > 0) {
+                    return (
+                      <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
+                        Direct TI Store prices are now captured for the watched universe.
+                        Price-trend classifications require two pricing-bearing captures.
+                        Currently {firstPriced} of {total} rows are waiting for the next
+                        capture before shortage / oversupply pressure can be calculated.
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
               </div>
             ) : (
               <div style={{ overflowX: 'auto' }}>
@@ -1655,6 +1708,19 @@ function InventoryPanel() {
                   const fmtDelta = d => d == null ? '—' : (d > 0 ? `+${Number(d).toLocaleString()}` : Number(d).toLocaleString());
                   const fmtPct = p => p == null ? '' : ` (${p > 0 ? '+' : ''}${p.toFixed(1)}%)`;
                   const deltaColor = invDelta == null ? '#7a96b8' : invDelta > 0 ? '#4dffc3' : invDelta < 0 ? '#f0a84e' : '#a0b8d0';
+                  // Phase 21D.2 — TI Store price latest vs previous. Either
+                  // can be null; if previous is null but latest is non-null
+                  // we show a "first priced capture" hint.
+                  const latestPrice = latest?.normalizedUnitPrice ?? null;
+                  const previousPrice = previous?.normalizedUnitPrice ?? null;
+                  const priceDelta = (latestPrice != null && previousPrice != null) ? (latestPrice - previousPrice) : null;
+                  const pricePctDelta = (latestPrice != null && previousPrice != null && previousPrice !== 0)
+                    ? ((latestPrice - previousPrice) / Math.abs(previousPrice)) * 100
+                    : (latestPrice === 0 && previousPrice === 0 ? 0 : null);
+                  const priceDeltaColor = priceDelta == null ? '#7a96b8' : priceDelta > 0 ? '#f05c5c' : priceDelta < 0 ? '#4dffc3' : '#a0b8d0';
+                  const fmtPriceVal = (p, cur) => p == null ? '—' : `${cur || latest?.currency || 'USD'} ${Number(p).toFixed(4)}`;
+                  const fmtPriceDelta = d => d == null ? '—' : (d > 0 ? `+${Number(d).toFixed(4)}` : Number(d).toFixed(4));
+                  const firstPricedHere = latestPrice != null && previousPrice == null;
                   return (
                     <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
                       <div style={{ minWidth: 360, flex: 1 }}>
@@ -1680,6 +1746,29 @@ function InventoryPanel() {
                             </div>
                           </div>
                           <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Latest TI price</div>
+                            <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>
+                              {fmtPriceVal(latestPrice, latest?.currency)}
+                              {latestPrice != null && (
+                                <span style={{ color: '#7a96b8', fontSize: '0.6rem', marginLeft: 4 }}>
+                                  @ {Number(latest?.normalizedPriceQty || 1).toLocaleString()}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Previous TI price</div>
+                            <div style={{ color: '#a0b8d0', fontSize: '0.85rem', marginTop: 2 }}>
+                              {fmtPriceVal(previousPrice, previous?.currency)}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Price Δ</div>
+                            <div style={{ color: priceDeltaColor, fontSize: '0.85rem', marginTop: 2 }}>
+                              {fmtPriceDelta(priceDelta)}<span style={{ fontSize: '0.62rem', color: '#7a96b8' }}>{fmtPct(pricePctDelta)}</span>
+                            </div>
+                          </div>
+                          <div>
                             <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Observations</div>
                             <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>{rows.length}</div>
                           </div>
@@ -1690,12 +1779,17 @@ function InventoryPanel() {
                             </div>
                           </div>
                           <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Pricing</div>
-                            <div style={{ color: anyPrice ? '#4dffc3' : '#f0a84e', fontSize: '0.7rem', marginTop: 2 }}>
-                              {anyPrice ? 'TI Store price available' : 'unavailable'}
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Pricing source</div>
+                            <div style={{ color: latestPrice != null ? '#4dffc3' : '#f0a84e', fontSize: '0.7rem', marginTop: 2 }}>
+                              {latestPrice != null ? 'TI Direct (high)' : 'unavailable'}
                             </div>
                           </div>
                         </div>
+                        {firstPricedHere && (
+                          <div style={{ marginTop: -8, marginBottom: 14, padding: '8px 12px', background: '#0d1422', border: '1px solid #1a2740', borderRadius: 4, fontSize: '0.66rem', color: '#a0b8d0', lineHeight: 1.5 }}>
+                            First direct TI price captured. Price-trend classification starts after the next priced capture.
+                          </div>
+                        )}
                         <div style={tinyLabel}>30d inventory & price history · {rows.length} captures</div>
                         <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem', width: '100%' }}>
                           <thead>
@@ -1854,7 +1948,26 @@ function InventoryPanel() {
                 const fetchedRaw = p.fetchedAt ? new Date(p.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
                 const fetched = isStale && lastGood ? `${lastGood} (stale)` : fetchedRaw;
                 const conf = p.signals?.sourceConfidence;
-                const pricingTxt = p.pricingAvailability === 'available' ? 'Available'
+                // Phase 21D.2 — when TI Store returned a price break, show
+                // the normalized unit price + qty + a "TI Direct" tag so
+                // the customer can see what's behind "Available" without
+                // expanding the per-part history. Falls back to the prior
+                // Available/Not posted/Pending labels when no break.
+                const pricingTxt = (p.pricingAvailability === 'available' && p.normalizedUnitPrice != null)
+                  ? (
+                      <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 4, flexWrap: 'wrap' }}>
+                        <span style={{ color: '#e0eaf8', fontWeight: 'bold' }}>
+                          {`${p.currency || 'USD'} ${Number(p.normalizedUnitPrice).toFixed(4)}`}
+                        </span>
+                        <span style={{ color: '#7a96b8', fontSize: '0.6rem' }}>
+                          {`@ ${Number(p.normalizedPriceQty || 1).toLocaleString()}`}
+                        </span>
+                        <span style={{ color: '#4dffc3', fontSize: '0.55rem', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                          TI Direct
+                        </span>
+                      </span>
+                    )
+                  : p.pricingAvailability === 'available' ? 'Available'
                   : p.pricingAvailability === 'unavailable' ? 'Not posted'
                   : p.pricingAvailability === 'pending_approval' ? 'Pending approval'
                   : '—';
