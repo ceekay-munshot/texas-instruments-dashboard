@@ -1479,9 +1479,23 @@ function InventoryPanel() {
           : captureStatus === 'error' || captureStatus === 'failed' ? '#f05c5c'
           : captureStatus === 'in_progress' ? '#3d8ef0'
           : '#7a96b8';
-        const expectedParts = sched?.offsetsConfigured && sched?.offsetsConfigured > 0
-          ? sched.offsetsConfigured * 8
-          : 32;
+        // Phase 22.6 — derive expected from the actual watched universe.
+        // Pre-22.4 this was offsetsConfigured*8 (the in-Cloudflare cron
+        // count × batch size), which only matched reality when the
+        // universe was 32 parts. With dynamic batching live we prefer
+        // /history/summary.totalTrackedParts → /inventory/latest.totalParts
+        // → schedule.capturedParts in that order, falling back to the
+        // cron-derived guess only when none of those exist yet.
+        const expectedParts =
+          (historySummary?.totalTrackedParts && historySummary.totalTrackedParts > 0
+            ? historySummary.totalTrackedParts
+            : (snapshot?.summary?.totalParts && snapshot.summary.totalParts > 0
+                ? snapshot.summary.totalParts
+                : (sched?.capturedParts && sched.capturedParts > 0
+                    ? sched.capturedParts
+                    : (sched?.offsetsConfigured && sched.offsetsConfigured > 0
+                        ? sched.offsetsConfigured * 8
+                        : 32))));
         const expectedSignals = expectedParts;
         const captured = sched?.capturedParts ?? null;
         const persisted = sched?.signalsPersisted ?? null;
@@ -1529,16 +1543,20 @@ function InventoryPanel() {
                   value={persisted == null ? '—' : `${persisted}/${expectedSignals}`}
                   valueColor={persisted === expectedSignals ? '#4dffc3' : persisted == null ? '#7a96b8' : '#f0a84e'}
                 />
-                {/* Phase 22.5 — Data Quality additions: failed/stale + 2+ obs */}
+                {/* Phase 22.5 — Data Quality additions: failed/stale + 2+ obs.
+                    Phase 22.6 — read failed/stale from snapshot.summary
+                    (the /inventory/latest payload), not the local
+                    `summary` variable above which is /history/summary
+                    (which doesn't carry failedParts/staleParts). */}
                 <InfoRow
                   label="Failed parts"
-                  value={summary?.failedParts != null ? String(summary.failedParts) : '—'}
-                  valueColor={(summary?.failedParts ?? 0) > 0 ? '#f05c5c' : '#4dffc3'}
+                  value={snapshot?.summary?.failedParts != null ? String(snapshot.summary.failedParts) : '—'}
+                  valueColor={(snapshot?.summary?.failedParts ?? 0) > 0 ? '#f05c5c' : '#4dffc3'}
                 />
                 <InfoRow
                   label="Stale parts"
-                  value={summary?.staleParts != null ? String(summary.staleParts) : '—'}
-                  valueColor={(summary?.staleParts ?? 0) > 0 ? '#f0a84e' : '#7a96b8'}
+                  value={snapshot?.summary?.staleParts != null ? String(snapshot.summary.staleParts) : '—'}
+                  valueColor={(snapshot?.summary?.staleParts ?? 0) > 0 ? '#f0a84e' : '#7a96b8'}
                 />
                 <InfoRow
                   label="Parts with 2+ obs"
