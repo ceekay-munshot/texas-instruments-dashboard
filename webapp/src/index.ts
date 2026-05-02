@@ -62,6 +62,7 @@ import {
   fetchTiProductInfo,
   fetchTiProductInfoDebug,
   fetchTiInventoryPricing,
+  fetchTiInventoryPricingDebug,
   tokenCacheSnapshot as tiTokenCacheSnapshot,
   tiAttemptedEndpoints,
 } from './sources/tiDirect'
@@ -2400,6 +2401,38 @@ app.get('/api/ti/inventory/history/summary', async (c) => {
     success: true,
     ...summary,
   })
+})
+
+// Phase 21D — GET /api/ti/inventory/pricing-diagnostic?partNumber=XYZ
+// Auth-gated diagnostic that returns SANITIZED shape evidence about the
+// TI Store Inventory & Pricing response: response top-level keys, the
+// product-level keys, a candidate-key probe over alternate field names
+// (priceBreaks / prices / priceList / priceTier / priceTiers /
+// productPricing / priceBreakdowns / unitPrices), the parsed pricing-array
+// length, the first-break field names, and the parser's normalized output.
+// Never returns the raw TI body, the OAuth token, the Authorization header,
+// or the client id/secret. Lets the operator distinguish "TI returned no
+// pricing for this part" from "our parser is looking under the wrong key".
+app.get('/api/ti/inventory/pricing-diagnostic', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const partNumber = (c.req.query('partNumber') || '').trim()
+  if (!partNumber) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'partNumber query param required.' }, 400)
+  }
+  const report = await fetchTiInventoryPricingDebug(env, partNumber)
+  return c.json({ success: report.status === 'ok', ...report })
 })
 
 // GET /api/ti/inventory-pricing?partNumber=XYZ — auth-gated.

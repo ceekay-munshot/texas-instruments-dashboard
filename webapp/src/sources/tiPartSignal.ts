@@ -16,6 +16,7 @@
 import {
   fetchTiProductInfo,
   fetchTiInventoryPricing,
+  chooseNormalizedPriceBreak,
   type TiEnv,
   type TiProductInfo,
   type TiInventoryPricing,
@@ -241,6 +242,14 @@ export type TiPartSignalPublic = {
   dashboardPriority?: 'high' | 'medium' | 'low' | null
   quantityAvailable: number | null
   pricingAvailability: 'available' | 'unavailable' | 'pending_approval' | 'unknown'
+  // Phase 21D — sanitized normalized pricing surfaced on the public shape
+  // so the snapshot/history pipeline can persist it. Null when TI didn't
+  // return a usable price break. Currency carries the break's currency, or
+  // null when no break was selected. Never fabricated — these come straight
+  // from chooseNormalizedPriceBreak() applied to the TI Store pricing[].
+  normalizedUnitPrice: number | null
+  normalizedPriceQty: number | null
+  currency: string | null
   orderLimit: number | null
   futureInventoryVisibility: {
     forecastCount: number
@@ -355,6 +364,13 @@ export function toPublicPartSignal(
     dashboardPriority: h.dashboardPriority ?? null,
     quantityAvailable: signal.quantityAvailable,
     pricingAvailability: signal.signals.pricingSignal,
+    // Phase 21D — derive normalized pricing from the TI Store price breaks
+    // using the 1000 → 100 → 1 → nearest-lowest priority. When TI returned
+    // no usable break (most parts today) all three fields stay null and
+    // pricingAvailability is already 'unavailable'.
+    normalizedUnitPrice: chooseNormalizedPriceBreak(signal.pricing)?.unitPrice ?? null,
+    normalizedPriceQty: chooseNormalizedPriceBreak(signal.pricing)?.breakQuantity ?? null,
+    currency: signal.currency,
     orderLimit: signal.orderLimit,
     futureInventoryVisibility: {
       forecastCount: futureRows.length,
@@ -418,6 +434,9 @@ function buildExceptionRow(
     dashboardPriority: input.dashboardPriority ?? null,
     quantityAvailable: null,
     pricingAvailability: 'unknown',
+    normalizedUnitPrice: null,
+    normalizedPriceQty: null,
+    currency: null,
     orderLimit: null,
     futureInventoryVisibility: { forecastCount: 0, nextForecastDate: null, nextForecastQuantity: null },
     leadTimeWeeks: null,

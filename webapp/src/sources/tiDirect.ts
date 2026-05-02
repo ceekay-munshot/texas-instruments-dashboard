@@ -1152,6 +1152,233 @@ export async function fetchTiInventoryPricing(
   }
 }
 
+// ── Phase 21D — pricing normalization + diagnostic ─────────────────────────
+
+/** Pick the price break that the dashboard uses as `normalizedUnitPrice`.
+ *  Spec: prefer 1000-piece, then 100, then 1, then the largest break ≤ 1000.
+ *  Returns null if no positive-priced break exists. */
+export function chooseNormalizedPriceBreak(
+  pricing: TiInventoryPricing['pricing'],
+): { breakQuantity: number; unitPrice: number; currency: string } | null {
+  if (!Array.isArray(pricing) || pricing.length === 0) return null
+  const valid = pricing.filter(b =>
+    Number.isFinite(b.breakQuantity) && Number.isFinite(b.unitPrice) && b.unitPrice > 0,
+  )
+  if (valid.length === 0) return null
+  const at = (q: number) => valid.find(b => b.breakQuantity === q) ?? null
+  const at1000 = at(1000)
+  if (at1000) return at1000
+  const at100 = at(100)
+  if (at100) return at100
+  const at1 = at(1)
+  if (at1) return at1
+  // Largest break <= 1000; falls back to the smallest break if all > 1000.
+  const sortedDesc = valid.slice().sort((a, b) => b.breakQuantity - a.breakQuantity)
+  const leMax = sortedDesc.find(b => b.breakQuantity <= 1000)
+  return leMax ?? sortedDesc[sortedDesc.length - 1]
+}
+
+/** Sanitized debug shape used by the auth-gated pricing-diagnostic endpoint.
+ *  Reports response-shape evidence without exposing tokens, headers, raw
+ *  bodies, or the OAuth secret. The candidate-key probe surfaces alternate
+ *  field names that TI might use (priceBreaks, prices, priceList, …) so we
+ *  can tell "TI returned no pricing for this part" apart from "our parser is
+ *  looking under the wrong key". */
+export type TiInventoryPricingDebug = {
+  partNumber: string
+  source: string
+  status: TiInventoryPricing['status']
+  httpStatus: number | null
+  sanitizedCode: string | null
+  sanitizedMessage: string
+  attemptedHost: string
+  attemptedPath: string
+  responseTopLevelKeys: string[]
+  productLevelKeys: string[]
+  productLevelKeysFound: 'product' | 'data' | 'top-level' | 'none'
+  candidateKeyProbe: Array<{ key: string; type: string; arrayLength: number | null; firstItemKeys: string[] }>
+  parsedPricingArrayLength: number
+  parsedFutureInventoryLength: number
+  pricingFirstBreakKeys: string[]
+  pricingFirstBreakSample: { breakQuantity: number; unitPrice: number; currency: string } | null
+  parserOutput: {
+    pricingAvailability: 'available' | 'unavailable' | 'pending_approval' | 'unknown'
+    normalizedUnitPrice: number | null
+    normalizedPriceQty: number | null
+    normalizedCurrency: string | null
+    priceBreaksCount: number
+    quantityAvailable: number | null
+    orderLimit: number | null
+  }
+  diagnosis: string
+  warnings: string[]
+}
+
+/** Run fetchTiInventoryPricing then return a SANITIZED inspection of the
+ *  parsed object. Never returns the raw TI body, the OAuth token, or any
+ *  Authorization header. The candidateKeyProbe inspects the parsed JSON
+ *  shape only — purely structural. */
+export async function fetchTiInventoryPricingDebug(
+  env: TiEnv,
+  partNumber: string,
+): Promise<TiInventoryPricingDebug> {
+  const cleaned = (partNumber || '').trim()
+  const baseEndpoints = tiAttemptedEndpoints(env)
+  const baseDebug: TiInventoryPricingDebug = {
+    partNumber: cleaned,
+    source: 'Texas Instruments Store API',
+    status: 'error',
+    httpStatus: null,
+    sanitizedCode: null,
+    sanitizedMessage: '',
+    attemptedHost: baseEndpoints.attemptedInventoryPricingHost,
+    attemptedPath: baseEndpoints.attemptedInventoryPricingPath,
+    responseTopLevelKeys: [],
+    productLevelKeys: [],
+    productLevelKeysFound: 'none',
+    candidateKeyProbe: [],
+    parsedPricingArrayLength: 0,
+    parsedFutureInventoryLength: 0,
+    pricingFirstBreakKeys: [],
+    pricingFirstBreakSample: null,
+    parserOutput: {
+      pricingAvailability: 'unknown',
+      normalizedUnitPrice: null,
+      normalizedPriceQty: null,
+      normalizedCurrency: null,
+      priceBreaksCount: 0,
+      quantityAvailable: null,
+      orderLimit: null,
+    },
+    diagnosis: '',
+    warnings: [],
+  }
+  if (!cleaned) {
+    return { ...baseDebug, status: 'error', sanitizedCode: 'invalid_partnumber', sanitizedMessage: 'partNumber is required.', diagnosis: 'partNumber missing.' }
+  }
+  // Re-issue the same fetch the production parser does, but capture the
+  // raw body locally so we can inspect its shape. The parser path is
+  // duplicated rather than refactored to keep the production hot path
+  // unchanged for Phase 21D.
+  const config = checkTiConfigured(env)
+  if (!config.configured) {
+    return { ...baseDebug, status: 'not_configured', sanitizedCode: 'not_configured', sanitizedMessage: 'TI adapter not configured.', diagnosis: 'TI credentials missing.' }
+  }
+  if (config.storeApiState !== 'enabled') {
+    return { ...baseDebug, status: 'pending_approval', sanitizedCode: 'store_api_pending', sanitizedMessage: 'TI Store API approval pending.', diagnosis: 'TI Store API entitlement disabled (TI_STORE_API_ENABLED != true).' }
+  }
+  const tok = await fetchTiToken(env)
+  if (!tok.ok) {
+    return { ...baseDebug, status: 'token_failed', httpStatus: tok.httpStatus, sanitizedCode: tok.sanitizedCode, sanitizedMessage: tok.sanitizedMessage, diagnosis: 'TI OAuth token fetch failed.' }
+  }
+  const inventoryUrl = resolveInventoryPricingUrl(env, cleaned)
+  let res: Response
+  try {
+    res = await fetch(inventoryUrl, { method: 'GET', headers: { Authorization: `Bearer ${tok.token}`, Accept: 'application/json' } })
+  } catch (e: any) {
+    return { ...baseDebug, status: 'error', sanitizedCode: 'unreachable', sanitizedMessage: sanitizeMessage(e?.message || 'unknown error', env), diagnosis: 'TI Store endpoint unreachable.' }
+  }
+  if (res.status === 401 || res.status === 403) {
+    return { ...baseDebug, status: 'auth_failed', httpStatus: res.status, sanitizedCode: 'unauthorized', sanitizedMessage: 'TI rejected the request.', diagnosis: 'TI rejected the auth token for the Store API. Verify Store API suite approval and TI_STORE_API_ENABLED entitlement.' }
+  }
+  if (res.status === 404) {
+    return { ...baseDebug, status: 'no_match', httpStatus: 404, sanitizedCode: 'not_found', sanitizedMessage: 'TI Store API returned 404.', diagnosis: 'Part not recognized by TI Store API.' }
+  }
+  if (res.status === 429) {
+    return { ...baseDebug, status: 'rate_limited', httpStatus: 429, sanitizedCode: 'rate_limited', sanitizedMessage: 'TI Store API rate limit hit.', diagnosis: 'Rate limited; back off and retry.' }
+  }
+  let bodyText = ''
+  try { bodyText = await res.text() } catch { bodyText = '' }
+  if (!res.ok) {
+    const ext = tryExtractTiError(bodyText)
+    return { ...baseDebug, status: 'error', httpStatus: res.status, sanitizedCode: ext.code ?? `http_${res.status}`, sanitizedMessage: sanitizeMessage(ext.message ?? bodyText, env), diagnosis: `Non-2xx HTTP ${res.status} from TI Store.` }
+  }
+  let data: any
+  try { data = JSON.parse(bodyText) } catch {
+    return { ...baseDebug, status: 'error', httpStatus: res.status, sanitizedCode: 'invalid_json', sanitizedMessage: 'Store API response was not valid JSON.', diagnosis: 'TI Store returned non-JSON; parser cannot proceed.' }
+  }
+  // Walk the response shape — keys only; never report raw values to the
+  // caller. The candidate-key probe is the bit that tells "TI returned no
+  // pricing" apart from "our parser is looking under the wrong key".
+  const responseTopLevelKeys = data && typeof data === 'object' ? Object.keys(data) : []
+  let p: any = null
+  let productLevelKeysFound: TiInventoryPricingDebug['productLevelKeysFound'] = 'none'
+  if (data && typeof data === 'object') {
+    if (data.product && typeof data.product === 'object') { p = data.product; productLevelKeysFound = 'product' }
+    else if (data.data && typeof data.data === 'object') { p = data.data; productLevelKeysFound = 'data' }
+    else { p = data; productLevelKeysFound = 'top-level' }
+  }
+  const productLevelKeys = p && typeof p === 'object' ? Object.keys(p) : []
+  const PRICING_CANDIDATE_KEYS = ['pricing', 'prices', 'priceBreaks', 'priceList', 'priceTier', 'priceTiers', 'productPricing', 'priceBreakdowns', 'unitPrices']
+  const candidateKeyProbe = PRICING_CANDIDATE_KEYS.map(key => {
+    const v = p?.[key]
+    let arrayLength: number | null = null
+    let firstItemKeys: string[] = []
+    if (Array.isArray(v)) {
+      arrayLength = v.length
+      const first = v[0]
+      if (first && typeof first === 'object') firstItemKeys = Object.keys(first)
+    }
+    return { key, type: Array.isArray(v) ? 'array' : (v == null ? 'absent' : typeof v), arrayLength, firstItemKeys }
+  })
+  // Reuse the production parser logic so the debug output exactly matches
+  // what the live capture would have written for this part.
+  const pricing: Array<{ breakQuantity: number; unitPrice: number; currency: string }> | null =
+    Array.isArray(p?.pricing)
+      ? p.pricing
+          .map((b: any) => ({ breakQuantity: Number(b?.breakQuantity ?? b?.quantity ?? 0), unitPrice: Number(b?.unitPrice ?? b?.price ?? 0), currency: typeof b?.currency === 'string' ? b.currency : 'USD' }))
+          .filter((r: any) => Number.isFinite(r.breakQuantity) && Number.isFinite(r.unitPrice) && r.unitPrice > 0)
+      : null
+  const futureInventory: Array<any> | null =
+    Array.isArray(p?.futureInventory)
+      ? p.futureInventory.filter((r: any) => r && typeof r === 'object')
+      : null
+  const chosen = chooseNormalizedPriceBreak(pricing)
+  const pricingAvailability = Array.isArray(pricing) && pricing.length > 0 ? 'available' : 'unavailable'
+  const quantityAvailable = typeof p?.quantity === 'number' ? p.quantity : (typeof p?.availableQuantity === 'number' ? p.availableQuantity : null)
+  const orderLimit = typeof p?.orderLimit === 'number' ? p.orderLimit : null
+  const pricingFirstBreakKeys = Array.isArray(p?.pricing) && p.pricing[0] && typeof p.pricing[0] === 'object'
+    ? Object.keys(p.pricing[0])
+    : []
+  const altCandidate = candidateKeyProbe.find(c => c.key !== 'pricing' && c.arrayLength != null && c.arrayLength > 0)
+  let diagnosis = ''
+  if (pricing && pricing.length > 0) {
+    diagnosis = `TI returned ${pricing.length} price break(s); chosen normalized unit price = ${chosen?.unitPrice ?? 'n/a'} ${chosen?.currency ?? ''} at qty=${chosen?.breakQuantity ?? 'n/a'}.`
+  } else if (altCandidate) {
+    diagnosis = `Parser missed pricing — TI returned data under "${altCandidate.key}" (length=${altCandidate.arrayLength}), not "pricing". First-item keys: ${altCandidate.firstItemKeys.join(',')}.`
+  } else if (Array.isArray(p?.pricing) && p.pricing.length > 0) {
+    diagnosis = 'TI returned a "pricing" array but every entry was filtered (non-finite breakQuantity / unitPrice or unitPrice ≤ 0). Inspect pricingFirstBreakKeys.'
+  } else {
+    diagnosis = 'TI Store API returned the part successfully, but the response carries no pricing array under any known candidate key — pricing is genuinely unavailable for this part/account.'
+  }
+  return {
+    ...baseDebug,
+    status: 'ok',
+    httpStatus: res.status,
+    sanitizedCode: null,
+    sanitizedMessage: '',
+    responseTopLevelKeys,
+    productLevelKeys,
+    productLevelKeysFound,
+    candidateKeyProbe,
+    parsedPricingArrayLength: Array.isArray(p?.pricing) ? p.pricing.length : 0,
+    parsedFutureInventoryLength: Array.isArray(futureInventory) ? futureInventory.length : 0,
+    pricingFirstBreakKeys,
+    pricingFirstBreakSample: chosen,
+    parserOutput: {
+      pricingAvailability,
+      normalizedUnitPrice: chosen?.unitPrice ?? null,
+      normalizedPriceQty: chosen?.breakQuantity ?? null,
+      normalizedCurrency: chosen?.currency ?? null,
+      priceBreaksCount: pricing?.length ?? 0,
+      quantityAvailable,
+      orderLimit,
+    },
+    diagnosis,
+    warnings: [],
+  }
+}
+
 // ── Cached freshness accessor ───────────────────────────────────────────────
 // Used by /api/ti/status to surface "Last token refresh" without doing a fresh
 // network round-trip when the cache is warm.

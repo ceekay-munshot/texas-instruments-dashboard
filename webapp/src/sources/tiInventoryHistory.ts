@@ -100,12 +100,12 @@ export type HistoryRow = {
 }
 
 export function toHistoryRow(p: TiPartSignalPublic, capturedAt: string): HistoryRow {
-  // Phase 21F pricing hierarchy: Store I&P returns price breaks in
-  // `pricing` on the merged signal, but the sanitized public shape only
-  // carries `pricingAvailability`. When direct breaks are present a future
-  // phase will fill normalizedUnitPrice / normalizedPriceQty here; for now
-  // we never invent a number — pricingAvailability=unavailable means the
-  // signal engine treats price as missing, not zero.
+  // Phase 21D — TiPartSignalPublic now carries normalizedUnitPrice /
+  // normalizedPriceQty / currency derived from chooseNormalizedPriceBreak()
+  // applied to the TI Store pricing[]. Persist them straight through.
+  // pricingAvailability stays the source of truth for the boolean flag —
+  // when the TI Store API returned no breaks the three normalized fields
+  // remain null and we never invent a number.
   const priceAvailable = p.pricingAvailability === 'available'
   return {
     capturedAt,
@@ -120,9 +120,9 @@ export function toHistoryRow(p: TiPartSignalPublic, capturedAt: string): History
     quantityAvailable: p.quantityAvailable ?? null,
     pricingAvailability: p.pricingAvailability,
     priceAvailable,
-    currency: priceAvailable ? 'USD' : null,
-    normalizedUnitPrice: null,
-    normalizedPriceQty: null,
+    currency: p.currency ?? (priceAvailable ? 'USD' : null),
+    normalizedUnitPrice: p.normalizedUnitPrice ?? null,
+    normalizedPriceQty: p.normalizedPriceQty ?? null,
     orderLimit: p.orderLimit ?? null,
     leadTimeWeeks: p.leadTimeWeeks ?? null,
     lifecycleStatus: p.lifecycleStatus ?? null,
