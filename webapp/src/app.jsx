@@ -72,6 +72,31 @@ function useToasts() {
   return { toasts, push, dismiss };
 }
 
+// Phase 23C.5 — persist Mouser rate-limit cooldown across page reloads so
+// hard-refreshing during a known cooldown does not re-pop the persistent
+// rate-limit toast (the page would call /api/prices, hit the still-active
+// Mouser quota, and surface the warn toast on every load).
+const RATE_LIMIT_LS_KEY = 'tip-mouser-rate-limit-until';
+function readPersistedRateLimit() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(RATE_LIMIT_LS_KEY);
+    if (!raw) return null;
+    if (new Date(raw).getTime() <= Date.now()) {
+      window.localStorage.removeItem(RATE_LIMIT_LS_KEY);
+      return null;
+    }
+    return raw;
+  } catch { return null; }
+}
+function writePersistedRateLimit(retryAt) {
+  if (typeof window === 'undefined') return;
+  try {
+    if (retryAt) window.localStorage.setItem(RATE_LIMIT_LS_KEY, retryAt);
+    else window.localStorage.removeItem(RATE_LIMIT_LS_KEY);
+  } catch {}
+}
+
 // Countdown toast component for rate limiting
 function RateLimitToast({ retryAt, onDismiss }) {
   const [secsLeft, setSecsLeft] = useState(null);
@@ -3383,7 +3408,10 @@ function App(){
   const [fetchCount,setFetchCount]=useState(null);
   const [vis,setVis]=useState(new Set(Object.keys(GC)));
   const [tooltip,setTooltip]=useState(null);
-  const [rateLimitedUntil,setRateLimitedUntil]=useState(null);
+  // Phase 23C.5 — lazy init from localStorage so a hard-refresh during an
+  // active Mouser cooldown keeps the refresh button disabled and prevents
+  // a fresh /api/prices call from re-triggering the warn toast.
+  const [rateLimitedUntil,setRateLimitedUntil]=useState(()=>readPersistedRateLimit());
   const [baselineMeta,setBaselineMeta]=useState(null);
   const [basketPreviewData,setBasketPreviewData]=useState(null);
   const [basketLoading,setBasketLoading]=useState(false);
@@ -3417,12 +3445,26 @@ function App(){
     const ms = Math.max(0, new Date(retryAt) - Date.now()) + 2000;
     retryTimer.current = setTimeout(() => {
       setRateLimitedUntil(null);
+      writePersistedRateLimit(null);
       push('Rate limit cleared — auto-refreshing live prices…', 'info', 4000);
       fetchLive(true, true);
     }, ms);
   }
 
   const fetchLive = useCallback(async(force=false, silent=false) => {
+    // Phase 23C.5 — pre-flight guard. If a manual refresh fires while we
+    // already know the Mouser quota is cooling down, skip the network call
+    // entirely and surface a calm one-line info toast. Prevents the loud
+    // RateLimitToast countdown from re-popping every time the user clicks.
+    if (force) {
+      const persisted = readPersistedRateLimit();
+      const until = rateLimitedUntil || persisted;
+      if (until && new Date(until).getTime() > Date.now()) {
+        const secsLeft = Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / 1000));
+        if (!silent) push(`Live refresh available in ~${secsLeft}s — Mouser quota cooling down.`, 'info', 4000);
+        return;
+      }
+    }
     setLoading(true);
     if (!silent) push('Querying Mouser Electronics API — fetching 28 categories in parallel…', 'info', 15000);
     try {
@@ -3456,6 +3498,7 @@ function App(){
         // retryAt from server; if missing, default to 60s from now
         const retryAt = json.retryAt || new Date(Date.now() + 65_000).toISOString();
         setRateLimitedUntil(retryAt);
+        writePersistedRateLimit(retryAt);
         if (rateLimitToastId.current) dismiss(rateLimitToastId.current);
         const id = push(
           <RateLimitToast retryAt={retryAt} onDismiss={()=>dismiss(id)} />,
@@ -3475,8 +3518,9 @@ function App(){
         }
       } else if ((json.fetchedCount ?? 0) === 0 && json.source === 'live') {
         // Fetched 0 categories but no rateLimited flag — likely all parts returned no pricing
-        setRateLimitedUntil(new Date(Date.now() + 65_000).toISOString());
         const retryAt2 = new Date(Date.now() + 65_000).toISOString();
+        setRateLimitedUntil(retryAt2);
+        writePersistedRateLimit(retryAt2);
         if (rateLimitToastId.current) dismiss(rateLimitToastId.current);
         const id2 = push(
           <RateLimitToast retryAt={retryAt2} onDismiss={()=>dismiss(id2)} />,
@@ -3491,8 +3535,13 @@ function App(){
           const total = json.totalCount ?? 28;
           push(`Live prices loaded — ${got}/${total} categories fetched from Mouser`, 'success', 5000);
         }
+        // Phase 23C.5 — clear cooldown state, persisted key, retry timer,
+        // and the persistent RateLimitToast so a successful refresh leaves
+        // no stale UI behind.
         setRateLimitedUntil(null);
-        if (retryTimer.current) clearTimeout(retryTimer.current);
+        writePersistedRateLimit(null);
+        if (retryTimer.current) { clearTimeout(retryTimer.current); retryTimer.current = null; }
+        if (rateLimitToastId.current) { dismiss(rateLimitToastId.current); rateLimitToastId.current = null; }
       }
     } catch(e) {
       push(`Failed to load live prices: ${e.message}`, 'error', 8000);
@@ -3500,7 +3549,20 @@ function App(){
     setLoading(false);
   }, [push, dismiss]);
 
-  useEffect(() => { fetchLive(false); return () => { if(retryTimer.current) clearTimeout(retryTimer.current); }; }, []);
+  useEffect(() => {
+    // Phase 23C.5 — if a previous tab/session left a Mouser cooldown
+    // window in localStorage, honor it on mount: load cached data
+    // silently and schedule the same auto-retry timer that the live
+    // path would have set. No fresh /api/prices call, no warn toast.
+    const persisted = readPersistedRateLimit();
+    if (persisted) {
+      scheduleRetry(persisted);
+      fetchLive(false, true);
+    } else {
+      fetchLive(false);
+    }
+    return () => { if(retryTimer.current) clearTimeout(retryTimer.current); };
+  }, []);
 
   // Phase 9: fetch the Nexar basket preview to enrich preview-covered cells.
   // Initial mount uses the cached path only — never sends ?refresh=true. The
