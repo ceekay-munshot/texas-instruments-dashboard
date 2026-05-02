@@ -951,6 +951,10 @@ function InventoryPanel() {
   // Trends tab — selected part for trend deep-dive.
   const [trendPart, setTrendPart] = useState(null);
   const [historySummary, setHistorySummary] = useState(null);
+  // Phase 21C — schedule/status feeds the customer-facing automation health
+  // strip at the top of the Inventory tab. Sanitized public response; no
+  // secrets ever flow through this channel.
+  const [scheduleStatus, setScheduleStatus] = useState(null);
 
   // ── Operator-tools state (collapsed by default) ───────────────────────
   // Lets an operator paste the X-Capture-Secret to run a fresh capture or
@@ -977,7 +981,9 @@ function InventoryPanel() {
       fetch('/api/ti/inventory/signals/latest').then(r => r.ok ? r.json() : null).catch(() => null),
       fetch('/api/ti/inventory/signals').then(r => r.ok ? r.json() : null).catch(() => null),
       fetch('/api/ti/inventory/history/summary').then(r => r.ok ? r.json() : null).catch(() => null),
-    ]).then(([snapRes, sigLatestRes, sigOnFlyRes, summaryRes]) => {
+      // Phase 21C — automation-health card on the Inventory tab.
+      fetch('/api/ti/inventory/schedule/status').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([snapRes, sigLatestRes, sigOnFlyRes, summaryRes, scheduleRes]) => {
       if (cancelled) return;
       setSnapshotLoading(false);
       const j = snapRes.status === 'fulfilled' ? snapRes.value : null;
@@ -992,6 +998,7 @@ function InventoryPanel() {
       const onFly = sigOnFlyRes.status === 'fulfilled' ? sigOnFlyRes.value : null;
       setSignalsResp(persisted ?? onFly ?? null);
       if (summaryRes.status === 'fulfilled' && summaryRes.value) setHistorySummary(summaryRes.value);
+      if (scheduleRes.status === 'fulfilled' && scheduleRes.value) setScheduleStatus(scheduleRes.value);
     });
     return () => { cancelled = true; };
   }, []);
@@ -1207,6 +1214,24 @@ function InventoryPanel() {
     </div>
   );
 
+  // Phase 21C — multi-row info cards for the always-visible Inventory
+  // status strip. KpiCard is great for one big number; this is for
+  // structured key/value lines (Automation Health, History Depth, Pricing
+  // Source Status). Same dark surface so the strip reads as a coherent
+  // block above the sub-tab navigation.
+  const InfoCard = ({ title, accent, children }) => (
+    <div style={{ minWidth: 260, flex: '1 1 280px', maxWidth: 380, padding: '12px 16px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
+      <div style={{ ...tinyLabel, color: accent || tinyLabel.color, marginBottom: 8 }}>{title}</div>
+      {children}
+    </div>
+  );
+  const InfoRow = ({ label, value, valueColor }) => (
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: '2px 0', fontSize: '0.66rem', fontFamily: 'monospace' }}>
+      <span style={{ color: '#7a96b8' }}>{label}</span>
+      <span style={{ color: valueColor || '#e0eaf8', textAlign: 'right' }}>{value}</span>
+    </div>
+  );
+
   const cellTH = { padding: '6px 8px', textAlign: 'left', borderBottom: '1px solid #1a2740', color: '#6b8aa8', fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.12em', fontWeight: 'bold', whiteSpace: 'nowrap' };
   const cellTD = { padding: '6px 8px', borderBottom: '1px solid #0d1520', fontSize: '0.7rem', color: '#c4d4e8', verticalAlign: 'top' };
   const cellMono = { ...cellTD, fontFamily: 'monospace' };
@@ -1248,6 +1273,102 @@ function InventoryPanel() {
           )}
         </div>
       </div>
+
+      {/* ── Phase 21C — Always-visible status strip: Automation Health,
+              History Depth, Pricing Source Status. Pulled from
+              /schedule/status, /history/summary and /signals/latest
+              respectively. The customer sees the operational picture at a
+              glance regardless of which Inventory sub-tab they're on. ── */}
+      {(() => {
+        const sched = scheduleStatus;
+        const summary = historySummary;
+        const sigSummary = signalsResp?.summary;
+        const fmtTime = iso => iso ? new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
+        const captureStatus = sched?.lastExternalCaptureStatus || '—';
+        const captureStatusColor = captureStatus === 'ok' ? '#4dffc3'
+          : captureStatus === 'partial' ? '#f0a84e'
+          : captureStatus === 'error' || captureStatus === 'failed' ? '#f05c5c'
+          : captureStatus === 'in_progress' ? '#3d8ef0'
+          : '#7a96b8';
+        const expectedParts = sched?.offsetsConfigured && sched?.offsetsConfigured > 0
+          ? sched.offsetsConfigured * 8
+          : 32;
+        const expectedSignals = expectedParts;
+        const captured = sched?.capturedParts ?? null;
+        const persisted = sched?.signalsPersisted ?? null;
+        const sourceLabel = sched?.lastExternalCaptureSource === 'github_actions_daily' ? 'GitHub Actions daily'
+          : sched?.lastExternalCaptureSource === 'operator_ui' ? 'Operator UI (manual)'
+          : sched?.lastExternalCaptureSource ? sched.lastExternalCaptureSource
+          : '—';
+        // Pricing source breakdown — derive from /signals/latest summary
+        // (priceUnavailableCount is set by Phase 21A.3 onwards). Fall back
+        // to counting parts whose latestNormalizedUnitPrice is null.
+        const sigList = signalsResp?.signals || [];
+        const priceUnavailableCount = sigSummary?.priceUnavailableCount
+          ?? sigList.filter(s => s.latestNormalizedUnitPrice == null && s.pricePctDelta == null).length;
+        const pricedCount = (sigSummary?.total ?? sigList.length) - priceUnavailableCount;
+        return (
+          <div style={{ ...sectionWrap, paddingTop: 14, paddingBottom: 14 }}>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              <InfoCard title="Automation health" accent={captureStatusColor}>
+                <InfoRow label="Status" value={captureStatus.toUpperCase()} valueColor={captureStatusColor} />
+                <InfoRow label="Source" value={sourceLabel} />
+                <InfoRow
+                  label="Parts captured"
+                  value={captured == null ? '—' : `${captured}/${expectedParts}`}
+                  valueColor={captured === expectedParts ? '#4dffc3' : captured == null ? '#7a96b8' : '#f0a84e'}
+                />
+                <InfoRow
+                  label="Signals persisted"
+                  value={persisted == null ? '—' : `${persisted}/${expectedSignals}`}
+                  valueColor={persisted === expectedSignals ? '#4dffc3' : persisted == null ? '#7a96b8' : '#f0a84e'}
+                />
+                <InfoRow label="Backend" value={(sched?.backend || '—').toUpperCase()} valueColor={sched?.backend === 'd1' ? '#4dffc3' : '#7a96b8'} />
+                <InfoRow label="Last capture" value={fmtTime(sched?.lastExternalCaptureAt || sched?.lastCaptureAt)} />
+                <InfoRow label="Schedule" value="Daily 07:15 UTC" />
+              </InfoCard>
+
+              <InfoCard title="History depth">
+                <InfoRow
+                  label="Total snapshots"
+                  value={summary?.totalSnapshots != null ? Number(summary.totalSnapshots).toLocaleString() : '—'}
+                  valueColor="#e0eaf8"
+                />
+                <InfoRow
+                  label="Parts with history"
+                  value={summary ? `${summary.partsWithHistory}/${summary.totalTrackedParts}` : '—'}
+                  valueColor={summary && summary.partsWithHistory === summary.totalTrackedParts ? '#4dffc3' : '#e0eaf8'}
+                />
+                <InfoRow
+                  label="With ≥3 observations"
+                  value={summary?.partsWith3PlusObservations != null ? `${summary.partsWith3PlusObservations}/${summary.totalTrackedParts}` : '—'}
+                />
+                <InfoRow label="Latest captured" value={fmtTime(summary?.latestCapturedAt)} />
+                <div style={{ marginTop: 6, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.45 }}>
+                  Signals become more useful as daily observations accumulate.
+                </div>
+              </InfoCard>
+
+              <InfoCard title="Pricing source status">
+                <InfoRow
+                  label="Price unavailable"
+                  value={priceUnavailableCount != null ? `${priceUnavailableCount} parts` : '—'}
+                  valueColor={priceUnavailableCount > 0 ? '#f0a84e' : '#7a96b8'}
+                />
+                <InfoRow
+                  label="Direct TI Store price"
+                  value={pricedCount != null ? `${pricedCount} parts` : '—'}
+                  valueColor={pricedCount > 0 ? '#4dffc3' : '#7a96b8'}
+                />
+                <InfoRow label="Source" value="Texas Instruments Store API" />
+                <div style={{ marginTop: 6, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.45 }}>
+                  Pricing series only renders when TI Store returns price breaks. We never fabricate a price line.
+                </div>
+              </InfoCard>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Sub-tab strip (Phase 21A): Latest Snapshot / Trends / Signals ── */}
       <div style={{ display: 'flex', gap: 0, padding: '0 16px', background: '#080c14', borderBottom: '1px solid #1a2740' }}>
@@ -1400,10 +1521,21 @@ function InventoryPanel() {
               />
             </div>
             {meaningful.length === 0 ? (
-              <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
+              <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.5 }}>
                 {insufficient === sigList.length && sigList.length > 0
                   ? 'Run captures over multiple days to start surfacing shortage / oversupply classifications. The engine needs at least 3 successful captures per part.'
                   : 'No shortage or oversupply pressure detected across the watched universe right now.'}
+                {/* Phase 21C — pricing-unavailable plain-English note. Only
+                    when the entire watched set is missing pricing AND the
+                    table is empty: that's the situation where the customer
+                    needs to know the dashboard is in inventory-only mode. */}
+                {sigList.length > 0 && (sigSummary?.priceUnavailableCount ?? 0) === sigList.length && (
+                  <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
+                    Current TI Store API responses are returning inventory units but no normalized
+                    price breaks for this watched set. The dashboard therefore shows
+                    inventory-only monitoring until a pricing source is available.
+                  </div>
+                )}
               </div>
             ) : (
               <div style={{ overflowX: 'auto' }}>
@@ -1507,9 +1639,63 @@ function InventoryPanel() {
                 ) : (() => {
                   const rows = histResp.rows || [];
                   const anyPrice = rows.some(r => r.priceAvailable);
+                  // Phase 21C — Part Detail mini-trend. Latest vs immediately
+                  // previous capture, plus observation count and a clear
+                  // pricing-status badge. Compact summary above the existing
+                  // 30-day table; no chart yet.
+                  const latest = rows[rows.length - 1] ?? null;
+                  const previous = rows.length >= 2 ? rows[rows.length - 2] : null;
+                  const latestQty = latest?.quantityAvailable;
+                  const previousQty = previous?.quantityAvailable;
+                  const invDelta = (latestQty != null && previousQty != null) ? (latestQty - previousQty) : null;
+                  const invPctDelta = (latestQty != null && previousQty != null && previousQty !== 0)
+                    ? ((latestQty - previousQty) / Math.abs(previousQty)) * 100
+                    : (latestQty === 0 && previousQty === 0 ? 0 : null);
+                  const fmtQty = q => q == null ? '—' : Number(q).toLocaleString();
+                  const fmtDelta = d => d == null ? '—' : (d > 0 ? `+${Number(d).toLocaleString()}` : Number(d).toLocaleString());
+                  const fmtPct = p => p == null ? '' : ` (${p > 0 ? '+' : ''}${p.toFixed(1)}%)`;
+                  const deltaColor = invDelta == null ? '#7a96b8' : invDelta > 0 ? '#4dffc3' : invDelta < 0 ? '#f0a84e' : '#a0b8d0';
                   return (
                     <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
                       <div style={{ minWidth: 360, flex: 1 }}>
+                        <div style={tinyLabel}>Part detail · {selected}</div>
+                        <div style={{
+                          marginTop: 6, marginBottom: 14, padding: '10px 14px',
+                          background: '#080c14', border: '1px solid #1a2740', borderRadius: 4,
+                          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '6px 14px',
+                          fontFamily: 'monospace', fontSize: '0.66rem',
+                        }}>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Latest inventory</div>
+                            <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>{fmtQty(latestQty)}</div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Previous inventory</div>
+                            <div style={{ color: '#a0b8d0', fontSize: '0.85rem', marginTop: 2 }}>{fmtQty(previousQty)}</div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Inventory Δ</div>
+                            <div style={{ color: deltaColor, fontSize: '0.85rem', marginTop: 2 }}>
+                              {fmtDelta(invDelta)}<span style={{ fontSize: '0.62rem', color: '#7a96b8' }}>{fmtPct(invPctDelta)}</span>
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Observations</div>
+                            <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>{rows.length}</div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Latest captured</div>
+                            <div style={{ color: '#a0b8d0', fontSize: '0.7rem', marginTop: 2 }}>
+                              {latest?.capturedAt ? new Date(latest.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—'}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Pricing</div>
+                            <div style={{ color: anyPrice ? '#4dffc3' : '#f0a84e', fontSize: '0.7rem', marginTop: 2 }}>
+                              {anyPrice ? 'TI Store price available' : 'unavailable'}
+                            </div>
+                          </div>
+                        </div>
                         <div style={tinyLabel}>30d inventory & price history · {rows.length} captures</div>
                         <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem', width: '100%' }}>
                           <thead>
