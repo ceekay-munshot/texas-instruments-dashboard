@@ -63,6 +63,7 @@ import {
   fetchTiProductInfoDebug,
   fetchTiInventoryPricing,
   fetchTiInventoryPricingDebug,
+  fetchTiCatalogProbe,
   tokenCacheSnapshot as tiTokenCacheSnapshot,
   tiAttemptedEndpoints,
 } from './sources/tiDirect'
@@ -2871,6 +2872,41 @@ app.get('/api/ti/inventory/signal-simulator', async (c) => {
       total: results.length,
       matches: results.filter(r => r.matches).length,
     },
+  })
+})
+
+// Phase 23B — GET /api/ti/universe/catalog/probe
+// Auth-gated ONE-SHOT diagnostic against the TI Store full-catalog
+// endpoint. Returns sanitized shape evidence only (top-level keys,
+// pagination probe, sample-product field-presence flags, totalCount-
+// like values, support recommendations); NEVER returns the raw response
+// body, the OAuth token, the Authorization header, or the client id /
+// client secret. Used to decide whether full-universe scaling should
+// use catalog snapshots or stick with the OPN-level batch path.
+//
+// Hard restrictions: never mutates D1 / KV / R2; never expands the
+// active 64-part watched universe; never writes capture history.
+// Operator runs at most once per probe — daily capture continues to use
+// /api/ti/inventory/capture against the validated 64 parts only.
+app.get('/api/ti/universe/catalog/probe', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const providedRaw = c.req.header('x-capture-secret') || c.req.query('secret') || ''
+  const provided = providedRaw.trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const probe = await fetchTiCatalogProbe(env)
+  return c.json({
+    success: probe.status === 'ok',
+    note: 'One-shot diagnostic. Not production ingestion. Does not expand the active 64-part watched universe. Does not mutate D1 / KV / R2. Used to decide whether full-universe scaling should be catalog-driven or OPN-batch-driven.',
+    ...probe,
   })
 })
 

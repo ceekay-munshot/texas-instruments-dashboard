@@ -1120,6 +1120,59 @@ batch and every verify passes.
   Bearer / `transact.ti.com` URL. The verify step also does a defensive
   `grep -F` over `/signals/latest` for forbidden tokens.
 
+### TI universe catalog probe (Phase 23B)
+
+`GET /api/ti/universe/catalog/probe` is an auth-gated **one-shot
+diagnostic** against TI's full-catalog endpoint
+(`https://transact.ti.com/v2/store/products/catalog`, overridable via
+the `TI_CATALOG_URL` env var). Its purpose is purely to decide whether
+full-universe scaling should use catalog snapshots or stick with the
+existing OPN-level batch path.
+
+**This endpoint:**
+
+- is **NOT production ingestion** — daily capture continues to hit
+  `/api/ti/inventory/capture` against the validated 64-part universe;
+- **does NOT expand the active watched universe** — `TI_WATCHED_PARTS`
+  is unchanged;
+- **does NOT mutate D1, KV, or R2** — read-only;
+- **must be called at most once per probe** — the operator runs it,
+  inspects the response, then decides on the Phase 23C architecture.
+  Daily / scheduled invocation is forbidden.
+- returns sanitized shape evidence only — top-level keys, sample
+  product field-presence flags, pagination probe, support
+  recommendations. **Never** returns the raw response body, the OAuth
+  token, the `Authorization` header, or the `TI_CLIENT_*` secrets.
+
+**Operator usage:**
+
+```bash
+curl -sS -H "X-Capture-Secret: $SNAPSHOT_CAPTURE_SECRET" \
+  "https://texas-instruments-dashboard-final.pages.dev/api/ti/universe/catalog/probe" \
+  | python3 -m json.tool
+```
+
+The response `diagnosis` and `supports.{...}` flags answer the four
+scaling questions:
+
+- `supports.fullUniverseInventorySnapshot` — does the catalog include
+  per-part `quantityAvailable` so a single call could replace
+  per-part inventory polling?
+- `supports.fullUniversePriceSnapshot` — does the catalog include the
+  same nested `pricing[].priceBreaks[]` shape the OPN endpoint
+  returns?
+- `supports.categorySubcategoryAggregation` — does each product
+  carry `category` / `subcategory` so the dashboard's heatmap can
+  group at scale without per-OPN metadata?
+- `supports.partDrilldown` — does each product carry an
+  `orderablePartNumber` so the existing per-part pages can be wired
+  to catalog-discovered SKUs?
+
+If two or more of those flags are `true`, Phase 23C is likely a
+catalog-snapshot architecture. If they're mostly `false`, the
+OPN-level batch path stays the production scaling mechanism and the
+catalog is only used for discovery.
+
 ## Local Development
 ```bash
 npm install

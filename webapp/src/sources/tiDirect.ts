@@ -30,6 +30,12 @@ const DEFAULT_TOKEN_URL = 'https://transact.ti.com/v1/oauth/accesstoken'
 const DEFAULT_PRODUCT_INFO_TPL = 'https://transact.ti.com/v1/products/{partNumber}'
 const DEFAULT_PRODUCT_INFO_EXT_TPL = 'https://transact.ti.com/v1/products-extended/{partNumber}?page=0'
 const DEFAULT_INVENTORY_PRICING_TPL = 'https://transact.ti.com/v2/store/products/{partNumber}?currency=USD'
+// Phase 23B — full-catalog probe endpoint. Default URL targets TI's catalog
+// path under the same v2 store base; an env override lets the operator
+// re-point without redeploy. NEVER called by daily capture; only the
+// auth-gated /api/ti/universe/catalog/probe endpoint hits it, and at most
+// once per operator-initiated probe.
+const DEFAULT_CATALOG_URL = 'https://transact.ti.com/v2/store/products/catalog'
 
 const TOKEN_CACHE_TTL_MS = 55 * 60 * 1000 // 55 min, per spec
 
@@ -45,6 +51,10 @@ export type TiEnv = {
   TI_PRODUCT_INFO_URL_TEMPLATE?: string
   TI_PRODUCT_INFO_EXTENDED_URL_TEMPLATE?: string
   TI_INVENTORY_PRICING_URL_TEMPLATE?: string
+  /** Phase 23B — full-catalog URL override for the auth-gated probe.
+   *  Same operator-safe override pattern as the other URL templates;
+   *  no secrets, surfaced in the probe diagnostic as host+path only. */
+  TI_CATALOG_URL?: string
 }
 
 // Resolve URL helpers — operator env always wins over the default.
@@ -62,6 +72,9 @@ function resolveProductInfoExtendedUrl(env: TiEnv, partNumber: string): string {
 function resolveInventoryPricingUrl(env: TiEnv, partNumber: string): string {
   const tpl = (env.TI_INVENTORY_PRICING_URL_TEMPLATE && env.TI_INVENTORY_PRICING_URL_TEMPLATE.trim()) || DEFAULT_INVENTORY_PRICING_TPL
   return tpl.split('{partNumber}').join(encodeURIComponent(partNumber))
+}
+function resolveCatalogUrl(env: TiEnv): string {
+  return (env.TI_CATALOG_URL && env.TI_CATALOG_URL.trim()) || DEFAULT_CATALOG_URL
 }
 
 /** Safe URL inspection: returns host and path only — never the query string,
@@ -1498,6 +1511,340 @@ export async function fetchTiInventoryPricingDebug(
       quantityAvailable,
       orderLimit,
     },
+    diagnosis,
+    warnings: [],
+  }
+}
+
+// ── Phase 23B — full-catalog probe (read-only diagnostic) ─────────────────
+//
+// This is a ONE-SHOT diagnostic. It is NOT production ingestion, NEVER
+// expands the active watched universe, NEVER mutates D1 / KV / R2, and is
+// only invoked from the auth-gated /api/ti/universe/catalog/probe endpoint.
+// It exists so the operator can decide whether full-universe scaling
+// should use catalog snapshots or stick with OPN-level batch calls.
+//
+// Sanitization rules (same as the per-part pricing diagnostic):
+//   - Never returns the raw response body
+//   - Never returns the OAuth token, the Authorization header, or the
+//     client id / client secret
+//   - Returns host + path only for the attempted endpoint
+//   - Returns shape evidence (top-level keys, sample-product field
+//     names, pagination candidates) without any underlying values that
+//     could be sensitive
+
+export type TiCatalogProbe = {
+  attemptedHost: string
+  attemptedPath: string
+  attemptedQuery: string                 // sanitized: literal `currency=USD&size=10` etc., never tokens
+  status:
+    | 'ok'
+    | 'no_match'
+    | 'error'
+    | 'auth_failed'
+    | 'rate_limited'
+    | 'token_failed'
+    | 'not_configured'
+    | 'pending_approval'
+    | 'unreachable'
+    | 'invalid_json'
+  httpStatus: number | null
+  sanitizedCode: string | null
+  sanitizedMessage: string
+  contentType: string | null
+  bodyByteSize: number | null
+  // Top-level shape evidence
+  responseTopLevelKeys: string[]
+  responseTopLevelTypes: Record<string, string>
+  // Pagination probe — known-pattern keys and their type/value when present
+  paginationProbe: Array<{ key: string; type: string; numericValue: number | null; stringValue: string | null }>
+  totalProductsClaimed: number | null     // best-effort: total / totalCount / totalElements / totalProducts
+  // Products array probe
+  productsArrayPath: string | null        // 'products' | 'data.products' | 'items' | 'results' | 'skus' | 'catalog' | null
+  productsArrayLength: number | null      // length of the first-page array
+  // Sample product (first item) — keys only, never values
+  sampleProductKeys: string[]
+  sampleProductFieldsPresent: {
+    orderablePartNumber: boolean
+    genericPartNumber: boolean
+    quantityAvailable: boolean
+    pricingContainer: boolean
+    nestedPriceBreaks: boolean
+    currency: boolean
+    category: boolean
+    subcategory: boolean
+    lifecycle: boolean
+    leadTime: boolean
+    package: boolean
+  }
+  // Recommendations (booleans + a one-line `diagnosis`)
+  supports: {
+    fullUniverseInventorySnapshot: boolean
+    fullUniversePriceSnapshot: boolean
+    categorySubcategoryAggregation: boolean
+    partDrilldown: boolean
+  }
+  diagnosis: string
+  warnings: string[]
+}
+
+// Field-name aliases the probe checks per-product. These are the same
+// alias families the per-part parser already supports plus a couple of
+// catalog-likely variants (e.g. `tiPartNumber` from the Store I&P shape).
+const PROBE_OPN_KEYS    = ['orderablePartNumber', 'tiPartNumber', 'partNumber', 'opn', 'productId', 'id', 'sku']
+const PROBE_GPN_KEYS    = ['genericPartNumber', 'gpn', 'genericPart']
+const PROBE_QTY_KEYS    = ['quantityAvailable', 'quantity', 'availableQuantity', 'inStock', 'stockQuantity']
+const PROBE_PRICING_KEYS = ['pricing', 'prices', 'priceList', 'productPricing', 'priceBreakdowns', 'unitPrices']
+const PROBE_BREAKS_KEYS  = ['priceBreaks', 'breaks', 'tieredPricing']
+const PROBE_CURRENCY_KEYS = ['currency', 'priceCurrency']
+const PROBE_CATEGORY_KEYS    = ['category', 'productCategory', 'categoryName', 'topCategory']
+const PROBE_SUBCATEGORY_KEYS = ['subcategory', 'subCategory', 'productSubcategory', 'subCategoryName']
+const PROBE_LIFECYCLE_KEYS   = ['lifecycle', 'lifecycleStatus', 'lifeCycle', 'productLifecycleStatus', 'productStatus']
+const PROBE_LEADTIME_KEYS    = ['leadTime', 'leadTimeWeeks', 'manufacturingLeadTime', 'leadTimeDays']
+const PROBE_PACKAGE_KEYS     = ['package', 'packageName', 'packageType', 'packaging']
+const PROBE_PAGINATION_KEYS  = [
+  'totalCount', 'total', 'totalProducts', 'totalElements', 'totalRecords',
+  'page', 'pageNumber', 'currentPage', 'pageSize', 'size', 'limit', 'count',
+  'hasMore', 'hasNextPage', 'hasNext', 'next', 'nextUrl', 'nextPageToken', 'cursor',
+] as const
+const PROBE_PRODUCTS_PATHS = ['products', 'data', 'items', 'results', 'skus', 'catalog', 'productList']
+
+function findFirstObject(v: unknown): Record<string, unknown> | null {
+  if (Array.isArray(v) && v.length > 0 && v[0] && typeof v[0] === 'object') {
+    return v[0] as Record<string, unknown>
+  }
+  return null
+}
+function hasAnyKey(obj: Record<string, unknown> | null, keys: readonly string[]): boolean {
+  if (!obj) return false
+  for (const k of keys) {
+    if (k in obj && obj[k] != null) return true
+  }
+  return false
+}
+function hasNestedPriceBreaks(product: Record<string, unknown> | null): boolean {
+  if (!product) return false
+  for (const containerKey of PROBE_PRICING_KEYS) {
+    const v = product[containerKey]
+    if (Array.isArray(v) && v.length > 0) {
+      const first = v[0]
+      if (first && typeof first === 'object') {
+        for (const breaksKey of PROBE_BREAKS_KEYS) {
+          if (Array.isArray((first as any)[breaksKey])) return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+export async function fetchTiCatalogProbe(env: TiEnv): Promise<TiCatalogProbe> {
+  const fullUrl = resolveCatalogUrl(env)
+  const summary = safeUrlSummary(fullUrl)
+  // Capture the literal query string (already free of tokens — we never
+  // append the Authorization there). If the operator overrode TI_CATALOG_URL
+  // with a query, this surfaces it as-is so the diagnostic is actionable.
+  let attemptedQuery = ''
+  try {
+    const u = new URL(fullUrl)
+    attemptedQuery = u.search.replace(/^\?/, '')
+  } catch { /* swallow */ }
+
+  const baseDiag: TiCatalogProbe = {
+    attemptedHost: summary.host,
+    attemptedPath: summary.path,
+    attemptedQuery,
+    status: 'error',
+    httpStatus: null,
+    sanitizedCode: null,
+    sanitizedMessage: '',
+    contentType: null,
+    bodyByteSize: null,
+    responseTopLevelKeys: [],
+    responseTopLevelTypes: {},
+    paginationProbe: [],
+    totalProductsClaimed: null,
+    productsArrayPath: null,
+    productsArrayLength: null,
+    sampleProductKeys: [],
+    sampleProductFieldsPresent: {
+      orderablePartNumber: false,
+      genericPartNumber: false,
+      quantityAvailable: false,
+      pricingContainer: false,
+      nestedPriceBreaks: false,
+      currency: false,
+      category: false,
+      subcategory: false,
+      lifecycle: false,
+      leadTime: false,
+      package: false,
+    },
+    supports: {
+      fullUniverseInventorySnapshot: false,
+      fullUniversePriceSnapshot: false,
+      categorySubcategoryAggregation: false,
+      partDrilldown: false,
+    },
+    diagnosis: '',
+    warnings: [],
+  }
+  const config = checkTiConfigured(env)
+  if (!config.configured) {
+    return { ...baseDiag, status: 'not_configured', sanitizedCode: 'not_configured', sanitizedMessage: 'TI adapter not configured.', diagnosis: 'TI credentials missing.' }
+  }
+  if (config.storeApiState !== 'enabled') {
+    return { ...baseDiag, status: 'pending_approval', sanitizedCode: 'store_api_pending', sanitizedMessage: 'TI Store API approval pending.', diagnosis: 'TI Store API entitlement disabled (TI_STORE_API_ENABLED != true).' }
+  }
+  const tok = await fetchTiToken(env)
+  if (!tok.ok) {
+    return { ...baseDiag, status: 'token_failed', httpStatus: tok.httpStatus, sanitizedCode: tok.sanitizedCode, sanitizedMessage: tok.sanitizedMessage, diagnosis: 'TI OAuth token fetch failed.' }
+  }
+  let res: Response
+  try {
+    res = await fetch(fullUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${tok.token}`,
+        Accept: 'application/json',
+      },
+    })
+  } catch (e: any) {
+    return { ...baseDiag, status: 'unreachable', sanitizedCode: 'unreachable', sanitizedMessage: sanitizeMessage(e?.message || 'unknown error', env), diagnosis: 'TI catalog endpoint unreachable.' }
+  }
+  const contentType = res.headers.get('content-type')
+  if (res.status === 401 || res.status === 403) {
+    return {
+      ...baseDiag,
+      status: 'auth_failed', httpStatus: res.status, contentType,
+      sanitizedCode: 'unauthorized',
+      sanitizedMessage: 'TI rejected the catalog request.',
+      diagnosis: `TI rejected the auth token for the catalog endpoint (HTTP ${res.status}). The Store API entitlement may not include catalog access — check the TI developer-portal product list for "catalog" alongside "Store Inventory & Pricing".`,
+    }
+  }
+  if (res.status === 404) {
+    return { ...baseDiag, status: 'no_match', httpStatus: 404, contentType, sanitizedCode: 'not_found', sanitizedMessage: 'TI catalog endpoint returned 404.', diagnosis: 'Catalog URL returned 404 — try a different path (set TI_CATALOG_URL env var).' }
+  }
+  if (res.status === 429) {
+    return { ...baseDiag, status: 'rate_limited', httpStatus: 429, contentType, sanitizedCode: 'rate_limited', sanitizedMessage: 'TI catalog rate limit hit.', diagnosis: 'Rate limited; back off and retry.' }
+  }
+  let bodyText = ''
+  try { bodyText = await res.text() } catch { bodyText = '' }
+  const bodyByteSize = bodyText.length
+  if (!res.ok) {
+    const ext = tryExtractTiError(bodyText)
+    return {
+      ...baseDiag,
+      status: 'error', httpStatus: res.status, contentType, bodyByteSize,
+      sanitizedCode: ext.code ?? `http_${res.status}`,
+      sanitizedMessage: sanitizeMessage(ext.message ?? bodyText, env),
+      diagnosis: `Non-2xx HTTP ${res.status} from TI catalog endpoint.`,
+    }
+  }
+  let data: unknown
+  try { data = JSON.parse(bodyText) } catch {
+    return { ...baseDiag, status: 'invalid_json', httpStatus: res.status, contentType, bodyByteSize, sanitizedCode: 'invalid_json', sanitizedMessage: 'TI catalog response was not valid JSON.', diagnosis: 'TI catalog returned non-JSON; cannot inspect shape.' }
+  }
+  // ── Shape inspection ──────────────────────────────────────────────────
+  const obj = (data && typeof data === 'object') ? data as Record<string, unknown> : null
+  const responseTopLevelKeys = obj ? Object.keys(obj) : []
+  const responseTopLevelTypes: Record<string, string> = {}
+  if (obj) {
+    for (const k of responseTopLevelKeys) {
+      const v = obj[k]
+      responseTopLevelTypes[k] = Array.isArray(v) ? 'array' : (v == null ? 'null' : typeof v)
+    }
+  }
+  // Pagination probe
+  const paginationProbe = PROBE_PAGINATION_KEYS
+    .filter(k => obj != null && k in obj)
+    .map(k => {
+      const v = obj![k]
+      const numericValue = typeof v === 'number' && Number.isFinite(v) ? v : null
+      const stringValue = typeof v === 'string' ? v : null
+      return { key: k, type: Array.isArray(v) ? 'array' : (v == null ? 'null' : typeof v), numericValue, stringValue }
+    })
+  // Best-effort total
+  let totalProductsClaimed: number | null = null
+  for (const k of ['totalCount', 'total', 'totalProducts', 'totalElements', 'totalRecords']) {
+    if (obj && typeof obj[k] === 'number' && Number.isFinite(obj[k] as number)) {
+      totalProductsClaimed = obj[k] as number
+      break
+    }
+  }
+  // Products array probe
+  let productsArrayPath: string | null = null
+  let productsArr: unknown[] | null = null
+  if (obj) {
+    for (const path of PROBE_PRODUCTS_PATHS) {
+      const v = obj[path]
+      if (Array.isArray(v)) { productsArrayPath = path; productsArr = v as unknown[]; break }
+    }
+    // Try nested data.products etc.
+    if (!productsArr && obj.data && typeof obj.data === 'object') {
+      const inner = obj.data as Record<string, unknown>
+      for (const path of PROBE_PRODUCTS_PATHS) {
+        const v = inner[path]
+        if (Array.isArray(v)) { productsArrayPath = `data.${path}`; productsArr = v as unknown[]; break }
+      }
+    }
+  }
+  const productsArrayLength = productsArr ? productsArr.length : null
+  const sample = findFirstObject(productsArr)
+  const sampleProductKeys = sample ? Object.keys(sample) : []
+  const sampleProductFieldsPresent = {
+    orderablePartNumber: hasAnyKey(sample, PROBE_OPN_KEYS),
+    genericPartNumber: hasAnyKey(sample, PROBE_GPN_KEYS),
+    quantityAvailable: hasAnyKey(sample, PROBE_QTY_KEYS),
+    pricingContainer: hasAnyKey(sample, PROBE_PRICING_KEYS),
+    nestedPriceBreaks: hasNestedPriceBreaks(sample),
+    currency: hasAnyKey(sample, PROBE_CURRENCY_KEYS),
+    category: hasAnyKey(sample, PROBE_CATEGORY_KEYS),
+    subcategory: hasAnyKey(sample, PROBE_SUBCATEGORY_KEYS),
+    lifecycle: hasAnyKey(sample, PROBE_LIFECYCLE_KEYS),
+    leadTime: hasAnyKey(sample, PROBE_LEADTIME_KEYS),
+    package: hasAnyKey(sample, PROBE_PACKAGE_KEYS),
+  }
+  const f = sampleProductFieldsPresent
+  const supports = {
+    fullUniverseInventorySnapshot: f.orderablePartNumber && f.quantityAvailable,
+    fullUniversePriceSnapshot: f.orderablePartNumber && (f.pricingContainer || f.nestedPriceBreaks),
+    categorySubcategoryAggregation: f.category, // subcategory is a bonus
+    partDrilldown: f.orderablePartNumber,
+  }
+  // Diagnosis
+  let diagnosis: string
+  if (!productsArr) {
+    diagnosis = obj
+      ? `Catalog endpoint returned 200 but no products array found under any candidate key (${PROBE_PRODUCTS_PATHS.join(', ')}). Top-level keys: ${responseTopLevelKeys.join(', ')}.`
+      : 'Catalog endpoint returned 200 but body was not a JSON object.'
+  } else if (productsArr.length === 0) {
+    diagnosis = `Catalog endpoint returned 200 with an empty "${productsArrayPath}" array (no products in this page; pagination may need explicit page params).`
+  } else {
+    const supportsList: string[] = []
+    if (supports.fullUniverseInventorySnapshot) supportsList.push('full-universe inventory snapshot')
+    if (supports.fullUniversePriceSnapshot) supportsList.push('full-universe price snapshot')
+    if (supports.categorySubcategoryAggregation) supportsList.push('category aggregation')
+    if (supports.partDrilldown) supportsList.push('part drilldown')
+    diagnosis = `Catalog returned ${productsArr.length} products on this page${totalProductsClaimed != null ? ` (claimed total ${totalProductsClaimed})` : ''}. Sample product keys: ${sampleProductKeys.slice(0, 10).join(', ')}${sampleProductKeys.length > 10 ? '…' : ''}. Supports: ${supportsList.length > 0 ? supportsList.join(', ') : 'none of the four scaling paths (fields missing — see sampleProductFieldsPresent)'}.`
+  }
+  return {
+    ...baseDiag,
+    status: 'ok',
+    httpStatus: res.status,
+    contentType,
+    bodyByteSize,
+    sanitizedCode: null,
+    sanitizedMessage: '',
+    responseTopLevelKeys,
+    responseTopLevelTypes,
+    paginationProbe,
+    totalProductsClaimed,
+    productsArrayPath,
+    productsArrayLength,
+    sampleProductKeys,
+    sampleProductFieldsPresent,
+    supports,
     diagnosis,
     warnings: [],
   }
