@@ -1,0 +1,281 @@
+name: TI Catalog Universe Ingest (Phase 23C.1)
+
+# Manual-trigger only. Fetches the TI full catalog ONCE per run, parses
+# the ~50MB JSON in this runner, splits it into 500-product chunks, and
+# POSTs each chunk to the Worker. The Worker never fetches the catalog
+# itself for this flow — that endpoint (/api/ti/universe/catalog/capture)
+# is rate-limited and marked experimental in webapp/README.md.
+#
+# Why GitHub Actions and not a Worker invocation:
+#   - The Cloudflare Worker memory cap (~128MB) makes parsing 50MB JSON
+#     in-Worker tight. GH Actions runners have 7GB RAM.
+#   - The TI catalog endpoint is rate-limited; one fetch per run keeps
+#     us inside quota.
+#   - Per-chunk Worker calls touch only ~500 products per invocation,
+#     well inside D1 batch and subrequest budgets.
+#
+# Required GitHub Actions repository secrets:
+#   TI_CLIENT_ID            — TI developer-portal app client id
+#   TI_CLIENT_SECRET        — same app's client secret
+#   SNAPSHOT_CAPTURE_SECRET — same secret used by ti-inventory-capture.yml
+#                             and the Cloudflare Pages env var
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_size:
+        description: 'Products per chunk POSTed to Worker (default 500)'
+        required: false
+        default: '500'
+      dry_run:
+        description: 'Skip the Worker POSTs; only parse + report.'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ti-catalog-universe-ingest
+  cancel-in-progress: false
+
+env:
+  BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+  TI_TOKEN_URL: https://transact.ti.com/v1/oauth/accesstoken
+  TI_CATALOG_URL: https://transact.ti.com/v2/store/products/catalog
+
+jobs:
+  ingest:
+    name: Fetch + chunk + POST chunked catalog ingest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate required secrets are configured
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          TI_CLIENT_ID: ${{ secrets.TI_CLIENT_ID }}
+          TI_CLIENT_SECRET: ${{ secrets.TI_CLIENT_SECRET }}
+        run: |
+          if [ -z "${CAPTURE_SECRET:-}" ]; then
+            echo "::error::Repo secret SNAPSHOT_CAPTURE_SECRET is not set."
+            exit 1
+          fi
+          if [ -z "${TI_CLIENT_ID:-}" ]; then
+            echo "::error::Repo secret TI_CLIENT_ID is not set. Add it under: Settings → Secrets and variables → Actions → New repository secret."
+            exit 1
+          fi
+          if [ -z "${TI_CLIENT_SECRET:-}" ]; then
+            echo "::error::Repo secret TI_CLIENT_SECRET is not set."
+            exit 1
+          fi
+          echo "All three secrets are configured (values not printed)."
+
+      - name: Fetch TI OAuth token
+        id: token
+        env:
+          TI_CLIENT_ID: ${{ secrets.TI_CLIENT_ID }}
+          TI_CLIENT_SECRET: ${{ secrets.TI_CLIENT_SECRET }}
+        run: |
+          set -uo pipefail
+          token_resp="$(mktemp)"
+          http_code="$(curl -sS -o "$token_resp" -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d "grant_type=client_credentials&client_id=${TI_CLIENT_ID}&client_secret=${TI_CLIENT_SECRET}" \
+            "${TI_TOKEN_URL}")"
+          if [ "${http_code}" != "200" ]; then
+            echo "::error::TI OAuth token endpoint returned HTTP ${http_code}"
+            jq -c '{error, error_description, status}' < "$token_resp" 2>/dev/null || head -c 200 "$token_resp"
+            exit 1
+          fi
+          token="$(jq -r '.access_token // empty' < "$token_resp")"
+          if [ -z "${token}" ]; then
+            echo "::error::TI OAuth response did not contain access_token"
+            exit 1
+          fi
+          # Mask the token in subsequent step logs.
+          echo "::add-mask::${token}"
+          echo "ti_token=${token}" >> "$GITHUB_OUTPUT"
+          echo "Token acquired (value masked)."
+
+      - name: Fetch TI catalog (one shot)
+        id: fetch
+        env:
+          TI_TOKEN: ${{ steps.token.outputs.ti_token }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          http_code="$(curl -sS -o artifacts/catalog.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${TI_TOKEN}" \
+            -H 'Accept: application/json' \
+            "${TI_CATALOG_URL}")"
+          size=$(stat -c%s artifacts/catalog.json 2>/dev/null || stat -f%z artifacts/catalog.json)
+          echo "TI catalog HTTP ${http_code}, body size: ${size} bytes"
+          if [ "${http_code}" != "200" ]; then
+            echo "::error::TI catalog returned HTTP ${http_code}"
+            head -c 500 artifacts/catalog.json
+            exit 1
+          fi
+          if ! jq -e .catalog < artifacts/catalog.json > /dev/null 2>&1; then
+            # Try alternate top-level keys (defensive).
+            if jq -e .products < artifacts/catalog.json > /dev/null 2>&1; then
+              jq '{catalog: .products}' < artifacts/catalog.json > artifacts/catalog.normalized.json
+              mv artifacts/catalog.normalized.json artifacts/catalog.json
+            else
+              echo "::error::TI catalog JSON has no .catalog or .products array"
+              exit 1
+            fi
+          fi
+          total=$(jq '.catalog | length' < artifacts/catalog.json)
+          echo "Parsed ${total} products"
+          echo "body_byte_size=${size}" >> "$GITHUB_OUTPUT"
+          echo "total_products=${total}" >> "$GITHUB_OUTPUT"
+
+      - name: Split catalog into chunks
+        id: split
+        env:
+          CHUNK_SIZE: ${{ inputs.chunk_size }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts/chunks
+          # Use Python for reliable streaming chunking.
+          python3 - <<'PY'
+          import json, os, math, uuid, datetime
+          chunk_size = int(os.environ.get('CHUNK_SIZE') or '500')
+          with open('artifacts/catalog.json') as f:
+              data = json.load(f)
+          products = data.get('catalog') or []
+          total = len(products)
+          total_chunks = math.ceil(total / chunk_size) if chunk_size > 0 else 0
+          run_id = str(uuid.uuid4())
+          captured_at = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+          for i in range(total_chunks):
+              start = i * chunk_size
+              chunk = products[start:start + chunk_size]
+              payload = {
+                  'runId': run_id,
+                  'capturedAt': captured_at,
+                  'chunkIndex': i,
+                  'totalChunks': total_chunks,
+                  'products': chunk,
+              }
+              with open(f'artifacts/chunks/chunk_{i:04d}.json', 'w') as out:
+                  json.dump(payload, out)
+          with open('artifacts/run_meta.json', 'w') as out:
+              json.dump({
+                  'runId': run_id,
+                  'capturedAt': captured_at,
+                  'chunkSize': chunk_size,
+                  'totalChunks': total_chunks,
+                  'totalProducts': total,
+              }, out, indent=2)
+          print(f'Wrote {total_chunks} chunks ({chunk_size} products/chunk) to artifacts/chunks/')
+          PY
+          run_id=$(jq -r .runId artifacts/run_meta.json)
+          captured_at=$(jq -r .capturedAt artifacts/run_meta.json)
+          total_chunks=$(jq -r .totalChunks artifacts/run_meta.json)
+          echo "run_id=${run_id}"          >> "$GITHUB_OUTPUT"
+          echo "captured_at=${captured_at}" >> "$GITHUB_OUTPUT"
+          echo "total_chunks=${total_chunks}" >> "$GITHUB_OUTPUT"
+
+      - name: POST each chunk to Worker
+        if: ${{ inputs.dry_run != 'true' }}
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          TOTAL_CHUNKS: ${{ steps.split.outputs.total_chunks }}
+        run: |
+          set -uo pipefail
+          OVERALL_FAILED=0
+          TOTAL_OPN_UPSERTED=0
+          TOTAL_PRICED=0
+          TOTAL_IN_STOCK=0
+          TOTAL_OUT_OF_STOCK=0
+
+          # Iterate chunks in lexical (chunk_0000.json …) order.
+          for chunk_file in $(ls artifacts/chunks/chunk_*.json | sort); do
+            response_file="$(mktemp)"
+            http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+              -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data-binary "@${chunk_file}" \
+              "${BASE_URL}/api/ti/universe/catalog/ingest-chunk")"
+
+            if ! jq -e . < "$response_file" > /dev/null 2>&1; then
+              echo "::error::${chunk_file} returned non-JSON (HTTP ${http_code})."
+              head -c 300 "$response_file" || true
+              OVERALL_FAILED=1
+              continue
+            fi
+
+            success=$(jq -r '.success // false' < "$response_file")
+            chunk_idx=$(jq -r '.chunkIndex // -1' < "$response_file")
+            attempted=$(jq -r '.attempted // 0' < "$response_file")
+            upserted=$(jq -r '.opnRowsUpserted // 0' < "$response_file")
+            priced=$(jq -r '.pricedOpns // 0' < "$response_file")
+            in_stock=$(jq -r '.inStockOpns // 0' < "$response_file")
+            out_of_stock=$(jq -r '.outOfStockOpns // 0' < "$response_file")
+            errors_len=$(jq -r '(.errors // []) | length' < "$response_file")
+
+            TOTAL_OPN_UPSERTED=$((TOTAL_OPN_UPSERTED + upserted))
+            TOTAL_PRICED=$((TOTAL_PRICED + priced))
+            TOTAL_IN_STOCK=$((TOTAL_IN_STOCK + in_stock))
+            TOTAL_OUT_OF_STOCK=$((TOTAL_OUT_OF_STOCK + out_of_stock))
+
+            if [ "${success}" != "true" ] || [ "${errors_len}" != "0" ]; then
+              echo "::warning::chunk ${chunk_idx} success=${success} errors=${errors_len}"
+              jq -c '.errors // []' < "$response_file"
+              OVERALL_FAILED=1
+            fi
+
+            # Light pacing — 100ms between chunks. With 145 chunks @ 500
+            # this is ~15s of pacing on top of ~30-90s actual work.
+            sleep 0.1
+          done
+
+          echo "─── Chunk POST totals ───"
+          echo "  totalChunks (expected): ${TOTAL_CHUNKS}"
+          echo "  opnRowsUpserted:        ${TOTAL_OPN_UPSERTED}"
+          echo "  pricedOpns:             ${TOTAL_PRICED}"
+          echo "  inStockOpns:            ${TOTAL_IN_STOCK}"
+          echo "  outOfStockOpns:         ${TOTAL_OUT_OF_STOCK}"
+
+          if [ "${OVERALL_FAILED}" = "1" ]; then
+            echo "::error::At least one chunk failed; finalize will still run for diagnostics."
+          fi
+
+      - name: Finalize (rebuild GPN aggregates + insert snapshot run row)
+        if: ${{ inputs.dry_run != 'true' }}
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
+          BODY_BYTE_SIZE: ${{ steps.fetch.outputs.body_byte_size }}
+        run: |
+          set -uo pipefail
+          payload=$(jq -nc \
+            --arg capturedAt "$CAPTURED_AT" \
+            --arg source 'ti_store_v2_catalog_chunked' \
+            --argjson bodyByteSize "${BODY_BYTE_SIZE}" \
+            '{capturedAt: $capturedAt, source: $source, bodyByteSize: $bodyByteSize, rawR2Key: null}')
+          curl -sS -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            -H 'Content-Type: application/json' \
+            --data "${payload}" \
+            "${BASE_URL}/api/ti/universe/catalog/finalize" \
+            | jq -c .
+
+      - name: Read /catalog/status
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          set -uo pipefail
+          curl -sS "${BASE_URL}/api/ti/universe/catalog/status" \
+            | jq -c '{success, backend, opnCount, gpnCount, pricedOpnCount, inStockOpnCount, outOfStockOpnCount, latestCapturedAt}'
+
+      - name: Upload chunk artifacts (debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ti-catalog-chunks-failure
+          path: artifacts/run_meta.json
+          if-no-files-found: warn
+          retention-days: 3

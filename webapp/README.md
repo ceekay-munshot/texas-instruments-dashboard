@@ -1120,6 +1120,69 @@ batch and every verify passes.
   Bearer / `transact.ti.com` URL. The verify step also does a defensive
   `grep -F` over `/signals/latest` for forbidden tokens.
 
+### TI universe catalog ingest — chunked (Phase 23C.1, recommended)
+
+The TI catalog endpoint (`/v2/store/products/catalog`) is rate-limited
+hard: even a single probe + capture pair can trigger HTTP 429 for
+hours. Combined with the ~150MB peak memory pressure when parsing
+50MB JSON inside a Cloudflare Worker, a single-shot Worker capture
+is fragile.
+
+**Recommended path:** the GH Action [`ti-catalog-universe-ingest.yml`](../.github/workflows/ti-catalog-universe-ingest.yml)
+fetches the catalog ONCE per dispatch, parses + chunks it locally
+(~7GB RAM, no Worker memory pressure), and POSTs 500-product chunks
+to three small Worker endpoints:
+
+  | Endpoint | Auth | Behaviour |
+  |---|---|---|
+  | `POST /api/ti/universe/catalog/ingest-chunk` | `X-Capture-Secret` | Upserts ≤500 pre-parsed products into `ti_catalog_latest_opn` |
+  | `POST /api/ti/universe/catalog/finalize`     | `X-Capture-Secret` | Rebuilds `ti_catalog_latest_gpn` via in-SQL `GROUP BY` (never pulls 72k rows into Worker memory). Inserts one `ti_catalog_snapshot_run` summary row. |
+  | `GET  /api/ti/universe/catalog/status`       | _(public, sanitized)_ | Read-only counts for the latest catalog snapshot. Safe for the UI. |
+
+Worker stays under the 128MB memory cap. TI gets exactly one catalog
+fetch per dispatch.
+
+**Required GH Actions secrets** (one-time setup, **Settings → Secrets and variables → Actions → New repository secret**):
+
+  - `TI_CLIENT_ID` — same value as the Cloudflare Pages env var
+  - `TI_CLIENT_SECRET` — same value as the Cloudflare Pages env var
+  - `SNAPSHOT_CAPTURE_SECRET` — same one [`ti-inventory-capture.yml`](../.github/workflows/ti-inventory-capture.yml) already uses
+
+**One-time D1 schema setup** (paste the four chunks from
+[`migrations/0003_ti_catalog.sql`](migrations/0003_ti_catalog.sql)
+into the D1 console — same flow as the 0002 migration). Verify with
+`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ti_catalog%';`
+→ should return three rows.
+
+**Manual dispatch:**
+
+```bash
+gh workflow run ti-catalog-universe-ingest.yml --ref main
+# Or browser: Repo → Actions → "TI Catalog Universe Ingest" → Run workflow → main
+```
+
+The workflow exposes two inputs: `chunk_size` (default 500) and
+`dry_run` (default false; set `true` to parse + chunk without POSTing).
+
+### TI universe catalog endpoints — experimental (Phase 23B / 23C, not for normal use)
+
+Two earlier endpoints **are still wired** but should not be invoked in
+normal operation:
+
+  - `GET /api/ti/universe/catalog/probe` (Phase 23B) — one-shot
+    diagnostic of the catalog endpoint shape. **Consumes one TI
+    catalog quota call.** Documented for completeness; the Phase 23C.1
+    chunked-ingest path now covers what the probe was used to plan.
+  - `POST /api/ti/universe/catalog/capture` (Phase 23C) —
+    single-shot fetch + parse + R2 + D1 in one Worker invocation.
+    **Marked experimental.** TI rate-limits the catalog endpoint, so
+    this burns quota without recovering. Memory peak (~150MB) also
+    flirts with the 128MB Worker cap. **Use the chunked-ingest GH
+    Action above instead.**
+
+Both endpoints are kept in the codebase for emergency fall-back use
+and so the pre-Phase-23C.1 commit history continues to make sense.
+
 ### TI universe catalog probe (Phase 23B)
 
 `GET /api/ti/universe/catalog/probe` is an auth-gated **one-shot

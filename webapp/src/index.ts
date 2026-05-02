@@ -67,7 +67,14 @@ import {
   tokenCacheSnapshot as tiTokenCacheSnapshot,
   tiAttemptedEndpoints,
 } from './sources/tiDirect'
-import { captureTiCatalogSnapshot } from './sources/tiCatalogIngest'
+import {
+  captureTiCatalogSnapshot,
+  ingestCatalogChunk,
+  rebuildGpnFromOpn,
+  readSnapshotCounts,
+  readLatestSnapshotRun,
+  insertSnapshotRunRow,
+} from './sources/tiCatalogIngest'
 import {
   fetchWatchedPartsProductInfo,
   TI_WATCHED_PARTS,
@@ -2925,10 +2932,20 @@ app.get('/api/ti/universe/catalog/probe', async (c) => {
 })
 
 // Phase 23C — POST /api/ti/universe/catalog/capture
-// Auth-gated, one-shot full-catalog ingest. Fetches /v2/store/products/
-// catalog (~50MB / ~72k products), R2-archives the raw body if the
-// binding is bound, parses the catalog, upserts the latest per-OPN +
-// per-GPN state into D1, and inserts one snapshot-run summary row.
+// **EXPERIMENTAL — DO NOT USE** (Phase 23C.1).
+//
+// Reason: TI rate-limits the /v2/store/products/catalog endpoint
+// aggressively (HTTP 429 after a single probe + capture pair). A retry
+// burns scarce quota without recovering, and even when the fetch
+// succeeds the Worker memory footprint during parse is tight (~150MB
+// peak vs the 128MB Workers limit). Use the chunked-ingest path
+// instead — see the three endpoints below this one.
+//
+// Original behaviour (still implemented for reference): one-shot
+// full-catalog ingest. Fetches /v2/store/products/catalog (~50MB / ~72k
+// products), R2-archives the raw body if the binding is bound, parses
+// the catalog, upserts the latest per-OPN + per-GPN state into D1, and
+// inserts one snapshot-run summary row.
 //
 // Hard restrictions (matched in tiCatalogIngest.ts):
 //   - NEVER expands the active 64-part watched universe; the daily
@@ -2981,6 +2998,145 @@ app.post('/api/ti/universe/catalog/capture', async (c) => {
     errors: result.errors,
     warnings: result.warnings,
     diagnostics: result.diagnostics,
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────
+// Phase 23C.1 — chunked catalog-ingest endpoints
+//
+// The TI catalog endpoint (/v2/store/products/catalog) is aggressively
+// rate-limited (HTTP 429 after even a single probe + capture pair).
+// Fetching the catalog from a Worker AND parsing it AND upserting 72k
+// rows in one invocation also flirts with the 128MB Worker memory cap.
+//
+// New architecture: a GitHub Action runner (.github/workflows/
+// ti-catalog-universe-ingest.yml) fetches the catalog ONCE, parses
+// the 50MB JSON locally (no Worker memory pressure), splits it into
+// 500-product chunks, POSTs each chunk to /api/ti/universe/catalog/
+// ingest-chunk, then calls /finalize and /status. Worker stays small.
+// ────────────────────────────────────────────────────────────────────────
+
+// POST /api/ti/universe/catalog/ingest-chunk — auth-gated.
+// Accepts a single pre-parsed chunk of products (≤500) and upserts
+// them into ti_catalog_latest_opn. Does NOT call TI; relies on the
+// chunk that was already fetched + parsed by the GH Action runner.
+app.post('/api/ti/universe/catalog/ingest-chunk', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({ success: false, status: 'capture_secret_not_configured', message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.' })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot upsert catalog rows.' }, 500)
+  }
+  let body: any
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ success: false, status: 'invalid_payload', message: 'Body must be JSON: { runId, capturedAt, chunkIndex, totalChunks, products[] }' }, 400)
+  }
+  const runId = typeof body?.runId === 'string' ? body.runId : ''
+  const capturedAt = typeof body?.capturedAt === 'string' ? body.capturedAt : ''
+  const chunkIndex = Number.isFinite(body?.chunkIndex) ? Math.trunc(body.chunkIndex) : -1
+  const totalChunks = Number.isFinite(body?.totalChunks) ? Math.trunc(body.totalChunks) : -1
+  const products = Array.isArray(body?.products) ? body.products : null
+  if (!runId || !capturedAt || chunkIndex < 0 || totalChunks <= 0 || !products) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'Missing or invalid runId / capturedAt / chunkIndex / totalChunks / products[].' }, 400)
+  }
+  if (products.length > 1000) {
+    return c.json({ success: false, status: 'chunk_too_large', message: `Chunk size ${products.length} exceeds the 1000-product safety cap.` }, 413)
+  }
+  const result = await ingestCatalogChunk(env.TI_INVENTORY_HISTORY_DB as any, {
+    runId, capturedAt, chunkIndex, totalChunks, products,
+  })
+  return c.json(result)
+})
+
+// POST /api/ti/universe/catalog/finalize — auth-gated.
+// Rebuilds ti_catalog_latest_gpn from ti_catalog_latest_opn (in-SQL
+// GROUP BY — never pulls 72k rows into Worker memory) and inserts one
+// ti_catalog_snapshot_run summary row. Called by the GH Action after
+// all chunks finish ingesting.
+app.post('/api/ti/universe/catalog/finalize', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({ success: false, status: 'capture_secret_not_configured', message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.' })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot finalize.' }, 500)
+  }
+  // Optional metadata for the snapshot_run row — the GH Action passes
+  // bodyByteSize and rawR2Key so the operator can correlate the run with
+  // the raw archive (if any) and the local download size.
+  let body: any = {}
+  try { body = await c.req.json() } catch { /* allow empty body */ }
+  const capturedAt = typeof body?.capturedAt === 'string' ? body.capturedAt : new Date().toISOString()
+  const source = typeof body?.source === 'string' ? body.source : 'ti_store_v2_catalog_chunked'
+  const rawR2Key = typeof body?.rawR2Key === 'string' ? body.rawR2Key : null
+  const bodyByteSize = Number.isFinite(body?.bodyByteSize) ? Math.trunc(body.bodyByteSize) : null
+
+  const errors: string[] = []
+  const gpnRowsUpserted = await rebuildGpnFromOpn(env.TI_INVENTORY_HISTORY_DB as any, capturedAt, errors)
+  const counts = await readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any)
+  const summary = {
+    totalOpns: counts.totalOpns,
+    totalGpns: counts.totalGpns,
+    pricedOpns: counts.pricedOpns,
+    inStockOpns: counts.inStockOpns,
+    outOfStockOpns: counts.outOfStockOpns,
+    parsedOk: errors.length === 0,
+    errors,
+  }
+  await insertSnapshotRunRow(env.TI_INVENTORY_HISTORY_DB as any, {
+    capturedAt, source, rawR2Key, bodyByteSize, summary,
+  })
+  return c.json({
+    success: errors.length === 0,
+    capturedAt,
+    source,
+    gpnRowsUpserted,
+    ...summary,
+    note: 'GPN aggregates rebuilt from ti_catalog_latest_opn via in-SQL GROUP BY. cheapest_opn / highest_inventory_opn / lifecycle_summary / median price are NULL in v1 and may be filled by a follow-up secondary pass.',
+  })
+})
+
+// GET /api/ti/universe/catalog/status — public, sanitized.
+// Returns the current state of the catalog tables + the most recent
+// snapshot-run summary row. Read-only. Safe for the UI to call.
+app.get('/api/ti/universe/catalog/status', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({
+      success: true,
+      backend: 'none',
+      latestRun: null,
+      opnCount: 0, gpnCount: 0,
+      pricedOpnCount: 0, inStockOpnCount: 0, outOfStockOpnCount: 0,
+      latestCapturedAt: null,
+      message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.',
+    })
+  }
+  const counts = await readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any)
+  const latestRun = await readLatestSnapshotRun(env.TI_INVENTORY_HISTORY_DB as any)
+  return c.json({
+    success: true,
+    backend: 'd1',
+    latestRun,
+    opnCount: counts.totalOpns,
+    gpnCount: counts.totalGpns,
+    pricedOpnCount: counts.pricedOpns,
+    inStockOpnCount: counts.inStockOpns,
+    outOfStockOpnCount: counts.outOfStockOpns,
+    latestCapturedAt: counts.latestCapturedAt,
   })
 })
 

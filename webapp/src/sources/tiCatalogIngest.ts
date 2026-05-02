@@ -139,7 +139,7 @@ type ParsedOpn = {
   buyNowUrl: string | null
 }
 
-function parseProduct(p: unknown): ParsedOpn | null {
+export function parseProduct(p: unknown): ParsedOpn | null {
   if (!p || typeof p !== 'object') return null
   const o = p as Record<string, unknown>
   const opn = typeof o.tiPartNumber === 'string' ? o.tiPartNumber.trim()
@@ -375,6 +375,217 @@ async function insertSnapshotRunSummary(
     result.errors.push(`d1_run_summary:${msg.slice(0, 100)}`)
   }
 }
+
+// ── Phase 23C.1 — chunked-ingest helpers ──────────────────────────────────
+// Used by POST /api/ti/universe/catalog/ingest-chunk + /finalize + /status.
+// Each Worker invocation only sees ~500 products at a time, so memory
+// stays bounded. The TI catalog fetch happens in the GitHub Action
+// runner (7GB RAM, can handle 50MB JSON trivially).
+
+export type IngestChunkResult = {
+  success: boolean
+  runId: string
+  chunkIndex: number
+  totalChunks: number
+  capturedAt: string
+  attempted: number
+  opnRowsUpserted: number
+  pricedOpns: number
+  inStockOpns: number
+  outOfStockOpns: number
+  errors: string[]
+}
+
+export async function ingestCatalogChunk(
+  d1: CatalogD1,
+  args: {
+    runId: string
+    capturedAt: string
+    chunkIndex: number
+    totalChunks: number
+    products: unknown[]
+  },
+): Promise<IngestChunkResult> {
+  const result: IngestChunkResult = {
+    success: false,
+    runId: args.runId,
+    chunkIndex: args.chunkIndex,
+    totalChunks: args.totalChunks,
+    capturedAt: args.capturedAt,
+    attempted: args.products.length,
+    opnRowsUpserted: 0,
+    pricedOpns: 0,
+    inStockOpns: 0,
+    outOfStockOpns: 0,
+    errors: [],
+  }
+  if (!Array.isArray(args.products) || args.products.length === 0) {
+    result.errors.push('empty_products_array')
+    return result
+  }
+  const opnRows: ParsedOpn[] = []
+  for (const p of args.products) {
+    const parsed = parseProduct(p)
+    if (!parsed) continue
+    opnRows.push(parsed)
+    if (parsed.normalizedUnitPrice != null) result.pricedOpns += 1
+    if (parsed.quantity != null) {
+      if (parsed.quantity > 0) result.inStockOpns += 1
+      else if (parsed.quantity === 0) result.outOfStockOpns += 1
+    }
+  }
+  result.opnRowsUpserted = await upsertOpnRows(d1, opnRows, args.capturedAt, 'ti_store_v2_catalog_chunked', result.errors)
+  result.success = result.errors.length === 0
+  return result
+}
+
+// SQL-only GPN rebuild — does NOT pull 72k OPN rows into Worker memory.
+// Computes the basic aggregates (opn_count, stocked_opn_count,
+// total_quantity, min_normalized_unit_price) in a single GROUP BY.
+// median / cheapest_opn / highest_inventory_opn / lifecycle_summary are
+// left NULL in v1; can be filled by a follow-up secondary pass if the
+// customer needs them.
+export async function rebuildGpnFromOpn(
+  d1: CatalogD1,
+  capturedAt: string,
+  errors: string[],
+): Promise<number> {
+  let upserted = 0
+  try {
+    await d1.prepare('DELETE FROM ti_catalog_latest_gpn').run()
+  } catch (e: any) {
+    errors.push(`gpn_delete:${(e?.message || 'failed').slice(0, 100)}`)
+    return 0
+  }
+  try {
+    const stmt = d1.prepare(
+      `INSERT INTO ti_catalog_latest_gpn (
+        generic_part_number, opn_count, stocked_opn_count, total_quantity,
+        min_normalized_unit_price, median_normalized_unit_price,
+        cheapest_opn, highest_inventory_opn, lifecycle_summary,
+        latest_captured_at
+      )
+      SELECT
+        generic_part_number,
+        COUNT(*) AS opn_count,
+        SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0 THEN 1 ELSE 0 END) AS stocked_opn_count,
+        SUM(COALESCE(quantity, 0)) AS total_quantity,
+        MIN(normalized_unit_price) AS min_normalized_unit_price,
+        NULL AS median_normalized_unit_price,
+        NULL AS cheapest_opn,
+        NULL AS highest_inventory_opn,
+        NULL AS lifecycle_summary,
+        ? AS latest_captured_at
+      FROM ti_catalog_latest_opn
+      WHERE generic_part_number IS NOT NULL AND TRIM(generic_part_number) != ''
+      GROUP BY generic_part_number`,
+    ).bind(capturedAt)
+    await stmt.run()
+    // Read back the count for the response. SQLite doesn't return rows-
+    // affected on INSERT...SELECT, so do a follow-up COUNT.
+    const res = await d1.prepare(
+      'SELECT COUNT(*) AS n FROM ti_catalog_latest_gpn',
+    ).all<{ n: number }>()
+    upserted = res.results?.[0]?.n ?? 0
+  } catch (e: any) {
+    errors.push(`gpn_insert:${(e?.message || 'failed').slice(0, 100)}`)
+  }
+  return upserted
+}
+
+export type SnapshotRunSummary = {
+  totalOpns: number
+  totalGpns: number
+  pricedOpns: number
+  inStockOpns: number
+  outOfStockOpns: number
+  parsedOk: boolean
+  errors: string[]
+}
+
+export async function readSnapshotCounts(d1: CatalogD1): Promise<{
+  totalOpns: number; totalGpns: number;
+  pricedOpns: number; inStockOpns: number; outOfStockOpns: number;
+  latestCapturedAt: string | null;
+}> {
+  const out = {
+    totalOpns: 0, totalGpns: 0,
+    pricedOpns: 0, inStockOpns: 0, outOfStockOpns: 0,
+    latestCapturedAt: null as string | null,
+  }
+  try {
+    const r = await d1.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM ti_catalog_latest_opn) AS total_opns,
+        (SELECT COUNT(*) FROM ti_catalog_latest_gpn) AS total_gpns,
+        (SELECT COUNT(*) FROM ti_catalog_latest_opn WHERE normalized_unit_price IS NOT NULL) AS priced_opns,
+        (SELECT COUNT(*) FROM ti_catalog_latest_opn WHERE quantity IS NOT NULL AND quantity > 0) AS in_stock_opns,
+        (SELECT COUNT(*) FROM ti_catalog_latest_opn WHERE quantity = 0) AS out_of_stock_opns,
+        (SELECT MAX(latest_captured_at) FROM ti_catalog_latest_opn) AS latest_captured_at
+      `,
+    ).all<any>()
+    const row = r.results?.[0] ?? {}
+    out.totalOpns = Number(row.total_opns) || 0
+    out.totalGpns = Number(row.total_gpns) || 0
+    out.pricedOpns = Number(row.priced_opns) || 0
+    out.inStockOpns = Number(row.in_stock_opns) || 0
+    out.outOfStockOpns = Number(row.out_of_stock_opns) || 0
+    out.latestCapturedAt = typeof row.latest_captured_at === 'string' ? row.latest_captured_at : null
+  } catch { /* swallow — return zeros */ }
+  return out
+}
+
+export async function readLatestSnapshotRun(d1: CatalogD1): Promise<unknown | null> {
+  try {
+    const r = await d1.prepare(
+      `SELECT id, captured_at, source, raw_r2_key, body_byte_size,
+              total_opns, total_gpns, priced_opns, in_stock_opns, out_of_stock_opns,
+              parsed_ok, errors_json, created_at
+       FROM ti_catalog_snapshot_run ORDER BY captured_at DESC LIMIT 1`,
+    ).all<any>()
+    return r.results?.[0] ?? null
+  } catch {
+    return null
+  }
+}
+
+export async function insertSnapshotRunRow(
+  d1: CatalogD1,
+  args: {
+    capturedAt: string;
+    source: string;
+    rawR2Key: string | null;
+    bodyByteSize: number | null;
+    summary: SnapshotRunSummary;
+  },
+): Promise<void> {
+  try {
+    await d1.prepare(
+      `INSERT INTO ti_catalog_snapshot_run (
+        captured_at, source, raw_r2_key, body_byte_size,
+        total_opns, total_gpns, priced_opns, in_stock_opns, out_of_stock_opns,
+        parsed_ok, errors_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      args.capturedAt,
+      args.source,
+      args.rawR2Key,
+      args.bodyByteSize,
+      args.summary.totalOpns,
+      args.summary.totalGpns,
+      args.summary.pricedOpns,
+      args.summary.inStockOpns,
+      args.summary.outOfStockOpns,
+      args.summary.parsedOk ? 1 : 0,
+      args.summary.errors.length > 0 ? JSON.stringify(args.summary.errors) : null,
+      isoNow(),
+    ).run()
+  } catch (e: any) {
+    args.summary.errors.push(`snapshot_run_insert:${(e?.message || 'failed').slice(0, 100)}`)
+  }
+}
+
+// ── Phase 23C — original single-shot capture (now experimental) ───────────
 
 export async function captureTiCatalogSnapshot(
   env: TiEnv & { TI_INVENTORY_HISTORY_DB?: CatalogD1; TI_CATALOG_SNAPSHOTS_R2?: CatalogR2 },
