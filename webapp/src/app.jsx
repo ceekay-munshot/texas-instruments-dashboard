@@ -4768,191 +4768,108 @@ function App(){
       else if(dist>=2) confidence='multi-source';
       else if(dist===1) confidence='single-source';
     }
-    const confColor=confidence==='multi-source'?'#00c9a7':confidence==='single-source'?'#f0a84e':'#f05c5c';
-    // Phase 24E — TI Direct primary, channel checks secondary. Compute the
-    // TI Direct rollup eagerly so the primary block can render first.
+    // Phase 24E — TI Direct primary, channel checks secondary.
     const tiCanonical = combinedEvidence?.legacyToCanonical?.[catId];
     const tiRollupRow = tiCanonical ? tiRollupsByCanonical[tiCanonical] : null;
+
+    // Compact summary inputs
+    const lastP = HP[HP.length - 1];
+    const histQoQ = HIST[lastP]?.[catId];
+    const liveQoQ = d?.qoqPct;
+    const fmtPct = (v) => `${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+    const priceParts = [];
+    if (histQoQ != null) priceParts.push(`${fmtPct(histQoQ)} QoQ`);
+    if (liveQoQ != null) priceParts.push(`Live ${fmtPct(liveQoQ)}`);
+    const priceSignalText = priceParts.length ? priceParts.join(' / ') : '—';
+    const priceSignalColor = (liveQoQ ?? histQoQ) > 0 ? '#4dffc3' : (liveQoQ ?? histQoQ) < 0 ? '#f05c5c' : '#e0eaf8';
+
+    let confLabel = '—';
+    let confColor2 = '#7a96b8';
+    const tiQ = tiRollupRow?.qualityLabel;
+    if (tiQ === 'high') { confLabel = 'High'; confColor2 = '#4dffc3'; }
+    else if (tiQ === 'medium' || confidence === 'multi-source') { confLabel = 'Medium'; confColor2 = '#00c9a7'; }
+    else if (tiQ === 'low' || tiQ === 'mixed' || confidence === 'single-source') { confLabel = 'Low'; confColor2 = '#f0a84e'; }
+
+    const basketText = tiRollupRow?.opnCount != null
+      ? `${Number(tiRollupRow.opnCount).toLocaleString()} mapped TI parts`
+      : (basket?.skuCount ? `${basket.skuCount} representative SKUs` : '—');
+
+    const sourceList = [];
+    if (d?.parts?.length > 0) sourceList.push('Mouser');
+    if (basket || evid) sourceList.push('Nexar');
+    if (tiRollupRow) sourceList.push('TI Direct');
+    const sourcesText = sourceList.length ? sourceList.join(' / ') : '—';
+
+    const normDate = (v) => {
+      if (!v) return null;
+      const s = typeof v === 'string' ? v : new Date(v).toISOString();
+      return s.slice(0, 10);
+    };
+    const dateCands = [
+      normDate(combinedEvidence?.latestMouserSnapshotDate),
+      normDate(combinedEvidence?.latestNexarSnapshotDate),
+      normDate(combinedEvidence?.latestTiDirectSnapshotDate || tiRollupRow?.latestCapturedAt),
+    ].filter(Boolean).sort();
+    const latestDate = dateCands.length ? dateCands[dateCands.length - 1] : null;
+    const latestCheckText = latestDate ? `${sourcesText} · ${latestDate}` : sourcesText;
+
+    let interp;
+    if (tiRollupRow && d?.parts?.length > 0) {
+      interp = 'Latest live channel check supports the current price signal.';
+    } else if (tiRollupRow) {
+      interp = 'Price movement is based on TI catalog history.';
+    } else if (d?.parts?.length > 0 || basket || evid) {
+      interp = 'Latest signal from live distributor channel data.';
+    } else {
+      interp = 'Latest signal from TI price history.';
+    }
+
     return <>
-      {/* Header — TI Direct framed as canonical, channel APIs as
-          corroboration. The real-time +X% in the Live cell comes from
-          Mouser because the TI catalog refreshes every ~24h, not every
-          second; the framing makes that explicit. */}
-      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null}</div>
-      <div style={{fontSize:'0.55rem',color:'#7a96b8',marginBottom:7,fontStyle:'italic',lineHeight:1.5}}>
-        TI Direct primary · channel checks secondary
-        <br/>
-        <span style={{color:'#4a6a8a'}}>Live cell tick from Mouser real-time API; canonical state from TI Direct catalog snapshot.</span>
+      {/* Header */}
+      <div style={{fontSize:'0.78rem',color:'#ffd700',marginBottom:6,fontWeight:'bold',letterSpacing:'-0.01em'}}>
+        {cat?.l}
+        {catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.52rem',marginLeft:6,fontWeight:'normal'}}>⚠ reel/2000 price</span>:null}
       </div>
 
-      {/* ── PRIMARY: TI Direct full catalog ──────────────────────────── */}
-      {tiRollupRow ? (() => {
-        const r = tiRollupRow;
-        const conf = r.mappingConfidenceSummary || {};
-        const high = Number(r.highConfidenceOpnCount ?? conf.high ?? 0);
-        const med  = Number(r.mediumConfidenceOpnCount ?? conf.medium ?? 0);
-        const low  = Number(r.lowConfidenceOpnCount ?? conf.low ?? 0);
-        const highPct = r.highConfidencePct != null ? Number(r.highConfidencePct) : null;
-        const qualityLabel = r.qualityLabel || 'unknown';
-        const usable = r.usableForPricesLiveEvidence === true;
-        const qualityWarning = r.qualityWarning || null;
-        const qualityColor = qualityLabel === 'high' ? '#4dffc3'
-                           : qualityLabel === 'medium' ? '#00c9a7'
-                           : qualityLabel === 'low' ? '#f0a84e'
-                           : qualityLabel === 'mixed' ? '#f0a84e'
-                           : '#4a6a8a';
-        const lifecycleEntries = r.lifecycleSummary && typeof r.lifecycleSummary === 'object'
-          ? Object.entries(r.lifecycleSummary) : [];
-        const fmtP = (n) => n == null ? '—' : `$${Number(n).toFixed(4)}`;
-        return (
-          <div style={{paddingTop:4,paddingBottom:4,borderTop:'2px solid #2a4060',borderBottom:'1px solid #1a2740',marginBottom:6}}>
-            <div style={{fontSize:'0.6rem',color:'#4dffc3',fontWeight:'bold',marginBottom:3,letterSpacing:'0.04em',textTransform:'uppercase'}}>
-              ★ Primary: TI Direct full catalog
-              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem',textTransform:'none',letterSpacing:0}}>· canonical subcategory · 72k-OPN snapshot</span>
-            </div>
-            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
-              <div>Snapshot: {r.latestCapturedAt ? new Date(r.latestCapturedAt).toISOString().slice(0,10) : '—'} · mapping quality <span style={{color:qualityColor,fontWeight:'bold'}}>{qualityLabel}</span>{!usable && qualityLabel !== 'unknown' ? ' · use as context, not signal' : ''}</div>
-              <div>OPNs: {Number(r.opnCount).toLocaleString()} · GPN families: {Number(r.gpnCount).toLocaleString()} · priced: {Number(r.pricedOpnCount).toLocaleString()}</div>
-              <div>Stocked: {Number(r.stockedOpnCount).toLocaleString()} ({r.stockedPct == null ? '—' : `${r.stockedPct}%`}) · Out of stock: {Number(r.outOfStockOpnCount).toLocaleString()}</div>
-              <div>Total qty: {Number(r.totalQuantity || 0).toLocaleString()}</div>
-              <div>Price: median {fmtP(r.medianNormalizedUnitPrice)} · min {fmtP(r.minNormalizedUnitPrice)} · max {fmtP(r.maxNormalizedUnitPrice)}</div>
-              {r.cheapestOpn && <div>Cheapest OPN: <span style={{color:'#e0eaf8'}}>{r.cheapestOpn}</span></div>}
-              {r.highestInventoryOpn && <div>Highest-inv OPN: <span style={{color:'#e0eaf8'}}>{r.highestInventoryOpn}</span></div>}
-              {lifecycleEntries.length > 0 && (
-                <div>Lifecycle: {lifecycleEntries.map(([k,v]) => `${k}:${v}`).join(' · ')}</div>
-              )}
-              <div style={{marginTop:4,paddingTop:4,borderTop:'1px dashed #1a2740'}}>
-                <span style={{color:'#7a96b8'}}>Mapping: </span>
-                <span style={{color:'#4dffc3'}}>{high} high</span>
-                <span style={{color:'#7a96b8'}}> · </span>
-                <span style={{color:'#00c9a7'}}>{med} medium</span>
-                <span style={{color:'#7a96b8'}}> · </span>
-                <span style={{color:'#f0a84e'}}>{low} low</span>
-                {highPct != null && <span style={{color:'#7a96b8'}}> · {highPct}% high-conf</span>}
-              </div>
-              {qualityWarning && (
-                <div style={{color:qualityColor,fontStyle:'italic',marginTop:3}}>⚠ {qualityWarning}</div>
-              )}
-              <div style={{color:'#3d8ef0',marginTop:3}}>→ Click cell to inspect mapped TI parts</div>
-              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Forward history requires stored TI snapshots — distributor data only fills gaps until the next TI capture lands.</div>
-            </div>
-          </div>
-        );
-      })() : (
-        <div style={{paddingTop:4,paddingBottom:4,borderTop:'2px solid #2a4060',borderBottom:'1px solid #1a2740',marginBottom:6,fontSize:'0.55rem',color:'#7a96b8',lineHeight:1.55}}>
-          <div style={{color:'#4dffc3',fontWeight:'bold',marginBottom:3,letterSpacing:'0.04em',textTransform:'uppercase',fontSize:'0.6rem'}}>★ Primary: TI Direct full catalog</div>
-          <div style={{fontStyle:'italic'}}>No TI Direct rollup mapped to this category yet — falling back to channel data below until the next catalog capture lands or a narrower mapping rule covers it.</div>
-        </div>
-      )}
-
-      {/* ── SECONDARY: real-time channel tick (Mouser qty=1) ─────────── */}
-      <div style={{fontSize:'0.55rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3,letterSpacing:'0.04em',textTransform:'uppercase'}}>
-        Channel check · Mouser qty=1 <span style={{color:'#4a6a8a',fontWeight:'normal',letterSpacing:0,textTransform:'none'}}>· real-time tick · vs latest baseline (28-Apr-26)</span>
+      {/* Interpretation */}
+      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom:9,lineHeight:1.45}}>
+        {interp}
       </div>
-      {d?(d.parts?.length>0?d.parts.map((p,i)=>(
-        <div key={i} style={{fontSize:'0.6rem',marginBottom:3,display:'flex',justifyContent:'space-between',gap:14}}>
-          <span style={{color:'#c4d4e8',fontFamily:'monospace'}}>{p.part}</span>
-          <span style={{color:'#00c9a7',fontFamily:'monospace'}}>${p.price?.toFixed(4)}</span>
-          <span style={{color:p.availability?.includes('In Stock')?'#00c9a7':'#f05c5c',fontSize:'0.52rem'}}>{p.availability||'—'}</span>
-        </div>
-      )):<div style={{fontSize:'0.58rem',color:'#f05c5c'}}>{d.error||'No live data'}</div>):<div style={{fontSize:'0.58rem',color:'#7a96b8'}}>No Mouser live data yet</div>}
-      {d&&<div style={{marginTop:5,paddingTop:4,borderTop:'1px solid #1a2740',fontSize:'0.52rem',color:'#2d4a6b'}}>
-        Live ${d.avgPriceUSD?.toFixed(4)} · Baseline ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser channel
-      </div>}
-      {basket&&<div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
-        <div style={{fontSize:'0.6rem',color:'#3d8ef0',fontWeight:'bold',marginBottom:3}}>
-          Channel check · Nexar trusted basket
-          <span style={{color:'#f0a84e',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· tiny basket preview, not full coverage</span>
-        </div>
-        <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
-          <div>Coverage: {basket.skuCount} SKUs / {basket.quotedSkuCount} quoted ({basket.sampleCoverage})</div>
-          <div>Avg trusted available: <span style={{color:'#00c9a7'}}>${basket.avgBestTrustedAvailableUnitPrice?.toFixed(4) ?? '—'}</span></div>
-          <div>Median trusted available: <span style={{color:'#00c9a7'}}>${basket.medianBestTrustedAvailableUnitPrice?.toFixed(4) ?? '—'}</span></div>
-          <div>Trusted inventory: {(basket.totalTrustedAvailableInventory||0).toLocaleString()}</div>
-          <div>Broker inventory: {(basket.totalBrokerAvailableInventory||0).toLocaleString()} <span style={{color:'#7a96b8'}}>(separate, excluded from core signal)</span></div>
-          <div style={{whiteSpace:'normal'}}>Trusted distributors: {(basket.trustedDistributorCoverage||[]).join(', ')||'—'}</div>
-          <div>Source coverage confidence: <span style={{color:confColor,fontWeight:'bold'}}>{confidence}</span></div>
-        </div>
-      </div>}
-      {evid&&(()=>{
-        const evColor = evid.evidenceStatus==='strong_current_evidence'?'#4dffc3'
-                      : evid.evidenceStatus==='moderate_current_evidence'?'#00c9a7'
-                      : evid.evidenceStatus==='weak_current_evidence'?'#f0a84e'
-                      : '#f05c5c';
-        const trendStr = trendMeta?.status==='ok' ? `available (${trendMeta.observationCount} obs)` : 'pending until 2 daily snapshots';
-        const dupTotal = (evid.skus||[]).reduce((s,x)=>s+(x.duplicateObservationCount||0),0);
-        const cov = coverageCatFor(catId);
-        return (
-          <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
-            <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
-              Channel check · Nexar snapshot evidence <span style={{color:'#4a6a8a',fontWeight:'normal'}}>· {evid.snapshotDate}</span>
-            </div>
-            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
-              <div>Confidence: <span style={{color:evColor,fontWeight:'bold'}}>{evid.sourceConfidenceScore}/100 · {evid.evidenceStatus.replace(/_current_evidence$/,'').replace(/_/g,' ')}</span></div>
-              <div>Trusted distributors ({evid.trustedDistributorCount}): <span style={{color:'#c4d4e8'}}>{(evid.trustedDistributors||[]).join(', ')||'—'}</span></div>
-              <div>Trusted inventory: {(evid.totalTrustedInventory||0).toLocaleString()}</div>
-              <div>Broker inventory: {(evid.totalBrokerInventory||0).toLocaleString()} <span style={{color:'#7a96b8'}}>(excluded from core signal)</span></div>
-              {evid.failedSkuCount>0&&<div style={{color:'#f0a84e'}}>Failed SKUs: {evid.failedSkuCount} of {evid.representativeSkuCount}</div>}
-              {dupTotal>0&&<div style={{color:'#7a96b8'}}>Deduped observations: {dupTotal}</div>}
-              {cov&&<div style={{color:'#7a96b8'}}>Representative coverage: sampled {cov.sampledSkuCount} of {cov.skuCount} monitored SKUs{cov.unsampledSkuCount>0?<span style={{color:'#f0a84e'}}> · {cov.unsampledSkuCount} watchlist pending higher quota</span>:null}</div>}
-              {coverageData?.samplingPolicy==='anchor_plus_rotation'&&<div style={{color:'#7a96b8'}}>Sampling policy: anchor + rotation</div>}
-              {cov&&!cov.sampledToday&&cov.nextExpectedSampleDate&&<div style={{color:'#f0a84e'}}>Watchlist category — next expected sample: {cov.nextExpectedSampleDate}</div>}
-              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Current source evidence only — trend signal {trendStr}.</div>
-            </div>
-          </div>
-        );
-      })()}
-      {agree&&(combinedEvidence?.latestMouserSnapshotDate||combinedEvidence?.latestNexarSnapshotDate||combinedEvidence?.latestTiDirectSnapshotDate)&&(()=>{
-        const aColor = agree.agreementStatus==='strong_agreement'?'#4dffc3'
-                    : agree.agreementStatus==='moderate_agreement'?'#00c9a7'
-                    : agree.agreementStatus==='divergent'?'#f0a84e'
-                    : agree.agreementStatus==='single_source_only'?'#7a96b8'
-                    : '#4a6a8a';
-        const aLabel = agree.agreementStatus.replace(/_/g,' ');
-        // Phase 23C.6 — surface TI direct alongside Mouser + Nexar.
-        // Δ is signed % vs Mouser baseline (matches Nexar-vs-Mouser
-        // formula). Sample size is the number of watched parts with
-        // a parsed normalizedUnitPrice that mapped into this canonical.
-        const tiPrice = agree.tiDirectPrice;
-        const tiInv = agree.tiDirectInventory;
-        const tiSamples = agree.tiDirectSampleSize ?? 0;
-        const tiPriceDelta = agree.tiPriceDeltaPctVsMouser;
-        const tiInvDelta = agree.tiInventoryDeltaPctVsMouser;
-        const hasTi = tiPrice != null || tiInv != null;
-        const fmtSigned = (v) => v == null ? '—' : `${v > 0 ? '+' : ''}${v}%`;
-        return (
-          <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
-            <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
-              Channel agreement <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· corroboration only · Mouser × Nexar × 64-part TI watch</span>
-            </div>
-            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
-              {combinedEvidence?.latestMouserSnapshotDate&&<div>Mouser latest: {combinedEvidence.latestMouserSnapshotDate}</div>}
-              {combinedEvidence?.latestNexarSnapshotDate&&<div>Nexar latest: {combinedEvidence.latestNexarSnapshotDate}</div>}
-              {combinedEvidence?.latestTiDirectSnapshotDate&&<div>TI direct latest: {combinedEvidence.latestTiDirectSnapshotDate}</div>}
-              <div>Agreement: <span style={{color:aColor,fontWeight:'bold'}}>{aLabel}</span></div>
-              {agree.mouserPrice!=null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar ${agree.nexarTrustedPrice.toFixed(4)} · Δ {fmtSigned(agree.priceDeltaPct)}</div>}
-              {agree.mouserPrice!=null&&agree.nexarTrustedPrice==null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar —</div>}
-              {agree.mouserPrice==null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser — · Nexar ${agree.nexarTrustedPrice.toFixed(4)}</div>}
-              {hasTi&&(
-                <div>
-                  TI direct: {tiPrice!=null?`$${tiPrice.toFixed(4)}`:'—'}
-                  {tiPriceDelta!=null?` · Δ vs Mouser ${fmtSigned(tiPriceDelta)}`:''}
-                  {tiSamples>0?` · n=${tiSamples}`:''}
-                </div>
-              )}
-              {(agree.mouserInventory!=null||agree.nexarTrustedInventory!=null)&&<div>Inventory: Mouser {(agree.mouserInventory||0).toLocaleString()} · Nexar {(agree.nexarTrustedInventory||0).toLocaleString()}{agree.inventoryDeltaPct!=null?` · Δ ${fmtSigned(agree.inventoryDeltaPct)}`:''}</div>}
-              {hasTi&&tiInv!=null&&(
-                <div>TI direct inv: {tiInv.toLocaleString()}{tiInvDelta!=null?` · Δ vs Mouser ${fmtSigned(tiInvDelta)}`:''}</div>
-              )}
-              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Source agreement only — shortage/easing labels still gated by ≥2 dated snapshots.</div>
-            </div>
-          </div>
-        );
-      })()}
 
-      {/* Phase 24E — TI Direct full catalog block was lifted to the
-          top of the tooltip (★ Primary). Channel sections above are
-          now framed as corroboration only. */}
+      {/* Compact 4-row summary */}
+      <div style={{display:'grid',gridTemplateColumns:'auto 1fr',rowGap:5,columnGap:14,fontSize:'0.62rem',marginBottom:9}}>
+        <span style={{color:'#7a96b8'}}>Price signal</span>
+        <span style={{color:priceSignalColor,fontFamily:'monospace',fontWeight:'bold'}}>{priceSignalText}</span>
+
+        <span style={{color:'#7a96b8'}}>Confidence</span>
+        <span style={{color:confColor2,fontWeight:'bold'}}>{confLabel}</span>
+
+        <span style={{color:'#7a96b8'}}>Basket</span>
+        <span style={{color:'#e0eaf8'}}>{basketText}</span>
+
+        <span style={{color:'#7a96b8'}}>Latest check</span>
+        <span style={{color:'#e0eaf8'}}>{latestCheckText}</span>
+      </div>
+
+      {/* Source detail */}
+      <div style={{fontSize:'0.55rem',color:'#4a6a8a',marginBottom:9,fontStyle:'italic',lineHeight:1.45}}>
+        Primary source: TI Direct · Channel checks: Mouser / Nexar
+      </div>
+
+      {/* CTA footer */}
+      <div style={{
+        background:'rgba(61,142,240,0.14)',
+        border:'1px solid #2a4a7a',
+        borderRadius:4,
+        padding:'7px 10px',
+        fontSize:'0.6rem',
+        color:'#7aaee8',
+        textAlign:'center',
+        fontWeight:'bold',
+        letterSpacing:'0.02em',
+      }}>
+        Click cell to inspect mapped TI parts and full source evidence →
+      </div>
     </>;
   }
 
