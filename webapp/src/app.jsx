@@ -3957,6 +3957,7 @@ function UniversePanel({ initialFilter, onClearFilter }) {
                 <th style={{ ...headPad, textAlign: 'left' }}>GPN</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Variants</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Stocked</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Out of stock</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Total qty</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Min price</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Median</th>
@@ -3968,18 +3969,27 @@ function UniversePanel({ initialFilter, onClearFilter }) {
             </thead>
             <tbody>
               {leaderboardLoading && (
-                <tr><td colSpan={10} style={{ ...cellPad, color: '#4a6a8a', textAlign: 'center' }}>Loading…</td></tr>
+                <tr><td colSpan={11} style={{ ...cellPad, color: '#4a6a8a', textAlign: 'center' }}>Loading…</td></tr>
               )}
               {!leaderboardLoading && leaderboard.length === 0 && (
-                <tr><td colSpan={10} style={{ ...cellPad, color: '#7a96b8', textAlign: 'center' }}>No rows</td></tr>
+                <tr><td colSpan={11} style={{ ...cellPad, color: '#7a96b8', textAlign: 'center' }}>No rows</td></tr>
               )}
-              {!leaderboardLoading && leaderboard.map(r => (
+              {!leaderboardLoading && leaderboard.map(r => {
+                // Phase 24E.2 — derive out-of-stock count + ratio so the new
+                // column shows e.g. "71 (77%)". opnCount can be 0 for
+                // empty subcategories; guard NaN.
+                const oos = Math.max(0, (r.opnCount ?? 0) - (r.stockedOpnCount ?? 0));
+                const oosPct = r.opnCount > 0 ? Math.round((oos / r.opnCount) * 100) : null;
+                const oosLabel = r.opnCount > 0 ? `${fmtN(oos)} (${oosPct}%)` : '—';
+                const oosColor = oosPct === 100 ? '#f05c5c' : oos > 0 ? '#f0a84e' : '#4a6a8a';
+                return (
                 <tr key={r.genericPartNumber}>
                   <td style={cellPad}>
                     <button onClick={() => openFamily(r.genericPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0, fontWeight: 'bold' }}>{r.genericPartNumber}</button>
                   </td>
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(r.opnCount)}</td>
                   <td style={{ ...cellPad, textAlign: 'right', color: r.stockedOpnCount > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(r.stockedOpnCount)}</td>
+                  <td style={{ ...cellPad, textAlign: 'right', color: oosColor }}>{oosLabel}</td>
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(r.totalQuantity)}</td>
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.minNormalizedUnitPrice)}</td>
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.medianNormalizedUnitPrice)}</td>
@@ -3996,7 +4006,8 @@ function UniversePanel({ initialFilter, onClearFilter }) {
                   </td>
                   <td style={{ ...cellPad, color: '#7a96b8' }}>{fmtLifecycle(r.lifecycleSummary)}</td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

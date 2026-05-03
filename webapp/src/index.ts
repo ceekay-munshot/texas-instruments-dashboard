@@ -4282,13 +4282,27 @@ app.get('/api/ti/universe/catalog/overview', async (c) => {
 //                              `price_desc` (which actually sorted by min DESC, not max)
 //                              so the dropdown can honestly label two distinct views as
 //                              "Min price" and "Max price".
-//   out_of_stock             — fully out-of-stock GPNs first (opn_count - stocked_opn_count DESC)
+//   out_of_stock             — Phase 24E.2: out-of-stock RATIO DESC, then
+//                              absolute out-of-stock count DESC. Families
+//                              that are fully out of stock (ratio = 1.0)
+//                              surface first regardless of variant count;
+//                              "mostly OOS" families come next; tiebreaker
+//                              on absolute count keeps the largest-impact
+//                              families above tiny ones at the same ratio.
+//                              Previous semantics (absolute count DESC)
+//                              put families like CDC6C (71/92 OOS but
+//                              158k qty in the 21 stocked variants) above
+//                              fully-OOS families with smaller variant
+//                              sets — confusing to customers reading the
+//                              top row as "the most out-of-stock family".
 //   variants_desc            — by opn_count DESC (which families have the most variants)
 const GPN_LEADERBOARD_SORTS: Record<string, string> = {
   inventory_desc: 'ORDER BY COALESCE(total_quantity, 0) DESC',
   price_asc:      'ORDER BY min_normalized_unit_price IS NULL, min_normalized_unit_price ASC',
   max_price_desc: 'ORDER BY max_normalized_unit_price IS NULL, max_normalized_unit_price DESC',
-  out_of_stock:   'ORDER BY (opn_count - stocked_opn_count) DESC, opn_count DESC',
+  out_of_stock:   `ORDER BY (CAST(opn_count - stocked_opn_count AS REAL) / NULLIF(opn_count, 0)) DESC,
+                            (opn_count - stocked_opn_count) DESC,
+                            opn_count DESC`,
   variants_desc:  'ORDER BY opn_count DESC',
 }
 // Phase 24E.1 — keep `price_desc` as a quiet alias for `max_price_desc` so any
