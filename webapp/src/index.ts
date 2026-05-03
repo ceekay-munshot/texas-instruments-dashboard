@@ -3821,6 +3821,154 @@ app.get('/api/ti/universe/catalog/rollups/trend', async (c) => {
   })
 })
 
+// GET /api/ti/universe/catalog/rollups/trend/:canonicalSubcategory/detail
+// — public, sanitized.
+//
+// Phase 26 — evidence drawer for the Insights watch list. Combines the
+// per-subcategory trend deltas (latest vs previous TI Direct snapshot)
+// with the current top OPNs in that subcategory so the customer can
+// audit "which exact parts caused this basket to be flagged".
+//
+// IMPORTANT: per-OPN HISTORY does not exist yet — only per-subcategory
+// rollup history is stored (ti_catalog_rollup_history). The endpoint
+// returns the current snapshot's top OPNs as basket context, NOT as
+// per-part contribution data. partLevelHistoryAvailable is set to
+// false and partLevelHistoryNote explains the next step.
+//
+// TODO Phase 27 (or later): add ti_catalog_part_history for OPN-level
+// contributor analysis. With that table the contributors[] payload
+// would carry priceMovePct + stockMovePct per OPN; today it carries
+// the latest snapshot only.
+app.get('/api/ti/universe/catalog/rollups/trend/:canonicalSubcategory/detail', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; trend detail unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  const canonicalSubcategory = (c.req.param('canonicalSubcategory') || '').trim()
+  if (!canonicalSubcategory) {
+    return c.json({ success: false, status: 'invalid_payload', message: ':canonicalSubcategory path param required.' }, 400)
+  }
+  const predicate = listSubcategoryPredicates().find(p => p.canonicalSubcategory === canonicalSubcategory)
+  if (!predicate) {
+    return c.json({ success: false, status: 'unknown_subcategory', message: `Subcategory '${canonicalSubcategory}' is not in the canonical mapping list.` }, 404)
+  }
+
+  // ── Trend deltas (latest vs previous snapshot, scoped to this subcategory).
+  type HistoryRow = {
+    captured_at: string
+    canonical_group: string
+    median_normalized_unit_price: number | null
+    total_quantity: number | null
+    priced_opn_count: number
+    stocked_opn_count: number
+    opn_count: number
+  }
+  const history = await d1.prepare(
+    `SELECT captured_at, canonical_group,
+            median_normalized_unit_price, total_quantity,
+            priced_opn_count, stocked_opn_count, opn_count
+       FROM ti_catalog_rollup_history
+      WHERE canonical_subcategory = ?
+        AND captured_at >= datetime('now', '-30 days')
+      ORDER BY captured_at DESC
+      LIMIT 30`,
+  ).bind(canonicalSubcategory).all<HistoryRow>()
+  const hs = history.results ?? []
+  const latest = hs[0] ?? null
+  const previous = hs[1] ?? null
+  const snapshotCount = hs.length
+  const hasEnoughHistory = snapshotCount >= 2
+  const trendConfidence = snapshotCount >= 7 ? 'weekly' : snapshotCount >= 2 ? 'daily' : 'insufficient'
+  function pctDelta(latestV: number | null, prevV: number | null): number | null {
+    if (latestV == null || prevV == null) return null
+    if (!Number.isFinite(latestV) || !Number.isFinite(prevV)) return null
+    if (prevV === 0) return null
+    return Math.round(((latestV - prevV) / prevV) * 1000) / 10
+  }
+  const priceDeltaPct = pctDelta(latest?.median_normalized_unit_price ?? null, previous?.median_normalized_unit_price ?? null)
+  const stockDeltaPct = pctDelta(latest?.total_quantity ?? null, previous?.total_quantity ?? null)
+
+  // Classify using the same thresholds as the Insights tab.
+  function classifySignal(p: number | null, s: number | null): string {
+    if (p == null || s == null) return 'insufficient_history'
+    if (p >= 2 && s <= -20) return 'shortage_risk'
+    if (p > -1 && p < 2 && s <= -30) return 'early_shortage_watch'
+    if (p <= -2 && s >= 30) return 'oversupply_easing'
+    if (p >= 2 && s >= 10) return 'pricing_power_mixed'
+    if (p <= -2 && s <= -10) return 'weak_unclear'
+    return 'stable'
+  }
+  const signal = hasEnoughHistory ? classifySignal(priceDeltaPct, stockDeltaPct) : 'insufficient_history'
+
+  // ── Current top OPNs in this subcategory (latest snapshot only). For
+  //    shortage rows, sort by lowest current quantity DESC = lowest stock
+  //    surfaces first; for oversupply, sort by highest quantity DESC. For
+  //    everything else just sort by quantity DESC. Capped at 10 rows.
+  const where = predicate.whereClause
+  let opnOrder = 'quantity DESC NULLS LAST'
+  if (signal === 'shortage_risk' || signal === 'early_shortage_watch') {
+    opnOrder = 'quantity ASC NULLS LAST'  // most-depleted first as a proxy
+  }
+  type OpnRow = {
+    ti_part_number: string
+    generic_part_number: string | null
+    description: string | null
+    quantity: number | null
+    normalized_unit_price: number | null
+    currency: string | null
+    lifecycle: string | null
+  }
+  const opns = await d1.prepare(
+    `SELECT ti_part_number, generic_part_number, description,
+            quantity, normalized_unit_price, currency, lifecycle
+       FROM ti_catalog_latest_opn
+      WHERE ${where}
+      ORDER BY ${opnOrder}, ti_part_number ASC
+      LIMIT 10`,
+  ).all<OpnRow>()
+
+  const contributors = (opns.results ?? []).map((o: OpnRow) => ({
+    tiPartNumber: o.ti_part_number,
+    genericPartNumber: o.generic_part_number,
+    description: o.description,
+    // Latest snapshot only — no priceMovePct / stockMovePct yet (per-OPN
+    // history not stored). UI surfaces the explicit unavailable note.
+    latestQuantity: o.quantity,
+    latestNormalizedUnitPrice: o.normalized_unit_price,
+    currency: o.currency,
+    lifeCycle: o.lifecycle,
+    source: 'TI Direct',
+  }))
+
+  return c.json({
+    success: true,
+    backend: 'd1',
+    canonicalSubcategory,
+    canonicalGroup: latest?.canonical_group ?? null,
+    latestSnapshotAt: latest?.captured_at ?? null,
+    previousSnapshotAt: previous?.captured_at ?? null,
+    latestPrice: latest?.median_normalized_unit_price ?? null,
+    previousPrice: previous?.median_normalized_unit_price ?? null,
+    latestStock: latest?.total_quantity ?? null,
+    previousStock: previous?.total_quantity ?? null,
+    priceDeltaPct,
+    stockDeltaPct,
+    snapshotCount,
+    hasEnoughHistory,
+    trendConfidence,
+    signal,
+    // Phase 26 — per-OPN history not stored yet. contributors[] carries
+    // the current snapshot's top OPNs as basket context only; their
+    // priceMovePct / stockMovePct fields will be added in a later phase
+    // once ti_catalog_part_history exists.
+    partLevelHistoryAvailable: false,
+    partLevelHistoryNote: 'Part-level history is not yet stored. Current signal is based on TI Direct subcategory rollup history. Future: add ti_catalog_part_history for OPN-level contributor analysis.',
+    contributors,
+    note: 'Phase 26 — evidence drawer payload. Distributor data is never blended into these numbers.',
+  })
+})
+
 // GET /api/ti/universe/catalog/rollups/quality — public, sanitized.
 //
 // Phase 24C.2 — operator + customer-facing diagnostic that surfaces

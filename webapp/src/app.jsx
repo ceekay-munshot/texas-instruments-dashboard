@@ -3193,10 +3193,44 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
   // single snapshot.
   const sig = useMemo(() => computeSignal(liveData), [liveData]);
   const fmtPct = v => (v == null || !Number.isFinite(v)) ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+  const fmtN = n => (n == null ? '—' : Number(n).toLocaleString());
+  const fmtPrice = n => (n == null ? '—' : `$${Number(n).toFixed(4)}`);
+  const fmtDate = iso => { if (!iso) return '—'; try { return new Date(iso).toISOString().slice(0,10); } catch { return iso; } };
 
   const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 10 };
   const card = { background: '#0c1426', border: '1px solid #1a2740', borderRadius: 6, padding: '14px 16px' };
+
+  // ── Phase 26 — evidence drawer state ──────────────────────────────────
+  // openId is the legacy CAT id (e.g. 'pm_ldo'); we resolve canonical via
+  // combinedEvidence.legacyToCanonical to call /rollups/trend/:c/detail.
+  const [openId, setOpenId] = useState(null);
+  const [evidenceDetail, setEvidenceDetail] = useState(null);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [evidenceError, setEvidenceError] = useState(null);
+  const openCanonical = openId ? (combinedEvidence?.legacyToCanonical?.[openId] || null) : null;
+  useEffect(() => {
+    if (!openCanonical) { setEvidenceDetail(null); setEvidenceError(null); return; }
+    let cancelled = false;
+    (async () => {
+      setEvidenceLoading(true); setEvidenceError(null);
+      try {
+        const res = await fetch(`/api/ti/universe/catalog/rollups/trend/${encodeURIComponent(openCanonical)}/detail`);
+        const json = await res.json();
+        if (cancelled) return;
+        if (!res.ok || !json?.success) {
+          setEvidenceDetail(null);
+          setEvidenceError(json?.message || `HTTP ${res.status}`);
+        } else {
+          setEvidenceDetail(json);
+        }
+      } catch (e) {
+        if (!cancelled) setEvidenceError(e?.message || String(e));
+      }
+      if (!cancelled) setEvidenceLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [openCanonical]);
 
   // ── Per-cell trend classification ──────────────────────────────────────
   // For each visible Mouser-live category, we already have a price delta
@@ -3411,9 +3445,15 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
               {top5.map(r => {
                 const badge = signalBadge(r.signal);
                 const priceColor = r.priceDeltaPct >= 0 ? '#00c9a7' : '#f05c5c';
+                const isOpen = openId === r.id;
                 return (
-                  <tr key={r.id} style={{ borderBottom: '1px solid #0d1520' }}>
-                    <td style={{ padding: '8px 12px', color: '#e0eaf8' }}>{r.subcategory}</td>
+                  <tr key={r.id}
+                      onClick={() => setOpenId(isOpen ? null : r.id)}
+                      style={{ borderBottom: '1px solid #0d1520', cursor: 'pointer', background: isOpen ? '#0c1426' : 'transparent' }}>
+                    <td style={{ padding: '8px 12px', color: '#e0eaf8' }}>
+                      <span style={{ color: '#3d8ef0', marginRight: 6, fontFamily: 'monospace', fontSize: '0.7rem' }}>{isOpen ? '▼' : '▶'}</span>
+                      {r.subcategory}
+                    </td>
                     <td style={{ padding: '8px 12px', textAlign: 'right', color: priceColor, fontWeight: Math.abs(r.priceDeltaPct) >= 5 ? 'bold' : 'normal' }}>{fmtPct(r.priceDeltaPct)}</td>
                     <td style={{ padding: '8px 12px', textAlign: 'right', color: r.stockDeltaPct == null ? '#7a96b8' : (r.stockDeltaPct >= 0 ? '#4dffc3' : '#ff7575'), fontWeight: r.stockDeltaPct != null && Math.abs(r.stockDeltaPct) >= 10 ? 'bold' : 'normal' }}>{r.stockDeltaPct == null ? 'pending' : fmtPct(r.stockDeltaPct)}</td>
                     <td style={{ padding: '8px 12px', color: badge.color }}>{badge.label}</td>
@@ -3424,6 +3464,121 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
             </tbody>
           </table>
         </div>
+
+        {/* Phase 26 — evidence drawer. Shown beneath the watch table when
+            a row is clicked. Resolves the legacy id to its canonical
+            subcategory and fetches /rollups/trend/:c/detail. Each section
+            stays compact: basket summary · why-flagged sentence · top
+            OPNs context (with honest note that per-OPN history isn't
+            stored yet). */}
+        {openId && (() => {
+          const watchRow = top5.find(r => r.id === openId);
+          if (!watchRow) return null;
+          const detail = evidenceDetail;
+          const badge = signalBadge(watchRow.signal);
+          const reason = (() => {
+            const p = detail?.priceDeltaPct ?? watchRow.priceDeltaPct;
+            const s = detail?.stockDeltaPct ?? watchRow.stockDeltaPct;
+            const sigKey = detail?.signal ?? watchRow.signal;
+            const fmtAbs = v => (v == null ? '—' : `${Math.abs(v).toFixed(1)}%`);
+            switch (sigKey) {
+              case 'shortage_risk':
+                return `TI price rose by ${fmtAbs(p)} while TI stock fell by ${fmtAbs(s)}, which suggests tightening supply.`;
+              case 'early_shortage_watch':
+                return `TI stock fell sharply by ${fmtAbs(s)} while price stayed near flat at ${fmtPct(p)} — early shortage watch.`;
+              case 'oversupply_easing':
+                return `TI price fell by ${fmtAbs(p)} while TI stock rose by ${fmtAbs(s)}, which suggests supply is easing.`;
+              case 'pricing_power_mixed':
+                return 'Both TI price and stock rose; this may indicate demand is absorbing supply.';
+              case 'weak_unclear':
+                return 'Both TI price and stock fell; this may reflect weaker demand or part-specific cleanup.';
+              case 'stable':
+                return `TI price moved ${fmtPct(p)} and TI stock moved ${fmtPct(s)} — within stable thresholds.`;
+              default:
+                return 'Needs at least 2 TI Direct snapshots before trend can be confirmed.';
+            }
+          })();
+          return (
+            <div style={{ ...card, marginTop: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                  Evidence · {watchRow.subcategory} <span style={{ color: badge.color, marginLeft: 6 }}>{badge.label}</span>
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); setOpenId(null); }} style={{ background: 'none', border: '1px solid #1a2740', color: '#7a96b8', cursor: 'pointer', fontFamily: 'monospace', padding: '3px 8px', fontSize: '0.6rem', borderRadius: 4 }}>close</button>
+              </div>
+              {evidenceLoading && <div style={{ color: '#7a96b8', fontSize: '0.7rem' }}>Loading evidence…</div>}
+              {evidenceError && <div style={{ color: '#ffb0b0', fontSize: '0.7rem' }}>Detail unavailable: {evidenceError}</div>}
+              {detail && (
+                <>
+                  {/* 1. Basket summary */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 10, fontSize: '0.7rem', fontFamily: 'monospace', marginBottom: 10 }}>
+                    <div><span style={{ color: '#7a96b8' }}>Basket: </span><span style={{ color: '#e0eaf8' }}>{detail.canonicalGroup ? `${detail.canonicalGroup} / ` : ''}{detail.canonicalSubcategory}</span></div>
+                    <div><span style={{ color: '#7a96b8' }}>Latest snapshot: </span>{fmtDate(detail.latestSnapshotAt)}</div>
+                    <div><span style={{ color: '#7a96b8' }}>Previous snapshot: </span>{fmtDate(detail.previousSnapshotAt)}</div>
+                    <div><span style={{ color: '#7a96b8' }}>TI price move: </span><span style={{ color: detail.priceDeltaPct == null ? '#7a96b8' : (detail.priceDeltaPct >= 0 ? '#00c9a7' : '#f05c5c'), fontWeight: 'bold' }}>{fmtPct(detail.priceDeltaPct)}</span></div>
+                    <div><span style={{ color: '#7a96b8' }}>TI stock move: </span><span style={{ color: detail.stockDeltaPct == null ? '#7a96b8' : (detail.stockDeltaPct >= 0 ? '#4dffc3' : '#ff7575'), fontWeight: 'bold' }}>{detail.stockDeltaPct == null ? 'pending' : fmtPct(detail.stockDeltaPct)}</span></div>
+                    <div><span style={{ color: '#7a96b8' }}>Snapshots stored: </span>{detail.snapshotCount}</div>
+                    <div><span style={{ color: '#7a96b8' }}>Trend confidence: </span><span style={{ color: detail.trendConfidence === 'weekly' ? '#4dffc3' : detail.trendConfidence === 'daily' ? '#00c9a7' : '#7a96b8' }}>{detail.trendConfidence}</span></div>
+                  </div>
+                  {/* tiny 2-point sparkline-as-text — keeps it honest, no chart lib */}
+                  {detail.previousPrice != null && detail.latestPrice != null && (
+                    <div style={{ fontSize: '0.65rem', fontFamily: 'monospace', color: '#7a96b8', marginBottom: 10 }}>
+                      Price: {fmtPrice(detail.previousPrice)} → {fmtPrice(detail.latestPrice)}
+                      {' · '}
+                      Stock: {fmtN(detail.previousStock)} → {fmtN(detail.latestStock)}
+                    </div>
+                  )}
+
+                  {/* 2. Why this was flagged */}
+                  <div style={{ background: '#080c14', border: '1px solid #1a2740', borderRadius: 4, padding: '10px 12px', marginBottom: 10, fontSize: '0.74rem', color: '#c4d4e8', lineHeight: 1.5 }}>
+                    <span style={{ color: '#7a96b8', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', marginRight: 6 }}>Why flagged</span>
+                    {reason}
+                  </div>
+
+                  {/* 3. Part-level evidence — honestly unavailable today */}
+                  <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
+                    Top OPNs in this basket {detail.contributors?.length > 0 ? `(${detail.contributors.length}, latest snapshot)` : ''}
+                  </div>
+                  {detail.partLevelHistoryAvailable === false && (
+                    <div style={{ fontSize: '0.65rem', color: '#7a96b8', fontStyle: 'italic', marginBottom: 8 }}>
+                      Part-level history is not yet stored. Current signal is based on TI Direct subcategory rollup history.
+                    </div>
+                  )}
+                  {Array.isArray(detail.contributors) && detail.contributors.length > 0 ? (
+                    <div style={{ background: '#080c14', border: '1px solid #1a2740', borderRadius: 4, overflow: 'auto', maxHeight: 240 }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.6rem', fontFamily: 'monospace' }}>
+                        <thead>
+                          <tr style={{ background: '#0c1426' }}>
+                            <th style={{ padding: '6px 10px', textAlign: 'left',  color: '#7a96b8', borderBottom: '1px solid #1a2740' }}>OPN</th>
+                            <th style={{ padding: '6px 10px', textAlign: 'left',  color: '#7a96b8', borderBottom: '1px solid #1a2740' }}>GPN</th>
+                            <th style={{ padding: '6px 10px', textAlign: 'right', color: '#7a96b8', borderBottom: '1px solid #1a2740' }}>Latest qty</th>
+                            <th style={{ padding: '6px 10px', textAlign: 'right', color: '#7a96b8', borderBottom: '1px solid #1a2740' }}>Latest price</th>
+                            <th style={{ padding: '6px 10px', textAlign: 'left',  color: '#7a96b8', borderBottom: '1px solid #1a2740' }}>Lifecycle</th>
+                            <th style={{ padding: '6px 10px', textAlign: 'left',  color: '#7a96b8', borderBottom: '1px solid #1a2740' }}>Source</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {detail.contributors.map(c => (
+                            <tr key={c.tiPartNumber} style={{ borderBottom: '1px solid #0d1520' }}>
+                              <td style={{ padding: '6px 10px', color: '#e0eaf8' }}>{c.tiPartNumber}</td>
+                              <td style={{ padding: '6px 10px', color: '#7a96b8' }}>{c.genericPartNumber || '—'}</td>
+                              <td style={{ padding: '6px 10px', textAlign: 'right', color: c.latestQuantity > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(c.latestQuantity)}</td>
+                              <td style={{ padding: '6px 10px', textAlign: 'right' }}>{fmtPrice(c.latestNormalizedUnitPrice)}</td>
+                              <td style={{ padding: '6px 10px', color: '#a0b8d0' }}>{c.lifeCycle || '—'}</td>
+                              <td style={{ padding: '6px 10px', color: '#7a96b8' }}>{c.source}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '0.65rem', color: '#7a96b8', fontStyle: 'italic' }}>No OPNs are mapped to this canonical subcategory yet.</div>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* ── 4. Data Center Power Watch ──────────────────────────────── */}
