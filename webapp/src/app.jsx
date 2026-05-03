@@ -5034,18 +5034,21 @@ function App(){
         })}
       </div>
 
-      {/* ── Simplified legend (Phase 19B) ── */}
-      <div style={{display:'flex',gap:14,padding:'5px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.6rem',color:'#7a96b8',flexWrap:'wrap',background:'#050810',alignItems:'center'}}>
-        <span style={{color:'#00c9a7'}}>■ positive</span>
-        <span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
-        <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ ≥5%</span>
-        {/* Phase 24E — investor framing: TI Direct is canonical;
-            distributors are channel corroboration + fallback. */}
-        <span style={{color:'#4a6a8a'}}>· Historical = QoQ %; Live row tick = Mouser real-time channel · TI Direct catalog is the canonical state · hover any cell for detail</span>
-        <span style={{color:'#4dffc3'}}>· <sup style={{fontSize:'0.55rem'}}>TI</sup>=Direct full-catalog rollup (primary, clean)</span>
-        <span style={{color:'#f0a84e'}}>· <sup style={{fontSize:'0.55rem',opacity:0.55}}>TI?</sup>=broad mapping (use as context, not signal)</span>
-        <span style={{color:'#7a96b8'}}>· TI Direct is the canonical source. Distributor APIs (Mouser / Nexar / DigiKey) are used only for channel corroboration and fallback. Forward history requires stored TI snapshots — backfill rows are channel-derived.</span>
+      {/* ── Customer-facing legend (clean) ── */}
+      <div style={{display:'flex',gap:18,padding:'7px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.62rem',color:'#7a96b8',flexWrap:'wrap',background:'#050810',alignItems:'center'}}>
+        <span><span style={{color:'#00c9a7'}}>■</span> Price increase</span>
+        <span><span style={{color:'#f05c5c'}}>■</span> Price decrease</span>
+        <span style={{color:'#4a6a8a'}}>· Quarterly rows show QoQ price movement</span>
+        <span style={{color:'#4a6a8a'}}>· Live row shows latest available channel check</span>
       </div>
+
+      {/* ── Sources & methodology (collapsed) ── */}
+      <details style={{borderBottom:`1px solid #0d1520`,background:'#050810'}}>
+        <summary style={{padding:'6px 16px',fontSize:'0.6rem',color:'#4a6a8a',cursor:'pointer',letterSpacing:'0.06em',textTransform:'uppercase',userSelect:'none'}}>Sources &amp; methodology</summary>
+        <div style={{padding:'4px 16px 10px',fontSize:'0.62rem',color:'#7a96b8',lineHeight:1.5,maxWidth:880}}>
+          TI Direct is treated as the primary catalog source. Distributor APIs are used for channel checks and fallback validation. Historical rows are quarterly price movements; the live row reflects the latest available channel check.
+        </div>
+      </details>
 
       {/* ── Table ── */}
       <div style={{overflowX:'auto',position:'relative',zIndex:1}}>
@@ -5081,7 +5084,7 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ LIVE — MOUSER QTY=1 vs LATEST BASELINE · Q1-26 CLOSE CAPTURED 28-APR-26 {fetchedAt?`· fetched ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
+                  <span>▼ LIVE {fetchedAt?`· checked ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
                   {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
                 </div>
               </td>
@@ -5159,7 +5162,7 @@ function App(){
                     onClick={handleClick}
                     title={isRLCell?'Rate limited — will retry automatically':hasTiRollup?'Click to inspect mapped TI parts in Universe tab':undefined}
                     style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:handleClick?'pointer':hasTooltip?'crosshair':'default'}}>
-                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}{hasTiRollup&&<sup style={{fontSize:'0.42rem',color:tiBadgeColor,marginLeft:1,opacity:tiBadgeOpacity}} title={tiBadgeTitle}>{tiUsable ? 'TI' : 'TI?'}</sup>}
+                    {txt}
                   </td>
                 );
               })}
@@ -5209,8 +5212,8 @@ function App(){
 
       {/* Slim global footer */}
       <div style={{padding:'8px 16px 14px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
-        <span>USD · qty=1 · {HP.length} verified quarters + live</span>
-        <span>TI Product Price Intelligence · Professional use only</span>
+        <span>USD · {HP.length} quarters of history + live</span>
+        <span>TI Product Price Intelligence</span>
       </div>
     </div>
   );
