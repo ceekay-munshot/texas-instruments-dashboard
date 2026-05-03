@@ -3178,7 +3178,7 @@ function InventoryPanel() {
 // ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
 // Shows only what answers the customer's question: are prices moving, by how
 // much, where, and any outliers. Hides empty sections. No operator chrome.
-function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, tiStatus, tiRollupsByCanonical }) {
+function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, tiStatus, tiRollupsByCanonical, tiTrendByCanonical }) {
   // Phase 24F — customer-focused Insights tab. The previous panel had an
   // operator/admin slant (TI Direct API token status, X-Capture-Secret-
   // gated controls, raw watched-parts table, source agreement matrix).
@@ -3222,18 +3222,32 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
   }
 
   // Build per-cell rows: every visible CAT mapped to its canonical
-  // subcategory, current TI Direct stock + price (canonical state) AND
-  // current Mouser channel-tick price delta. stockDeltaPct stays null
-  // until ≥2 TI Direct snapshots are stored.
+  // subcategory. Phase 25 — when a TI Direct snapshot trend is available
+  // for the canonical subcategory we use the TI-only deltas (price &
+  // stock) as the source of truth for shortage classification. Mouser
+  // channel-tick price delta is kept as a fallback row-level signal so
+  // the watch list still surfaces something pre-history. Distributor
+  // data is never blended into TI Direct truth — once a TI delta is
+  // present the classifier uses it exclusively.
   const cellRows = useMemo(() => {
     return CATS.map(c => {
       const live = liveData?.[c.id];
-      const priceDeltaPct = (live && Number.isFinite(live.qoqPct)) ? Number(live.qoqPct) : null;
+      const channelPriceDeltaPct = (live && Number.isFinite(live.qoqPct)) ? Number(live.qoqPct) : null;
       const canonical = combinedEvidence?.legacyToCanonical?.[c.id] || null;
       const tiRollup = canonical ? tiRollupsByCanonical?.[canonical] : null;
       const tiUsable = tiRollup?.usableForPricesLiveEvidence === true;
-      const stockDeltaPct = null; // requires ≥2 stored TI Direct snapshots
-      const signal = classify(priceDeltaPct, stockDeltaPct);
+      const trend = canonical ? tiTrendByCanonical?.[canonical] : null;
+      // Prefer TI-only deltas when ≥2 snapshots stored. Otherwise the
+      // row is "insufficient_history" and we surface the channel price
+      // tick purely so the watch list can still rank loudest movers
+      // honestly (badge copy says "stock trend pending").
+      const tiPriceDeltaPct = trend?.hasEnoughHistory ? (trend.priceDeltaPct ?? null) : null;
+      const tiStockDeltaPct = trend?.hasEnoughHistory ? (trend.stockDeltaPct ?? null) : null;
+      const priceDeltaPct = tiPriceDeltaPct != null ? tiPriceDeltaPct : channelPriceDeltaPct;
+      const stockDeltaPct = tiStockDeltaPct;
+      const signal = trend?.hasEnoughHistory
+        ? classify(tiPriceDeltaPct, tiStockDeltaPct)
+        : 'insufficient_history';
       return {
         id: c.id,
         group: c.g,
@@ -3242,10 +3256,13 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
         stockDeltaPct,
         latestStock: tiRollup ? Number(tiRollup.totalQuantity || 0) : null,
         tiUsable,
+        snapshotCount: trend?.snapshotCount ?? 0,
+        trendConfidence: trend?.trendConfidence ?? 'insufficient',
+        priceSourceLabel: tiPriceDeltaPct != null ? 'TI Direct' : (channelPriceDeltaPct != null ? 'Mouser channel' : null),
         signal,
       };
     });
-  }, [liveData, combinedEvidence, tiRollupsByCanonical]);
+  }, [liveData, combinedEvidence, tiRollupsByCanonical, tiTrendByCanonical]);
 
   // ── 1. Shortage / Oversupply readout ──────────────────────────────────
   const counts = cellRows.reduce((acc, r) => {
@@ -3257,6 +3274,12 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
     return acc;
   }, { shortage: 0, oversupply: 0, mixed: 0, stable: 0, insufficient: 0 });
   const trendHistoryReady = counts.insufficient < cellRows.length;
+  // Phase 25 — confidence ladder: weekly (≥7 snapshots on the maxed-out
+  // subcategory) → daily (≥2) → insufficient. Take the strongest
+  // available across the canonical set so the headline reflects the
+  // best signal, not the weakest.
+  const maxSnapshotCount = cellRows.reduce((m, r) => Math.max(m, r.snapshotCount || 0), 0);
+  const overallTrendConfidence = maxSnapshotCount >= 7 ? 'weekly' : maxSnapshotCount >= 2 ? 'daily' : 'insufficient';
   const headlineSentence = trendHistoryReady
     ? `Latest TI Direct snapshots show ${counts.shortage} shortage-risk basket${counts.shortage===1?'':'s'} and ${counts.oversupply} oversupply/easing basket${counts.oversupply===1?'':'s'} across ${cellRows.length} monitored categories.`
     : `Latest source snapshot shows ${sig?.tone ? sig.tone.toLowerCase() : 'mixed'} price action. Stock-price trend detection will start after multiple TI Direct snapshots are stored.`;
@@ -3286,12 +3309,16 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
                     : 'price roughly flat';
       return `${r.subcategory}: ${dirText}; stock trend pending — watch for shortage/oversupply confirmation after the next TI Direct snapshot.`;
     }
-    if (r.signal === 'shortage_risk') return `${r.subcategory}: price rising while stock falls — clean shortage signal.`;
-    if (r.signal === 'early_shortage_watch') return `${r.subcategory}: stock falling sharply with prices still flat — early shortage watch.`;
-    if (r.signal === 'oversupply_easing') return `${r.subcategory}: prices easing while stock builds — supply unwinding.`;
-    if (r.signal === 'pricing_power_mixed') return `${r.subcategory}: prices and stock both rising — pricing power, demand absorbing supply.`;
-    if (r.signal === 'weak_unclear') return `${r.subcategory}: both price and stock weak — demand softening.`;
-    return `${r.subcategory}: stable.`;
+    // Phase 25 — snapshot-backed rows quote the actual TI deltas so the
+    // copy is auditable. fmtPct already adds the sign.
+    const pStr = fmtPct(r.priceDeltaPct);
+    const sStr = fmtPct(r.stockDeltaPct);
+    if (r.signal === 'shortage_risk') return `${r.subcategory}: TI price ${pStr} while TI stock ${sStr} — clean shortage signal.`;
+    if (r.signal === 'early_shortage_watch') return `${r.subcategory}: TI stock ${sStr} with prices still ${pStr} — early shortage watch.`;
+    if (r.signal === 'oversupply_easing') return `${r.subcategory}: TI price ${pStr} while TI stock ${sStr} — supply unwinding.`;
+    if (r.signal === 'pricing_power_mixed') return `${r.subcategory}: TI price ${pStr} and TI stock ${sStr} both rising — pricing power, demand absorbing supply.`;
+    if (r.signal === 'weak_unclear') return `${r.subcategory}: TI price ${pStr} and TI stock ${sStr} both weak — demand softening.`;
+    return `${r.subcategory}: stable (TI price ${pStr} · TI stock ${sStr}).`;
   }
   function signalBadge(s) {
     switch (s) {
@@ -3388,7 +3415,7 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
                   <tr key={r.id} style={{ borderBottom: '1px solid #0d1520' }}>
                     <td style={{ padding: '8px 12px', color: '#e0eaf8' }}>{r.subcategory}</td>
                     <td style={{ padding: '8px 12px', textAlign: 'right', color: priceColor, fontWeight: Math.abs(r.priceDeltaPct) >= 5 ? 'bold' : 'normal' }}>{fmtPct(r.priceDeltaPct)}</td>
-                    <td style={{ padding: '8px 12px', textAlign: 'right', color: '#7a96b8' }}>pending</td>
+                    <td style={{ padding: '8px 12px', textAlign: 'right', color: r.stockDeltaPct == null ? '#7a96b8' : (r.stockDeltaPct >= 0 ? '#4dffc3' : '#ff7575'), fontWeight: r.stockDeltaPct != null && Math.abs(r.stockDeltaPct) >= 10 ? 'bold' : 'normal' }}>{r.stockDeltaPct == null ? 'pending' : fmtPct(r.stockDeltaPct)}</td>
                     <td style={{ padding: '8px 12px', color: badge.color }}>{badge.label}</td>
                     <td style={{ padding: '8px 12px', color: '#a0b8d0' }}>{whyItMatters(r)}</td>
                   </tr>
@@ -3400,23 +3427,35 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
       </div>
 
       {/* ── 4. Data Center Power Watch ──────────────────────────────── */}
-      <div style={sectionWrap}>
-        <div style={sectionTitle}>Data Center Power Watch</div>
-        <div style={card}>
-          <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: '0.74rem', fontFamily: 'monospace', marginBottom: 8 }}>
-            <div><span style={{ color: '#7a96b8' }}>Average price move: </span><span style={{ color: dcpAvg != null && dcpAvg >= 0 ? '#00c9a7' : '#f05c5c', fontWeight: 'bold' }}>{fmtPct(dcpAvg)}</span></div>
-            <div><span style={{ color: '#7a96b8' }}>Average stock move: </span><span style={{ color: '#7a96b8' }}>pending</span></div>
-            <div><span style={{ color: '#7a96b8' }}>Top affected: </span><span style={{ color: '#e0eaf8' }}>{dcpTop ? dcpTop.subcategory : '—'}</span></div>
+      {(() => {
+        // Phase 25 — surface real avg stock move when ≥1 DCP subcategory
+        // has stock-delta data; otherwise keep "pending".
+        const dcpStockRows = dcpRows.filter(r => r.stockDeltaPct != null);
+        const dcpStockAvg = dcpStockRows.length > 0
+          ? dcpStockRows.reduce((s, r) => s + r.stockDeltaPct, 0) / dcpStockRows.length
+          : null;
+        return (
+          <div style={sectionWrap}>
+            <div style={sectionTitle}>Data Center Power Watch</div>
+            <div style={card}>
+              <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: '0.74rem', fontFamily: 'monospace', marginBottom: 8 }}>
+                <div><span style={{ color: '#7a96b8' }}>Average price move: </span><span style={{ color: dcpAvg != null && dcpAvg >= 0 ? '#00c9a7' : '#f05c5c', fontWeight: 'bold' }}>{fmtPct(dcpAvg)}</span></div>
+                <div><span style={{ color: '#7a96b8' }}>Average stock move: </span><span style={{ color: dcpStockAvg == null ? '#7a96b8' : (dcpStockAvg >= 0 ? '#4dffc3' : '#ff7575'), fontWeight: dcpStockAvg != null ? 'bold' : 'normal' }}>{dcpStockAvg == null ? 'pending' : fmtPct(dcpStockAvg)}</span></div>
+                <div><span style={{ color: '#7a96b8' }}>Top affected: </span><span style={{ color: '#e0eaf8' }}>{dcpTop ? dcpTop.subcategory : '—'}</span></div>
+              </div>
+              <div style={{ fontSize: '0.78rem', color: '#c4d4e8', lineHeight: 1.5 }}>
+                {dcpRows.length === 0
+                  ? 'No live Data Center Power data yet — waiting for Mouser channel tick.'
+                  : dcpStockAvg != null && dcpTop
+                    ? `Data Center Power is showing a ${fmtPct(dcpAvg)} average price move and ${fmtPct(dcpStockAvg)} average stock move, led by ${dcpTop.subcategory} (price ${fmtPct(dcpTop.priceDeltaPct)}${dcpTop.stockDeltaPct != null ? ` · stock ${fmtPct(dcpTop.stockDeltaPct)}` : ''}).`
+                    : dcpAvg != null && dcpAvg >= 0.5 && dcpTop
+                      ? `Data Center Power is showing a ${fmtPct(dcpAvg)} average price move, led by ${dcpTop.subcategory} at ${fmtPct(dcpTop.priceDeltaPct)}. Stock-trend confirmation requires another TI Direct snapshot.`
+                      : `Data Center Power price action is muted (${fmtPct(dcpAvg)} avg). Stock-trend confirmation requires another TI Direct snapshot.`}
+              </div>
+            </div>
           </div>
-          <div style={{ fontSize: '0.78rem', color: '#c4d4e8', lineHeight: 1.5 }}>
-            {dcpRows.length === 0
-              ? 'No live Data Center Power data yet — waiting for Mouser channel tick.'
-              : dcpAvg != null && dcpAvg >= 0.5 && dcpTop
-                ? `Data Center Power is showing a ${fmtPct(dcpAvg)} average price move, led by ${dcpTop.subcategory} at ${fmtPct(dcpTop.priceDeltaPct)}. Stock-trend confirmation requires another TI Direct snapshot.`
-                : `Data Center Power price action is muted (${fmtPct(dcpAvg)} avg). Stock-trend confirmation requires another TI Direct snapshot.`}
-          </div>
-        </div>
-      </div>
+        );
+      })()}
 
       {/* ── 5. Source Confidence ────────────────────────────────────── */}
       <div style={sectionWrap}>
@@ -3429,7 +3468,7 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
       {/* ── Slim footer ────────────────────────────────────────────── */}
       <div style={{ padding: '10px 16px', borderTop: '1px solid #0d1520', background: '#050810', fontSize: '0.62rem', color: '#7a96b8', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
         <span>Baseline: {baselineMeta?.baselinePeriodLabel || 'Q1-26 close'} captured {baselineMeta?.baselineDate || '2026-04-28'}</span>
-        <span>Stock trend status: <span style={{ color: trendHistoryReady ? '#4dffc3' : '#7a96b8' }}>{trendHistoryReady ? 'ready' : 'pending — needs ≥2 TI Direct snapshots'}</span></span>
+        <span>Stock trend status: <span style={{ color: overallTrendConfidence === 'weekly' ? '#4dffc3' : overallTrendConfidence === 'daily' ? '#00c9a7' : '#7a96b8' }}>{overallTrendConfidence === 'weekly' ? `weekly confidence (${maxSnapshotCount} snapshots stored)` : overallTrendConfidence === 'daily' ? `daily confidence (${maxSnapshotCount} snapshots stored)` : 'pending — needs ≥2 TI Direct snapshots'}</span></span>
       </div>
     </>
   );
@@ -4239,6 +4278,12 @@ function App(){
   // Phase 24C: TI Direct full-catalog rollups indexed by canonical
   // subcategory id. Populated once on mount; never causes a TI call.
   const [tiRollupsByCanonical,setTiRollupsByCanonical]=useState({});
+  // Phase 25 — TI Direct stock+price trend per canonical subcategory.
+  // Empty {} until ≥1 history row exists per subcategory. Rich row carries
+  // priceDeltaPct + stockDeltaPct + snapshotCount + hasEnoughHistory +
+  // trendConfidence ('insufficient' | 'daily' | 'weekly'). Drives the
+  // Insights tab's shortage/oversupply classifier.
+  const [tiTrendByCanonical,setTiTrendByCanonical]=useState({});
   // Phase 19B — two-tab UI. 'prices' is the customer-facing default;
   // 'insights' holds source agreement, signal summary, and operator status.
   const [activeTab,setActiveTab]=useState('prices');
@@ -4423,7 +4468,7 @@ function App(){
     let cancelled = false;
     (async () => {
       try {
-        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes, tiStatusRes, tiRollupsRes] = await Promise.allSettled([
+        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes, tiStatusRes, tiRollupsRes, tiTrendRes] = await Promise.allSettled([
           fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/latest').then(r => r.ok ? r.json() : null),
@@ -4433,6 +4478,10 @@ function App(){
           // Phase 24C — TI Direct rollups for the Live row tooltip badge.
           // ?limit=200 covers all 28 canonical subcategories with headroom.
           fetch('/api/ti/universe/catalog/rollups/latest?limit=200').then(r => r.ok ? r.json() : null),
+          // Phase 25 — TI Direct stock+price trend per canonical subcategory.
+          // Drives the Insights tab's shortage/oversupply classifier once
+          // ≥2 history snapshots exist.
+          fetch('/api/ti/universe/catalog/rollups/trend').then(r => r.ok ? r.json() : null),
         ]);
         if (cancelled) return;
         if (latestRes.status === 'fulfilled' && latestRes.value) {
@@ -4469,6 +4518,13 @@ function App(){
             if (r?.canonicalSubcategory) map[r.canonicalSubcategory] = r;
           }
           setTiRollupsByCanonical(map);
+        }
+        if (tiTrendRes.status === 'fulfilled' && tiTrendRes.value && Array.isArray(tiTrendRes.value.subcategories)) {
+          const map = {};
+          for (const s of tiTrendRes.value.subcategories) {
+            if (s?.canonicalSubcategory) map[s.canonicalSubcategory] = s;
+          }
+          setTiTrendByCanonical(map);
         }
       } catch (_) { /* silent */ }
     })();
@@ -4972,6 +5028,7 @@ function App(){
         trendMeta={trendMeta}
         tiStatus={tiStatus}
         tiRollupsByCanonical={tiRollupsByCanonical}
+        tiTrendByCanonical={tiTrendByCanonical}
       />}
 
       {/* Tooltip — applies on prices tab when hovering live cells.

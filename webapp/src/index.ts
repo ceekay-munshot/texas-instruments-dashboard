@@ -3697,6 +3697,130 @@ app.get('/api/ti/universe/catalog/rollups/detail', async (c) => {
   })
 })
 
+// GET /api/ti/universe/catalog/rollups/trend — public, sanitized.
+//
+// Phase 25 — derives a per-canonical-subcategory price + stock trend from
+// the ti_catalog_rollup_history table that finalize already appends to on
+// every real_catalog land. Returns:
+//
+//   For each subcategory present in history:
+//     latestPrice / latestStock / latestSnapshotAt
+//     previousPrice / previousStock / previousSnapshotAt   (null if only 1 snapshot)
+//     priceDeltaPct / stockDeltaPct                        (latest vs previous)
+//     baseline7dPrice / baseline7dStock                    (closest snapshot ≥ 7 days old)
+//     priceDeltaPct7d / stockDeltaPct7d                    (latest vs 7-day baseline)
+//     snapshotCount                                        (rows in last 30 days)
+//     hasEnoughHistory                                     (snapshotCount >= 2)
+//     trendConfidence                                      ('insufficient' | 'daily' | 'weekly')
+//
+// Trend confidence ladder:
+//   insufficient — 0 or 1 snapshots
+//   daily        — 2..6 snapshots
+//   weekly       — 7+ snapshots (also unlocks 7-day baseline deltas)
+//
+// Never calls TI; pure SELECT against the existing history table.
+app.get('/api/ti/universe/catalog/rollups/trend', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; rollup trend unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  // Read up to 30 days of history per subcategory. With ≤28 canonical
+  // subcategories × 30 rows = 840 rows max — comfortably small.
+  type HistoryRow = {
+    canonical_subcategory: string
+    canonical_group: string
+    captured_at: string
+    median_normalized_unit_price: number | null
+    total_quantity: number | null
+    priced_opn_count: number
+    stocked_opn_count: number
+    opn_count: number
+  }
+  let rows: HistoryRow[] = []
+  try {
+    const res = await d1.prepare(
+      `SELECT canonical_subcategory, canonical_group, captured_at,
+              median_normalized_unit_price, total_quantity,
+              priced_opn_count, stocked_opn_count, opn_count
+         FROM ti_catalog_rollup_history
+         WHERE captured_at >= datetime('now', '-30 days')
+         ORDER BY canonical_subcategory ASC, captured_at DESC`,
+    ).all<HistoryRow>()
+    rows = res.results ?? []
+  } catch (e: any) {
+    return c.json({
+      success: false, status: 'history_unreadable',
+      message: `Could not read ti_catalog_rollup_history: ${(e?.message || 'unknown').slice(0, 140)}`,
+    }, 500)
+  }
+  // Group by subcategory in JS (rows already ORDERED by sub asc, captured_at desc).
+  const bySubcat = new Map<string, HistoryRow[]>()
+  for (const r of rows) {
+    const k = r.canonical_subcategory
+    if (!bySubcat.has(k)) bySubcat.set(k, [])
+    bySubcat.get(k)!.push(r)
+  }
+  function pctDelta(latest: number | null, prev: number | null): number | null {
+    if (latest == null || prev == null) return null
+    if (!Number.isFinite(latest) || !Number.isFinite(prev)) return null
+    if (prev === 0) return null
+    return Math.round(((latest - prev) / prev) * 1000) / 10
+  }
+  const nowMs = Date.now()
+  const subcategories = Array.from(bySubcat.entries()).map(([sub, hs]) => {
+    const latest = hs[0] ?? null
+    const previous = hs[1] ?? null
+    const snapshotCount = hs.length
+    // Pick the snapshot whose captured_at is closest to (now - 7 days)
+    // but no newer than (now - 6 days). If none qualify, no 7-day baseline.
+    const sevenDaysAgoMs = nowMs - 7 * 24 * 60 * 60_000
+    let baseline7d: HistoryRow | null = null
+    let bestDelta = Infinity
+    for (const h of hs) {
+      const ageMs = nowMs - new Date(h.captured_at).getTime()
+      if (ageMs >= 6 * 24 * 60 * 60_000) {
+        const delta = Math.abs(new Date(h.captured_at).getTime() - sevenDaysAgoMs)
+        if (delta < bestDelta) {
+          bestDelta = delta
+          baseline7d = h
+        }
+      }
+    }
+    const trendConfidence = snapshotCount >= 7 ? 'weekly' : snapshotCount >= 2 ? 'daily' : 'insufficient'
+    return {
+      canonicalSubcategory: sub,
+      canonicalGroup: latest?.canonical_group ?? null,
+      latestSnapshotAt: latest?.captured_at ?? null,
+      latestPrice: latest?.median_normalized_unit_price ?? null,
+      latestStock: latest?.total_quantity ?? null,
+      latestPricedOpnCount: latest?.priced_opn_count ?? null,
+      latestStockedOpnCount: latest?.stocked_opn_count ?? null,
+      latestOpnCount: latest?.opn_count ?? null,
+      previousSnapshotAt: previous?.captured_at ?? null,
+      previousPrice: previous?.median_normalized_unit_price ?? null,
+      previousStock: previous?.total_quantity ?? null,
+      priceDeltaPct: pctDelta(latest?.median_normalized_unit_price ?? null, previous?.median_normalized_unit_price ?? null),
+      stockDeltaPct: pctDelta(latest?.total_quantity ?? null, previous?.total_quantity ?? null),
+      baseline7dSnapshotAt: baseline7d?.captured_at ?? null,
+      baseline7dPrice: baseline7d?.median_normalized_unit_price ?? null,
+      baseline7dStock: baseline7d?.total_quantity ?? null,
+      priceDeltaPct7d: pctDelta(latest?.median_normalized_unit_price ?? null, baseline7d?.median_normalized_unit_price ?? null),
+      stockDeltaPct7d: pctDelta(latest?.total_quantity ?? null, baseline7d?.total_quantity ?? null),
+      snapshotCount,
+      hasEnoughHistory: snapshotCount >= 2,
+      trendConfidence,
+    }
+  })
+  return c.json({
+    success: true,
+    backend: 'd1',
+    subcategoryCount: subcategories.length,
+    subcategories,
+    note: 'Phase 25 — TI Direct snapshot history. Daily delta requires 2+ stored snapshots; 7-day baseline requires 7+ stored snapshots. Distributor data is never blended into these numbers.',
+  })
+})
+
 // GET /api/ti/universe/catalog/rollups/quality — public, sanitized.
 //
 // Phase 24C.2 — operator + customer-facing diagnostic that surfaces
