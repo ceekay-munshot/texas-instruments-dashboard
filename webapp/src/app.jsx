@@ -3050,22 +3050,31 @@ function App(){
             </tr>
 
             {/* QTD / Latest data row.
-                Cell value priority:
-                  1. tiTrend.priceDeltaPct  (true catalog QoQ when we have ≥2 TI snapshots)
+                Cell value priority (first non-null wins):
+                  1. tiTrend.priceDeltaPct  (true catalog QoQ when ≥2 TI snapshots)
                   2. liveData[c.id].qoqPct  (Mouser/server-merged qoq)
-                Cells with no data render '—' (never '…' per-cell, since that
-                misled customers into thinking the whole row was broken).
-                When EVERY cell would be empty we collapse the row into one
-                friendly message instead of showing 28 dashes. */}
+                  3. Computed (avg-baseline)/baseline*100 from the persisted
+                     snapshot — covers the rate-limit placeholder case where
+                     the server returned baseline prices but qoqPct was null.
+                Cells with no value render '—'. The row collapses to a single
+                message ONLY when no category can produce any value. */}
             {(() => {
-              const qtdHasAnyValue = visCats.some(c => {
-                const canonical = combinedEvidence?.legacyToCanonical?.[c.id];
+              function qtdValueFor(catId) {
+                const canonical = combinedEvidence?.legacyToCanonical?.[catId];
                 const trend = canonical ? tiTrendByCanonical[canonical] : null;
                 const trendPct = trend?.hasEnoughHistory ? trend.priceDeltaPct : null;
-                if (Number.isFinite(trendPct)) return true;
-                const live = liveData?.[c.id]?.qoqPct;
-                return Number.isFinite(live);
-              });
+                if (Number.isFinite(trendPct)) return { v: trendPct, fromTrend: true };
+                const d = liveData?.[catId];
+                if (Number.isFinite(d?.qoqPct)) return { v: d.qoqPct, fromTrend: false };
+                const avg = Number(d?.avgPriceUSD);
+                const base = Number(d?.baselinePriceUSD);
+                if (Number.isFinite(avg) && Number.isFinite(base) && base > 0) {
+                  return { v: ((avg - base) / base) * 100, fromTrend: false };
+                }
+                return { v: null, fromTrend: false };
+              }
+              window.__qtdValueFor = qtdValueFor; // exposed for testing
+              const qtdHasAnyValue = visCats.some(c => qtdValueFor(c.id).v != null);
               if (!qtdHasAnyValue) {
                 const message = loading
                   ? 'Loading latest data…'
@@ -3088,8 +3097,11 @@ function App(){
               const trend = canonical ? tiTrendByCanonical[canonical] : null;
               const trendPct = trend?.hasEnoughHistory ? trend.priceDeltaPct : null;
               if (Number.isFinite(trendPct)) return true;
-              const live = liveData?.[c.id]?.qoqPct;
-              return Number.isFinite(live);
+              const d = liveData?.[c.id];
+              if (Number.isFinite(d?.qoqPct)) return true;
+              const avg = Number(d?.avgPriceUSD);
+              const base = Number(d?.baselinePriceUSD);
+              return Number.isFinite(avg) && Number.isFinite(base) && base > 0;
             }) && (
             <tr style={{background:'rgba(255,215,0,0.035)'}}>
               <td style={{padding:'6px 12px 6px 16px',borderRight:`1px solid ${B}`,borderBottom:`1px solid ${B}`,fontFamily:'monospace',fontSize:'0.72rem',position:'sticky',left:0,background:'#141102',zIndex:2,color:'#ffd700',fontWeight:'bold'}}>
@@ -3117,8 +3129,15 @@ function App(){
                 const tiRollup = canonicalForCell ? tiRollupsByCanonical[canonicalForCell] : null;
                 const tiTrend = canonicalForCell ? tiTrendByCanonical[canonicalForCell] : null;
                 const tiTrendPct = tiTrend?.hasEnoughHistory ? tiTrend.priceDeltaPct : null;
-                const v = tiTrendPct != null ? tiTrendPct : d?.qoqPct;
-                const fromTiTrend = tiTrendPct != null;
+                let v = Number.isFinite(tiTrendPct) ? tiTrendPct : (Number.isFinite(d?.qoqPct) ? d.qoqPct : null);
+                if (v == null) {
+                  const avg = Number(d?.avgPriceUSD);
+                  const base = Number(d?.baselinePriceUSD);
+                  if (Number.isFinite(avg) && Number.isFinite(base) && base > 0) {
+                    v = ((avg - base) / base) * 100;
+                  }
+                }
+                const fromTiTrend = Number.isFinite(tiTrendPct);
                 const hasTiRollup = !!tiRollup;
                 const tiQualityLabel = tiRollup?.qualityLabel || 'unknown';
                 const tiUsable = tiRollup?.usableForPricesLiveEvidence === true;
