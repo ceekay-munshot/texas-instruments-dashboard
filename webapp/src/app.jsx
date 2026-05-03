@@ -3049,7 +3049,48 @@ function App(){
               </td>
             </tr>
 
-            {/* Live row */}
+            {/* QTD / Latest data row.
+                Cell value priority:
+                  1. tiTrend.priceDeltaPct  (true catalog QoQ when we have ≥2 TI snapshots)
+                  2. liveData[c.id].qoqPct  (Mouser/server-merged qoq)
+                Cells with no data render '—' (never '…' per-cell, since that
+                misled customers into thinking the whole row was broken).
+                When EVERY cell would be empty we collapse the row into one
+                friendly message instead of showing 28 dashes. */}
+            {(() => {
+              const qtdHasAnyValue = visCats.some(c => {
+                const canonical = combinedEvidence?.legacyToCanonical?.[c.id];
+                const trend = canonical ? tiTrendByCanonical[canonical] : null;
+                const trendPct = trend?.hasEnoughHistory ? trend.priceDeltaPct : null;
+                if (Number.isFinite(trendPct)) return true;
+                const live = liveData?.[c.id]?.qoqPct;
+                return Number.isFinite(live);
+              });
+              if (!qtdHasAnyValue) {
+                const message = loading
+                  ? 'Loading latest data…'
+                  : 'QTD data is being collected. Latest price moves will appear here as soon as they are available.';
+                return (
+                  <tr style={{background:'rgba(255,215,0,0.035)'}}>
+                    <td style={{padding:'6px 12px 6px 16px',borderRight:`1px solid ${B}`,borderBottom:`1px solid ${B}`,fontFamily:'monospace',fontSize:'0.72rem',position:'sticky',left:0,background:'#141102',zIndex:2,color:'#ffd700',fontWeight:'bold'}}>
+                      ★ QTD
+                    </td>
+                    <td colSpan={visCats.length} style={{padding:'10px 16px',borderBottom:`1px solid ${B}`,fontStyle:'italic',color:'#7a96b8',fontSize:'0.7rem'}}>
+                      {message}
+                    </td>
+                  </tr>
+                );
+              }
+              return null;
+            })()}
+            {visCats.some(c => {
+              const canonical = combinedEvidence?.legacyToCanonical?.[c.id];
+              const trend = canonical ? tiTrendByCanonical[canonical] : null;
+              const trendPct = trend?.hasEnoughHistory ? trend.priceDeltaPct : null;
+              if (Number.isFinite(trendPct)) return true;
+              const live = liveData?.[c.id]?.qoqPct;
+              return Number.isFinite(live);
+            }) && (
             <tr style={{background:'rgba(255,215,0,0.035)'}}>
               <td style={{padding:'6px 12px 6px 16px',borderRight:`1px solid ${B}`,borderBottom:`1px solid ${B}`,fontFamily:'monospace',fontSize:'0.72rem',position:'sticky',left:0,background:'#141102',zIndex:2,color:'#ffd700',fontWeight:'bold'}}>
                 {loading
@@ -3115,7 +3156,7 @@ function App(){
                   });
                   setActiveTab('universe');
                 } : undefined;
-                const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':'—',col:'#2a4060',bold:false};
+                const{txt,col,bold}=v!=null?fmt(v):{txt:'—',col:'#2a4060',bold:false};
                 const cellTitle = isRLCell && v == null
                   ? 'Update pending — TI data is still available'
                   : fromTiTrend
@@ -3137,6 +3178,7 @@ function App(){
                 );
               })}
             </tr>
+            )}
           </tbody>
         </table>
       </div>
