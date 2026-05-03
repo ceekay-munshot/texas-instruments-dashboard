@@ -5021,7 +5021,6 @@ function App(){
               {visCats.map((c,i)=>{
                 const iF=i===0||visCats[i-1].g!==c.g;
                 const d=liveData?.[c.id];
-                const v=d?.qoqPct;
                 const isLive=d&&!d.error&&d.parts?.length>0;
                 const isRLCell = d?.error?.includes('Rate limit');
                 const hasBasket=!!basketCatFor(c.id);
@@ -5034,6 +5033,10 @@ function App(){
                 // rollups appear as caution rather than clean signal.
                 const canonicalForCell = combinedEvidence?.legacyToCanonical?.[c.id];
                 const tiRollup = canonicalForCell ? tiRollupsByCanonical[canonicalForCell] : null;
+                const tiTrend = canonicalForCell ? tiTrendByCanonical[canonicalForCell] : null;
+                const tiTrendPct = tiTrend?.hasEnoughHistory ? tiTrend.priceDeltaPct : null;
+                const v = tiTrendPct != null ? tiTrendPct : d?.qoqPct;
+                const fromTiTrend = tiTrendPct != null;
                 const hasTiRollup = !!tiRollup;
                 const tiQualityLabel = tiRollup?.qualityLabel || 'unknown';
                 const tiUsable = tiRollup?.usableForPricesLiveEvidence === true;
@@ -5071,7 +5074,14 @@ function App(){
                   });
                   setActiveTab('universe');
                 } : undefined;
-                const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':isRLCell?'⚡':'—',col:isRLCell?'#3a2800':'#2a4060',bold:false};
+                const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':'—',col:'#2a4060',bold:false};
+                const cellTitle = isRLCell && v == null
+                  ? 'Live channel check temporarily rate-limited — auto-retry scheduled'
+                  : fromTiTrend
+                    ? 'Latest TI Direct catalog snapshot delta'
+                    : hasTiRollup
+                      ? 'Click to inspect mapped TI parts in Universe tab'
+                      : undefined;
                 return(
                   <td key={c.id}
                     className={handleClick?'tdc':undefined}
@@ -5079,8 +5089,8 @@ function App(){
                     onMouseMove={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
                     onMouseLeave={hasTooltip?()=>setTooltip(null):undefined}
                     onClick={handleClick}
-                    title={isRLCell?'Rate limited — will retry automatically':hasTiRollup?'Click to inspect mapped TI parts in Universe tab':undefined}
-                    style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:handleClick?'pointer':hasTooltip?'crosshair':'default'}}>
+                    title={cellTitle}
+                    style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:v==null&&d?.error?'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:handleClick?'pointer':hasTooltip?'crosshair':'default'}}>
                     {txt}
                   </td>
                 );
