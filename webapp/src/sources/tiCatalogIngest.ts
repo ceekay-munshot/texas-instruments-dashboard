@@ -815,6 +815,389 @@ export async function rebuildGpnEnrichment(d1: CatalogD1): Promise<GpnEnrichment
   }
 }
 
+// ── Phase 24C — TI catalog rollup rebuild ───────────────────────────────────
+// Maps every OPN in ti_catalog_latest_opn to a canonical subcategory via
+// the deterministic rule list in tiCatalogMapping.ts, then aggregates per
+// subcategory and writes one row per canonical bucket into
+// ti_catalog_rollup_latest. Optionally appends the same rows into
+// ti_catalog_rollup_history when the caller passes appendHistory=true
+// (used by finalize on a real_catalog land).
+//
+// The mapping is rendered into a single SQL CASE expression at startup
+// so the rebuild stays inside D1 — three UPDATE-FROM-CTE statements
+// for cheapest/highest/median + one INSERT-OR-REPLACE per canonical
+// subcategory. No streaming of OPN rows through the Worker.
+
+import {
+  buildSqlSubcategoryCase,
+  buildSqlGroupCase,
+  buildSqlConfidenceCase,
+} from './tiCatalogMapping'
+
+export type CatalogRollupResult = {
+  totalOpns: number
+  mappedOpns: number
+  unmappedOpns: number
+  mappingCoveragePct: number
+  rollupRows: number
+  highConfidenceRows: number
+  mediumConfidenceRows: number
+  lowConfidenceRows: number
+  appendedHistoryRows: number
+  sampleRollups: Array<{
+    canonicalGroup: string
+    canonicalSubcategory: string
+    opnCount: number
+    gpnCount: number
+    pricedOpnCount: number
+    stockedOpnCount: number
+    outOfStockOpnCount: number
+    stockedPct: number | null
+    totalQuantity: number | null
+    medianNormalizedUnitPrice: number | null
+    minNormalizedUnitPrice: number | null
+    maxNormalizedUnitPrice: number | null
+    cheapestOpn: string | null
+    highestInventoryOpn: string | null
+    lifecycleSummary: unknown
+    mappingConfidenceSummary: unknown
+    latestCapturedAt: string
+  }>
+  unmappedSamples: Array<{ tiPartNumber: string; genericPartNumber: string | null; description: string | null }>
+  errors: string[]
+}
+
+export async function rebuildCatalogRollups(
+  d1: CatalogD1,
+  opts?: { appendHistory?: boolean; snapshotRunId?: number | null },
+): Promise<CatalogRollupResult> {
+  const errors: string[] = []
+  const subcategoryCase = buildSqlSubcategoryCase()
+  const groupCase = buildSqlGroupCase()
+  const confidenceCase = buildSqlConfidenceCase()
+
+  // Step 1 — wipe latest rollups so deletions don't leave stale rows.
+  try {
+    await d1.prepare('DELETE FROM ti_catalog_rollup_latest').run()
+  } catch (e: any) {
+    errors.push(`rollup_delete:${(e?.message || 'failed').slice(0, 120)}`)
+  }
+
+  // Step 2 — single INSERT…SELECT that does mapping + aggregation +
+  // confidence histogram + lifecycle aggregation in one D1 statement.
+  // json_group_object builds compact JSON for the lifecycle and
+  // mapping-confidence summaries. cheapest/highest/median come in via
+  // separate UPDATE-FROM-CTE passes below since they need window
+  // functions that don't compose with the GROUP BY here.
+  try {
+    await d1.prepare(
+      `INSERT INTO ti_catalog_rollup_latest (
+         canonical_subcategory, canonical_group,
+         opn_count, gpn_count, priced_opn_count,
+         stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+         total_quantity,
+         median_normalized_unit_price, min_normalized_unit_price, max_normalized_unit_price,
+         cheapest_opn, highest_inventory_opn,
+         lifecycle_summary, mapping_confidence_summary,
+         latest_captured_at)
+       SELECT
+         m.canonical_subcategory,
+         MAX(m.canonical_group) AS canonical_group,
+         COUNT(*)                                                              AS opn_count,
+         COUNT(DISTINCT m.generic_part_number)                                 AS gpn_count,
+         SUM(CASE WHEN m.normalized_unit_price IS NOT NULL THEN 1 ELSE 0 END)  AS priced_opn_count,
+         SUM(CASE WHEN m.quantity IS NOT NULL AND m.quantity > 0 THEN 1 ELSE 0 END) AS stocked_opn_count,
+         SUM(CASE WHEN m.quantity = 0 THEN 1 ELSE 0 END)                        AS out_of_stock_opn_count,
+         ROUND(SUM(CASE WHEN m.quantity IS NOT NULL AND m.quantity > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 2) AS stocked_pct,
+         SUM(COALESCE(m.quantity, 0))                                          AS total_quantity,
+         NULL AS median_normalized_unit_price,
+         MIN(m.normalized_unit_price)                                          AS min_normalized_unit_price,
+         MAX(m.normalized_unit_price)                                          AS max_normalized_unit_price,
+         NULL AS cheapest_opn,
+         NULL AS highest_inventory_opn,
+         (
+           SELECT json_group_object(lc.lifecycle, lc.cnt)
+           FROM (
+             SELECT lifecycle, COUNT(*) AS cnt
+             FROM ti_catalog_latest_opn lc_inner
+             WHERE lc_inner.lifecycle IS NOT NULL
+               AND TRIM(lc_inner.lifecycle) != ''
+               AND (${subcategoryCase.replace(/\b(generic_part_number|ti_part_number|description)\b/g, 'lc_inner.$1')}) = m.canonical_subcategory
+             GROUP BY lifecycle
+           ) lc
+         ) AS lifecycle_summary,
+         (
+           SELECT json_group_object(cf.confidence, cf.cnt)
+           FROM (
+             SELECT (${confidenceCase.replace(/\b(generic_part_number|ti_part_number|description)\b/g, 'cf_inner.$1')}) AS confidence, COUNT(*) AS cnt
+             FROM ti_catalog_latest_opn cf_inner
+             WHERE (${subcategoryCase.replace(/\b(generic_part_number|ti_part_number|description)\b/g, 'cf_inner.$1')}) = m.canonical_subcategory
+             GROUP BY confidence
+           ) cf
+         ) AS mapping_confidence_summary,
+         MAX(m.latest_captured_at)                                             AS latest_captured_at
+       FROM (
+         SELECT *,
+           (${subcategoryCase}) AS canonical_subcategory,
+           (${groupCase}) AS canonical_group
+         FROM ti_catalog_latest_opn
+       ) m
+       WHERE m.canonical_subcategory IS NOT NULL
+       GROUP BY m.canonical_subcategory`,
+    ).run()
+  } catch (e: any) {
+    errors.push(`rollup_insert:${(e?.message || 'failed').slice(0, 200)}`)
+  }
+
+  // Step 3 — cheapest_opn per canonical subcategory (lowest price; tie →
+  // highest quantity → lexically smallest OPN).
+  try {
+    await d1.prepare(
+      `WITH cheapest AS (
+         SELECT canonical_subcategory, ti_part_number AS opn FROM (
+           SELECT (${subcategoryCase}) AS canonical_subcategory, ti_part_number,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY (${subcategoryCase})
+                    ORDER BY normalized_unit_price ASC,
+                             COALESCE(quantity, -1) DESC,
+                             ti_part_number ASC
+                  ) AS rn
+           FROM ti_catalog_latest_opn
+           WHERE normalized_unit_price IS NOT NULL
+         )
+         WHERE rn = 1 AND canonical_subcategory IS NOT NULL
+       )
+       UPDATE ti_catalog_rollup_latest
+       SET cheapest_opn = cheapest.opn
+       FROM cheapest
+       WHERE ti_catalog_rollup_latest.canonical_subcategory = cheapest.canonical_subcategory`,
+    ).run()
+  } catch (e: any) {
+    errors.push(`rollup_cheapest:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+
+  // Step 4 — highest_inventory_opn (mirrors GPN enrichment helper).
+  try {
+    await d1.prepare(
+      `WITH highest AS (
+         SELECT canonical_subcategory, ti_part_number AS opn FROM (
+           SELECT (${subcategoryCase}) AS canonical_subcategory, ti_part_number,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY (${subcategoryCase})
+                    ORDER BY quantity DESC,
+                             COALESCE(normalized_unit_price, 1e18) ASC,
+                             ti_part_number ASC
+                  ) AS rn
+           FROM ti_catalog_latest_opn
+           WHERE quantity IS NOT NULL
+         )
+         WHERE rn = 1 AND canonical_subcategory IS NOT NULL
+       )
+       UPDATE ti_catalog_rollup_latest
+       SET highest_inventory_opn = highest.opn
+       FROM highest
+       WHERE ti_catalog_rollup_latest.canonical_subcategory = highest.canonical_subcategory`,
+    ).run()
+  } catch (e: any) {
+    errors.push(`rollup_highest:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+
+  // Step 5 — true median via window-function trick (same pattern as
+  // rebuildGpnEnrichment).
+  try {
+    await d1.prepare(
+      `WITH ranked AS (
+         SELECT (${subcategoryCase}) AS canonical_subcategory,
+                normalized_unit_price,
+                ROW_NUMBER() OVER (
+                  PARTITION BY (${subcategoryCase})
+                  ORDER BY normalized_unit_price
+                ) AS rn,
+                COUNT(*) OVER (PARTITION BY (${subcategoryCase})) AS cnt
+         FROM ti_catalog_latest_opn
+         WHERE normalized_unit_price IS NOT NULL
+       ),
+       medians AS (
+         SELECT canonical_subcategory, AVG(normalized_unit_price) AS median_norm
+         FROM ranked
+         WHERE canonical_subcategory IS NOT NULL
+           AND rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
+         GROUP BY canonical_subcategory
+       )
+       UPDATE ti_catalog_rollup_latest
+       SET median_normalized_unit_price = medians.median_norm
+       FROM medians
+       WHERE ti_catalog_rollup_latest.canonical_subcategory = medians.canonical_subcategory`,
+    ).run()
+  } catch (e: any) {
+    errors.push(`rollup_median:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+
+  // Step 6 — diagnostics + samples.
+  let totalOpns = 0
+  let mappedOpns = 0
+  let highConfidenceRows = 0
+  let mediumConfidenceRows = 0
+  let lowConfidenceRows = 0
+  let rollupRows = 0
+  type SampleRollupRow = {
+    canonical_group: string;
+    canonical_subcategory: string;
+    opn_count: number;
+    gpn_count: number;
+    priced_opn_count: number;
+    stocked_opn_count: number;
+    out_of_stock_opn_count: number;
+    stocked_pct: number | null;
+    total_quantity: number | null;
+    median_normalized_unit_price: number | null;
+    min_normalized_unit_price: number | null;
+    max_normalized_unit_price: number | null;
+    cheapest_opn: string | null;
+    highest_inventory_opn: string | null;
+    lifecycle_summary: string | null;
+    mapping_confidence_summary: string | null;
+    latest_captured_at: string;
+  }
+  let sampleRollupsRaw: SampleRollupRow[] = []
+  let unmappedSamplesRaw: Array<{ ti_part_number: string; generic_part_number: string | null; description: string | null }> = []
+  try {
+    const opnCounts = await d1.prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN (${subcategoryCase}) IS NOT NULL THEN 1 ELSE 0 END) AS mapped
+       FROM ti_catalog_latest_opn`,
+    ).first<{ total: number; mapped: number }>()
+    if (opnCounts) {
+      totalOpns = Number(opnCounts.total) || 0
+      mappedOpns = Number(opnCounts.mapped) || 0
+    }
+    const rollupCounts = await d1.prepare(
+      `SELECT COUNT(*) AS rows FROM ti_catalog_rollup_latest`,
+    ).first<{ rows: number }>()
+    rollupRows = Number(rollupCounts?.rows ?? 0) || 0
+    // "highConfidenceRows" semantics: how many rollup rows have ≥ 1
+    // high-confidence OPN backing them; same for medium / low. Read the
+    // mapping_confidence_summary JSON inline.
+    const sample = await d1.prepare(
+      `SELECT canonical_group, canonical_subcategory,
+              opn_count, gpn_count, priced_opn_count,
+              stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+              total_quantity, median_normalized_unit_price,
+              min_normalized_unit_price, max_normalized_unit_price,
+              cheapest_opn, highest_inventory_opn,
+              lifecycle_summary, mapping_confidence_summary,
+              latest_captured_at
+         FROM ti_catalog_rollup_latest
+         ORDER BY total_quantity DESC NULLS LAST
+         LIMIT 8`,
+    ).all<SampleRollupRow>()
+    sampleRollupsRaw = sample.results ?? []
+    const unmapped = await d1.prepare(
+      `SELECT ti_part_number, generic_part_number, description
+         FROM ti_catalog_latest_opn
+         WHERE (${subcategoryCase}) IS NULL
+         ORDER BY quantity DESC NULLS LAST
+         LIMIT 10`,
+    ).all<{ ti_part_number: string; generic_part_number: string | null; description: string | null }>()
+    unmappedSamplesRaw = unmapped.results ?? []
+    // Count high/medium/low confidence rows: a rollup row counts as
+    // "high" if ANY of its backing OPNs were mapped via a high-confidence
+    // rule; medium if any were medium and none high; low otherwise.
+    for (const r of sampleRollupsRaw) {
+      let summary: Record<string, number> | null = null
+      if (typeof r.mapping_confidence_summary === 'string') {
+        try { summary = JSON.parse(r.mapping_confidence_summary) } catch {}
+      }
+      if (summary) {
+        if ((summary.high ?? 0) > 0) highConfidenceRows += 1
+        else if ((summary.medium ?? 0) > 0) mediumConfidenceRows += 1
+        else if ((summary.low ?? 0) > 0) lowConfidenceRows += 1
+      }
+    }
+  } catch (e: any) {
+    errors.push(`rollup_diag:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+  const unmappedOpns = totalOpns - mappedOpns
+  const mappingCoveragePct = totalOpns > 0 ? Math.round((mappedOpns / totalOpns) * 10000) / 100 : 0
+
+  // Step 7 — append-to-history when finalize asked us to.
+  let appendedHistoryRows = 0
+  if (opts?.appendHistory) {
+    try {
+      const res: any = await d1.prepare(
+        `INSERT INTO ti_catalog_rollup_history (
+           captured_at, snapshot_run_id,
+           canonical_subcategory, canonical_group,
+           opn_count, gpn_count, priced_opn_count,
+           stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+           total_quantity, median_normalized_unit_price,
+           min_normalized_unit_price, max_normalized_unit_price,
+           cheapest_opn, highest_inventory_opn,
+           lifecycle_summary, mapping_confidence_summary)
+         SELECT latest_captured_at, ?,
+                canonical_subcategory, canonical_group,
+                opn_count, gpn_count, priced_opn_count,
+                stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+                total_quantity, median_normalized_unit_price,
+                min_normalized_unit_price, max_normalized_unit_price,
+                cheapest_opn, highest_inventory_opn,
+                lifecycle_summary, mapping_confidence_summary
+           FROM ti_catalog_rollup_latest`,
+      ).bind(opts.snapshotRunId ?? null).run()
+      const changes = (res?.meta?.changes ?? res?.changes)
+      if (typeof changes === 'number') appendedHistoryRows = changes
+    } catch (e: any) {
+      errors.push(`rollup_history_append:${(e?.message || 'failed').slice(0, 150)}`)
+    }
+  }
+
+  const sampleRollups = sampleRollupsRaw.map(r => {
+    const parseJson = (s: string | null | undefined) => {
+      if (typeof s !== 'string') return s ?? null
+      try { return JSON.parse(s) } catch { return s }
+    }
+    return {
+      canonicalGroup: r.canonical_group,
+      canonicalSubcategory: r.canonical_subcategory,
+      opnCount: r.opn_count,
+      gpnCount: r.gpn_count,
+      pricedOpnCount: r.priced_opn_count,
+      stockedOpnCount: r.stocked_opn_count,
+      outOfStockOpnCount: r.out_of_stock_opn_count,
+      stockedPct: r.stocked_pct,
+      totalQuantity: r.total_quantity,
+      medianNormalizedUnitPrice: r.median_normalized_unit_price,
+      minNormalizedUnitPrice: r.min_normalized_unit_price,
+      maxNormalizedUnitPrice: r.max_normalized_unit_price,
+      cheapestOpn: r.cheapest_opn,
+      highestInventoryOpn: r.highest_inventory_opn,
+      lifecycleSummary: parseJson(r.lifecycle_summary),
+      mappingConfidenceSummary: parseJson(r.mapping_confidence_summary),
+      latestCapturedAt: r.latest_captured_at,
+    }
+  })
+
+  return {
+    totalOpns,
+    mappedOpns,
+    unmappedOpns,
+    mappingCoveragePct,
+    rollupRows,
+    highConfidenceRows,
+    mediumConfidenceRows,
+    lowConfidenceRows,
+    appendedHistoryRows,
+    sampleRollups,
+    unmappedSamples: unmappedSamplesRaw.map(r => ({
+      tiPartNumber: r.ti_part_number,
+      genericPartNumber: r.generic_part_number,
+      description: r.description,
+    })),
+    errors,
+  }
+}
+
 export type SnapshotRunSummary = {
   totalOpns: number
   totalGpns: number

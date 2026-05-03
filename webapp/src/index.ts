@@ -72,6 +72,7 @@ import {
   ingestCatalogChunk,
   rebuildGpnFromOpn,
   rebuildGpnEnrichment,
+  rebuildCatalogRollups,
   readSnapshotCounts,
   readLatestSnapshotRun,
   insertSnapshotRunRow,
@@ -3122,6 +3123,12 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
   // standalone if the chain failed.
   const enrichment = await rebuildGpnEnrichment(env.TI_INVENTORY_HISTORY_DB as any)
   for (const e of enrichment.errors) errors.push(e)
+  // Phase 24C — rebuild per-canonical-subcategory rollups + append a
+  // history row per snapshot. Append-history is only safe at finalize
+  // time (one snapshot just landed), not at the standalone rebuild
+  // endpoint. Errors flow into the same errors[] array.
+  const rollups = await rebuildCatalogRollups(env.TI_INVENTORY_HISTORY_DB as any, { appendHistory: true })
+  for (const e of rollups.errors) errors.push(e)
   const counts = await readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any)
   const summary = {
     totalOpns: counts.totalOpns,
@@ -3149,8 +3156,15 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
       nullHighestInventoryCount: enrichment.nullHighestInventoryCount,
       nullLifecycleSummaryCount: enrichment.nullLifecycleSummaryCount,
     },
+    rollups: {
+      totalOpns: rollups.totalOpns,
+      mappedOpns: rollups.mappedOpns,
+      mappingCoveragePct: rollups.mappingCoveragePct,
+      rollupRows: rollups.rollupRows,
+      appendedHistoryRows: rollups.appendedHistoryRows,
+    },
     ...summary,
-    note: 'Phase 24A.1 — GPN aggregates rebuilt from ti_catalog_latest_opn (in-SQL GROUP BY); cheapest_opn / highest_inventory_opn / lifecycle_summary / median_normalized_unit_price now backfilled via four UPDATE-FROM-CTE statements during finalize.',
+    note: 'Phase 24C — finalize chains: GPN GROUP BY → GPN enrichment (UPDATE-FROM-CTE) → canonical-subcategory rollup rebuild + history append. No TI calls beyond the chunked-ingest fetch already performed.',
   })
 })
 
@@ -3193,6 +3207,146 @@ app.post('/api/ti/universe/catalog/gpn/rebuild-enrichment', async (c) => {
     sampleRows: result.sampleRows,
     errors: result.errors,
     note: 'Phase 24A.1 — pure SQL UPDATE-FROM-CTE rebuild. No TI calls. Idempotent.',
+  })
+})
+
+// ── Phase 24C — TI catalog rollups (canonical-subcategory aggregates) ───────
+
+// POST /api/ti/universe/catalog/rollups/rebuild — auth-gated.
+//
+// Maps every OPN in ti_catalog_latest_opn to one of the 28 canonical
+// subcategories via deterministic JS rules (rendered into a single SQL
+// CASE), aggregates per subcategory, and writes one row per canonical
+// bucket into ti_catalog_rollup_latest. Never calls TI; pure SQL on
+// existing rows.
+app.post('/api/ti/universe/catalog/rollups/rebuild', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot rebuild rollups.' }, 500)
+  }
+  const result = await rebuildCatalogRollups(env.TI_INVENTORY_HISTORY_DB as any, { appendHistory: false })
+  return c.json({
+    success: result.errors.length === 0,
+    totalOpns: result.totalOpns,
+    mappedOpns: result.mappedOpns,
+    unmappedOpns: result.unmappedOpns,
+    mappingCoveragePct: result.mappingCoveragePct,
+    rollupRows: result.rollupRows,
+    highConfidenceRows: result.highConfidenceRows,
+    mediumConfidenceRows: result.mediumConfidenceRows,
+    lowConfidenceRows: result.lowConfidenceRows,
+    sampleRollups: result.sampleRollups,
+    unmappedSamples: result.unmappedSamples,
+    errors: result.errors,
+    note: 'Phase 24C — pure SQL rebuild over ti_catalog_latest_opn. No TI calls. Idempotent.',
+  })
+})
+
+// GET /api/ti/universe/catalog/rollups/latest — public, sanitized.
+//
+// Returns the per-canonical-subcategory rollup rows the rebuild produced.
+// Filters: ?group=<canonical_group>, ?subcategory=<canonical_subcategory>,
+// ?confidence=<high|medium|low> (matches when that bucket has > 0 OPNs in
+// the row's mapping_confidence_summary), ?limit=1..200 default 100.
+app.get('/api/ti/universe/catalog/rollups/latest', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; rollup table unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  const group = (c.req.query('group') || '').trim() || null
+  const subcategory = (c.req.query('subcategory') || '').trim() || null
+  const confidenceRaw = (c.req.query('confidence') || '').toLowerCase().trim()
+  const confidence = (confidenceRaw === 'high' || confidenceRaw === 'medium' || confidenceRaw === 'low') ? confidenceRaw : null
+  const limitRaw = parseInt(c.req.query('limit') || '100', 10) || 100
+  const limit = Math.max(1, Math.min(200, limitRaw))
+
+  const where: string[] = []
+  const binds: unknown[] = []
+  if (group) {
+    where.push('canonical_group = ?')
+    binds.push(group)
+  }
+  if (subcategory) {
+    where.push('canonical_subcategory = ?')
+    binds.push(subcategory)
+  }
+  if (confidence) {
+    // mapping_confidence_summary is JSON like {"high":42,"medium":3}.
+    // Use json_extract to filter rows that have at least one OPN in
+    // the requested bucket.
+    where.push(`COALESCE(json_extract(mapping_confidence_summary, '$.${confidence}'), 0) > 0`)
+  }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''
+  binds.push(limit)
+  const sql =
+    `SELECT canonical_group, canonical_subcategory,
+            opn_count, gpn_count, priced_opn_count,
+            stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+            total_quantity, median_normalized_unit_price,
+            min_normalized_unit_price, max_normalized_unit_price,
+            cheapest_opn, highest_inventory_opn,
+            lifecycle_summary, mapping_confidence_summary,
+            latest_captured_at
+       FROM ti_catalog_rollup_latest
+       ${whereClause}
+       ORDER BY total_quantity DESC NULLS LAST
+       LIMIT ?`
+
+  type Row = {
+    canonical_group: string;
+    canonical_subcategory: string;
+    opn_count: number; gpn_count: number; priced_opn_count: number;
+    stocked_opn_count: number; out_of_stock_opn_count: number;
+    stocked_pct: number | null; total_quantity: number | null;
+    median_normalized_unit_price: number | null;
+    min_normalized_unit_price: number | null;
+    max_normalized_unit_price: number | null;
+    cheapest_opn: string | null; highest_inventory_opn: string | null;
+    lifecycle_summary: string | null; mapping_confidence_summary: string | null;
+    latest_captured_at: string;
+  }
+  const result = await d1.prepare(sql).bind(...binds).all<Row>()
+  const parseJson = (s: string | null) => {
+    if (typeof s !== 'string') return s ?? null
+    try { return JSON.parse(s) } catch { return s }
+  }
+  const rows = (result.results ?? []).map((r: Row) => ({
+    canonicalGroup: r.canonical_group,
+    canonicalSubcategory: r.canonical_subcategory,
+    opnCount: r.opn_count,
+    gpnCount: r.gpn_count,
+    pricedOpnCount: r.priced_opn_count,
+    stockedOpnCount: r.stocked_opn_count,
+    outOfStockOpnCount: r.out_of_stock_opn_count,
+    stockedPct: r.stocked_pct,
+    totalQuantity: r.total_quantity,
+    medianNormalizedUnitPrice: r.median_normalized_unit_price,
+    minNormalizedUnitPrice: r.min_normalized_unit_price,
+    maxNormalizedUnitPrice: r.max_normalized_unit_price,
+    cheapestOpn: r.cheapest_opn,
+    highestInventoryOpn: r.highest_inventory_opn,
+    lifecycleSummary: parseJson(r.lifecycle_summary),
+    mappingConfidenceSummary: parseJson(r.mapping_confidence_summary),
+    latestCapturedAt: r.latest_captured_at,
+  }))
+  return c.json({
+    success: true,
+    backend: 'd1',
+    filters: { group, subcategory, confidence, limit },
+    rows,
+    note: 'Phase 24C — TI Direct evidence is the latest catalog snapshot only. Historical trend requires at least two TI catalog snapshots.',
   })
 })
 

@@ -3951,6 +3951,9 @@ function App(){
   const [coverageData,setCoverageData]=useState(null);
   // Phase 16A: combined Mouser + Nexar evidence (read-only, no Nexar calls).
   const [combinedEvidence,setCombinedEvidence]=useState(null);
+  // Phase 24C: TI Direct full-catalog rollups indexed by canonical
+  // subcategory id. Populated once on mount; never causes a TI call.
+  const [tiRollupsByCanonical,setTiRollupsByCanonical]=useState({});
   // Phase 19B — two-tab UI. 'prices' is the customer-facing default;
   // 'insights' holds source agreement, signal summary, and operator status.
   const [activeTab,setActiveTab]=useState('prices');
@@ -4129,13 +4132,16 @@ function App(){
     let cancelled = false;
     (async () => {
       try {
-        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes, tiStatusRes] = await Promise.allSettled([
+        const [latestRes, trendsRes, evidenceRes, coverageRes, combinedRes, tiStatusRes, tiRollupsRes] = await Promise.allSettled([
           fetch('/api/snapshots/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/trends?days=30').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/latest').then(r => r.ok ? r.json() : null),
           fetch('/api/nexar/basket-coverage').then(r => r.ok ? r.json() : null),
           fetch('/api/snapshots/evidence/combined').then(r => r.ok ? r.json() : null),
           fetch('/api/ti/status').then(r => r.ok ? r.json() : null),
+          // Phase 24C — TI Direct rollups for the Live row tooltip badge.
+          // ?limit=200 covers all 28 canonical subcategories with headroom.
+          fetch('/api/ti/universe/catalog/rollups/latest?limit=200').then(r => r.ok ? r.json() : null),
         ]);
         if (cancelled) return;
         if (latestRes.status === 'fulfilled' && latestRes.value) {
@@ -4165,6 +4171,13 @@ function App(){
         }
         if (tiStatusRes.status === 'fulfilled' && tiStatusRes.value) {
           setTiStatus(tiStatusRes.value);
+        }
+        if (tiRollupsRes.status === 'fulfilled' && tiRollupsRes.value && Array.isArray(tiRollupsRes.value.rows)) {
+          const map = {};
+          for (const r of tiRollupsRes.value.rows) {
+            if (r?.canonicalSubcategory) map[r.canonicalSubcategory] = r;
+          }
+          setTiRollupsByCanonical(map);
         }
       } catch (_) { /* silent */ }
     })();
@@ -4357,6 +4370,44 @@ function App(){
           </div>
         );
       })()}
+
+      {/* Phase 24C — TI Direct full-catalog rollup for this canonical
+          subcategory. Sourced from /api/ti/universe/catalog/rollups/latest.
+          Hidden when no rollup row exists (legacy cell didn't map to a
+          canonical, or TI catalog not yet captured). */}
+      {(() => {
+        const canonical = combinedEvidence?.legacyToCanonical?.[catId];
+        const r = canonical ? tiRollupsByCanonical[canonical] : null;
+        if (!r) return null;
+        const conf = r.mappingConfidenceSummary || {};
+        const high = Number(conf.high || 0), med = Number(conf.medium || 0), low = Number(conf.low || 0);
+        const confLabel = high > 0 ? 'high' : med > 0 ? 'medium' : low > 0 ? 'low' : 'unknown';
+        const confColor = confLabel === 'high' ? '#4dffc3' : confLabel === 'medium' ? '#00c9a7' : confLabel === 'low' ? '#f0a84e' : '#4a6a8a';
+        const lifecycleEntries = r.lifecycleSummary && typeof r.lifecycleSummary === 'object'
+          ? Object.entries(r.lifecycleSummary) : [];
+        const fmtP = (n) => n == null ? '—' : `$${Number(n).toFixed(4)}`;
+        return (
+          <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
+            <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
+              TI Direct full catalog
+              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· canonical subcategory · 72k-OPN snapshot</span>
+            </div>
+            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
+              <div>Snapshot: {r.latestCapturedAt ? new Date(r.latestCapturedAt).toISOString().slice(0,10) : '—'} · mapping <span style={{color:confColor,fontWeight:'bold'}}>{confLabel}</span></div>
+              <div>OPNs: {Number(r.opnCount).toLocaleString()} · GPN families: {Number(r.gpnCount).toLocaleString()} · priced: {Number(r.pricedOpnCount).toLocaleString()}</div>
+              <div>Stocked: {Number(r.stockedOpnCount).toLocaleString()} ({r.stockedPct == null ? '—' : `${r.stockedPct}%`}) · Out of stock: {Number(r.outOfStockOpnCount).toLocaleString()}</div>
+              <div>Total qty: {Number(r.totalQuantity || 0).toLocaleString()}</div>
+              <div>Price: median {fmtP(r.medianNormalizedUnitPrice)} · min {fmtP(r.minNormalizedUnitPrice)} · max {fmtP(r.maxNormalizedUnitPrice)}</div>
+              {r.cheapestOpn && <div>Cheapest OPN: <span style={{color:'#e0eaf8'}}>{r.cheapestOpn}</span></div>}
+              {r.highestInventoryOpn && <div>Highest-inv OPN: <span style={{color:'#e0eaf8'}}>{r.highestInventoryOpn}</span></div>}
+              {lifecycleEntries.length > 0 && (
+                <div>Lifecycle: {lifecycleEntries.map(([k,v]) => `${k}:${v}`).join(' · ')}</div>
+              )}
+              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</div>
+            </div>
+          </div>
+        );
+      })()}
     </>;
   }
 
@@ -4444,6 +4495,9 @@ function App(){
         <span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ ≥5%</span>
         <span style={{color:'#4a6a8a'}}>· Historical = QoQ %; Live row = Mouser qty=1 vs latest baseline · hover any cell for detail</span>
+        {/* Phase 24C — TI marker key + caveat about single-snapshot evidence. */}
+        <span style={{color:'#4dffc3'}}>· <sup style={{fontSize:'0.55rem'}}>TI</sup>=Direct full-catalog rollup</span>
+        <span style={{color:'#7a96b8'}}>· TI Direct evidence is latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</span>
       </div>
 
       {/* ── Table ── */}
@@ -4503,10 +4557,26 @@ function App(){
                 const isLive=d&&!d.error&&d.parts?.length>0;
                 const isRLCell = d?.error?.includes('Rate limit');
                 const hasBasket=!!basketCatFor(c.id);
+                // Phase 24C — TI Direct full-catalog rollup availability
+                // for this canonical subcategory. Drives the small "TI"
+                // marker AND lets us reach hover even when Mouser/Nexar
+                // are silent (rate-limited or out-of-basket).
+                const canonicalForCell = combinedEvidence?.legacyToCanonical?.[c.id];
+                const tiRollup = canonicalForCell ? tiRollupsByCanonical[canonicalForCell] : null;
+                const hasTiRollup = !!tiRollup;
+                const tiConf = tiRollup?.mappingConfidenceSummary || {};
+                const tiConfLabel = (Number(tiConf.high||0) > 0) ? 'high'
+                                  : (Number(tiConf.medium||0) > 0) ? 'medium'
+                                  : (Number(tiConf.low||0) > 0) ? 'low' : 'unknown';
+                const tiBadgeColor = tiConfLabel === 'high' ? '#4dffc3'
+                                   : tiConfLabel === 'medium' ? '#00c9a7'
+                                   : tiConfLabel === 'low' ? '#f0a84e' : '#7a96b8';
                 // Hover fires when Mouser is live OR Nexar basket has cross-source
                 // data — so a Mouser rate-limited cell still surfaces the Nexar
                 // section (Phase 9: cross-source enrichment must be reachable).
-                const hasTooltip = isLive || hasBasket;
+                // Phase 24C: TI Direct rollup also opens the tooltip so the
+                // 72k-OPN evidence is reachable from any mapped cell.
+                const hasTooltip = isLive || hasBasket || hasTiRollup;
                 const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':isRLCell?'⚡':'—',col:isRLCell?'#3a2800':'#2a4060',bold:false};
                 return(
                   <td key={c.id}
@@ -4515,7 +4585,7 @@ function App(){
                     onMouseLeave={hasTooltip?()=>setTooltip(null):undefined}
                     title={isRLCell?'Rate limited — will retry automatically':undefined}
                     style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:hasTooltip?'crosshair':'default'}}>
-                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}
+                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}{hasTiRollup&&<sup style={{fontSize:'0.42rem',color:tiBadgeColor,marginLeft:1}} title={`TI Direct full-catalog rollup available (${tiConfLabel} mapping confidence) — hover for detail`}>TI</sup>}
                   </td>
                 );
               })}
@@ -4538,7 +4608,7 @@ function App(){
       />}
 
       {/* Tooltip — applies on prices tab when hovering live cells */}
-      {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId))&&(
+      {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId)||tiRollupsByCanonical[combinedEvidence?.legacyToCanonical?.[tooltip.catId]])&&(
         <div className="tt" style={{top:tooltip.y+14,left:Math.min(tooltip.x+14,window.innerWidth-360)}}>
           <TT catId={tooltip.catId}/>
         </div>
