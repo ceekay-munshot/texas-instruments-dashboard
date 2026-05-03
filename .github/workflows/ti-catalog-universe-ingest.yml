@@ -1,25 +1,29 @@
-name: TI Catalog Universe Ingest (Phase 23C.3)
+name: TI Catalog Universe Ingest (Phase 23C.4)
 
 # Manual-trigger only. Two operating modes:
 #
-#   1. Real catalog (default)  — Fetches the TI full catalog ONCE per run,
-#      parses the ~50MB JSON in this runner, splits it into chunks (default
-#      200), and POSTs each chunk to the Worker. Workflow fails red if any
-#      chunk fails OR if cumulative opnRowsUpserted < parsedProducts.
+#   1. real_catalog (default) — Calls /api/ti/universe/catalog/quota/preflight
+#      FIRST. If unsafe, the job exits success without ever touching TI.
+#      If safe, fetches the TI full catalog ONCE per run, parses the ~50MB
+#      JSON in this runner, splits it into chunks (default 100), POSTs
+#      each chunk sequentially with a randomized 300–750 ms sleep between,
+#      finalizes, validates /catalog/status, then closes the quota ledger
+#      row via /quota/complete. Workflow fails red if any chunk fails OR
+#      if cumulative opnRowsUpserted < parsedProducts OR if validation
+#      fails.
 #
-#   2. Synthetic test_mode    — Skips OAuth + the rate-limited TI catalog
-#      fetch entirely; sends ONE chunk of synthetic products to the
-#      Worker. Used to verify the D1 micro-batch writer without burning
-#      catalog quota. The dispatcher picks this with input
-#      `test_mode = synthetic_chunk`.
+#   2. synthetic_chunk — Skips OAuth + the rate-limited TI catalog fetch
+#      entirely; sends ONE chunk of synthetic products to the Worker.
+#      Used to verify the D1 micro-batch writer without burning catalog
+#      quota. Never writes to the quota ledger.
 #
 # Why GitHub Actions and not a Worker invocation:
 #   - The Cloudflare Worker memory cap (~128MB) makes parsing 50MB JSON
 #     in-Worker tight. GH Actions runners have 7GB RAM.
 #   - The TI catalog endpoint is rate-limited; one fetch per run keeps
 #     us inside quota.
-#   - Per-chunk Worker calls touch only ~200 products per invocation,
-#     well inside D1 micro-batch and subrequest budgets.
+#   - Per-chunk Worker calls touch only ~100 products per invocation,
+#     comfortably inside D1 free-tier per-call budgets.
 #
 # Required GitHub Actions repository secrets:
 #   TI_CLIENT_ID            — TI developer-portal app client id
@@ -27,12 +31,20 @@ name: TI Catalog Universe Ingest (Phase 23C.3)
 #   SNAPSHOT_CAPTURE_SECRET — same secret used by ti-inventory-capture.yml
 #                             and the Cloudflare Pages env var
 #
-# Phase 23C.3 changes:
-#   - Default chunk_size lowered from 500 → 200 (D1 micro-batch headroom).
-#   - Hard fail on any chunk failure or short-write detected via diagnostics.
-#   - Post-status validation: opnCount must equal parsedProducts; gpnCount,
-#     pricedOpnCount, and inStockOpnCount + outOfStockOpnCount sanity checks.
-#   - Synthetic test_mode path that requires no TI quota.
+# GitHub free-plan friendly:
+#   - Sequential, single-job, no matrix, no cache.
+#   - Default chunk_size 100 (was 200 in 23C.3, 500 in 23C.1).
+#   - Randomized 300–750 ms sleep between POSTs to avoid bursts.
+#   - timeout-minutes: 90.
+#   - Artifacts: only run_meta.json + failed_chunks_summary.json on
+#     failure, retention-days: 1. Raw catalog body is NEVER uploaded.
+#
+# Phase 23C.4 changes vs 23C.3:
+#   - Preflight quota gate; operator never has to remember the safe window.
+#   - Default chunk_size lowered from 200 → 100 (D1 free-tier headroom).
+#   - Sleep widened to randomized 300–750 ms (was fixed 100 ms) to avoid
+#     bursting the Worker.
+#   - Quota ledger /complete called on success, 429, and any failed_*.
 
 on:
   workflow_dispatch:
@@ -45,20 +57,16 @@ on:
         options:
           - real_catalog
           - synthetic_chunk
-      confirm_catalog_quota_available:
-        description: 'For real_catalog ONLY: type YES to acknowledge TI catalog quota (1/4h, 6/day). Ignored in synthetic_chunk mode.'
-        required: false
-        default: 'NO'
       chunk_size:
-        description: 'Products per chunk POSTed to Worker (default 200; Phase 23C.3 lowered from 500).'
+        description: 'Products per chunk POSTed to Worker (default 100; Phase 23C.4 lowered from 200).'
         required: false
-        default: '200'
+        default: '100'
       synthetic_chunk_size:
         description: 'For synthetic_chunk mode: how many synthetic products to send in the single test chunk (default 25).'
         required: false
         default: '25'
       dry_run:
-        description: 'real_catalog only: skip the Worker POSTs; only parse + report.'
+        description: 'real_catalog only: skip the Worker POSTs; only parse + report. Still calls /quota/preflight if mode is real_catalog.'
         required: false
         default: 'false'
 
@@ -76,39 +84,11 @@ env:
 
 jobs:
   ingest:
-    name: Fetch + chunk + POST chunked catalog ingest
+    name: Preflight + fetch + chunk + POST + finalize + validate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
-      - name: Quota acknowledgment gate (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' }}
-        env:
-          CONFIRM: ${{ inputs.confirm_catalog_quota_available }}
-        run: |
-          # TI's /v2/store/products/catalog endpoint is officially
-          # rate-limited to 1 call every 4 hours and 6 calls per day.
-          # The probe (Phase 23B), the experimental capture (Phase 23C),
-          # and this workflow ALL consume the same quota. We require an
-          # explicit operator acknowledgment so a casual re-run can't
-          # silently burn the next 4-hour window. synthetic_chunk mode
-          # skips this gate because it never calls TI.
-          if [ "${CONFIRM}" != "YES" ]; then
-            echo "::error::Workflow input confirm_catalog_quota_available must be set to YES for real_catalog mode."
-            echo ""
-            echo "TI /v2/store/products/catalog quota: 1 call every 4 hours, 6 calls per day."
-            echo "The catalog probe + capture endpoints share the same quota."
-            echo ""
-            echo "Before re-running:"
-            echo "  1. Confirm at least 4 hours have passed since the last catalog fetch"
-            echo "     attempt (probe, capture, or this workflow). 24 hours is safer."
-            echo "  2. Confirm no concurrent catalog fetch is in flight."
-            echo "  3. Re-dispatch with confirm_catalog_quota_available = YES."
-            echo "  4. Or pick test_mode = synthetic_chunk to verify the writer without quota."
-            exit 1
-          fi
-          echo "Quota acknowledged. Proceeding."
-
       - name: Validate required secrets are configured
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
@@ -135,7 +115,7 @@ jobs:
           fi
 
       # ──────────────────────────────────────────────────────────────────────
-      # synthetic_chunk path — no TI OAuth, no TI catalog fetch.
+      # synthetic_chunk path — no TI OAuth, no TI catalog fetch, no ledger.
       # ──────────────────────────────────────────────────────────────────────
 
       - name: Generate synthetic chunk (test_mode only)
@@ -152,15 +132,14 @@ jobs:
           run_id = str(uuid.uuid4())
           captured_at = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
           # Synthetic product shape mirrors what parseProduct() expects.
-          # Use a clear "PHASE23C3SYNTH" namespace so test rows are obviously
-          # delete-able later (DELETE FROM ti_catalog_latest_opn WHERE
-          # ti_part_number LIKE 'PHASE23C3SYNTH-%').
+          # 'PHASE23C3SYNTH-OPN-*' namespace stays consistent across phases
+          # so the same DELETE statement cleans either path.
           products = []
           for i in range(n):
               products.append({
                   'tiPartNumber': f'PHASE23C3SYNTH-OPN-{i:04d}',
                   'genericPartNumber': f'PHASE23C3SYNTH-GPN-{i // 5:04d}',
-                  'description': f'Synthetic Phase 23C.3 D1-writer test row {i}',
+                  'description': f'Synthetic Phase 23C D1-writer test row {i}',
                   'quantity': 100 + i,
                   'pricing': [{
                       'priceBreaks': [
@@ -193,11 +172,7 @@ jobs:
               }, out, indent=2)
           print(f'Wrote 1 synthetic chunk with {n} products.')
           PY
-          run_id=$(jq -r .runId artifacts/run_meta.json)
-          captured_at=$(jq -r .capturedAt artifacts/run_meta.json)
           synth_count=$(jq -r .totalProducts artifacts/run_meta.json)
-          echo "run_id=${run_id}"          >> "$GITHUB_OUTPUT"
-          echo "captured_at=${captured_at}" >> "$GITHUB_OUTPUT"
           echo "synth_count=${synth_count}" >> "$GITHUB_OUTPUT"
 
       - name: Verify 401 without capture secret (test_mode only)
@@ -253,28 +228,66 @@ jobs:
           if [ "${rps}" -le 0 ] || [ "${rps}" -gt 5 ]; then echo "::error::rowsPerStatement=${rps} not in (0, 5]";   fail=1; fi
           if [ "${ppr}" -le 0 ];                then echo "::error::paramsPerRow=${ppr} (expected > 0)";             fail=1; fi
           if [ "${stmts}" -le 0 ];              then echo "::error::sqlStatementsExecuted=${stmts} (expected > 0)";  fail=1; fi
-          # Sanity: stmts should be ceil(attempted / rowsPerStatement).
-          expected_stmts=$(( (SYNTH_COUNT + rps - 1) / rps ))
-          if [ "${stmts}" != "${expected_stmts}" ]; then
-            echo "::warning::sqlStatementsExecuted=${stmts} differs from ceil(${SYNTH_COUNT}/${rps})=${expected_stmts}; investigate."
-          fi
           if [ "${fail}" = "1" ]; then
             echo "::error::Synthetic chunk diagnostics did not match expectations. See body:"
             jq . < "$response_file" || head -c 500 "$response_file"
             exit 1
           fi
           echo "Synthetic chunk diagnostics OK: ${SYNTH_COUNT} rows in ${stmts} statements (${rps} rows/stmt, ${ppr} params/row)."
+          echo "synthetic_chunk mode: quota ledger NOT touched. Done."
 
       # ──────────────────────────────────────────────────────────────────────
-      # real_catalog path — TI OAuth + full catalog fetch.
+      # real_catalog path — preflight gate FIRST, then TI OAuth + fetch.
       # ──────────────────────────────────────────────────────────────────────
+
+      - name: Quota preflight (real_catalog only)
+        if: ${{ inputs.test_mode != 'synthetic_chunk' }}
+        id: preflight
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+        run: |
+          set -uo pipefail
+          response_file="$(mktemp)"
+          http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            -H 'Content-Type: application/json' \
+            --data '{"source":"github_actions_catalog_ingest","notes":"workflow_dispatch real_catalog"}' \
+            "${BASE_URL}/api/ti/universe/catalog/quota/preflight")"
+          echo "preflight HTTP ${http_code}"
+          jq -c '{success, safeToRun, reason, runId, nextSafeRunAt, minutesUntilSafe, attemptsLast24h: .quotaStatus.attemptsLast24h, lastCatalogAttemptAt: .quotaStatus.lastCatalogAttemptAt}' < "$response_file" || true
+
+          if [ "${http_code}" != "200" ]; then
+            echo "::error::Quota preflight returned HTTP ${http_code}; cannot decide safety. Aborting."
+            exit 1
+          fi
+          safe=$(jq -r '.safeToRun // false' < "$response_file")
+          if [ "${safe}" != "true" ]; then
+            reason=$(jq -r '.reason // "unknown"' < "$response_file")
+            next_at=$(jq -r '.nextSafeRunAt // "unknown"' < "$response_file")
+            mins=$(jq -r '.minutesUntilSafe // 0' < "$response_file")
+            echo "::notice::Quota preflight blocked this run. reason=${reason} nextSafeRunAt=${next_at} minutesUntilSafe=${mins}."
+            echo "skip_real_catalog=true" >> "$GITHUB_OUTPUT"
+            echo "Phase 23C.4: TI catalog NOT touched. Re-dispatch after ${next_at} (~${mins} minutes from now)."
+            exit 0
+          fi
+          run_id=$(jq -r '.runId' < "$response_file")
+          if [ -z "${run_id}" ] || [ "${run_id}" = "null" ]; then
+            echo "::error::Preflight returned safeToRun=true but no runId. Aborting before TI fetch."
+            exit 1
+          fi
+          echo "Quota preflight: safe. runId=${run_id}"
+          echo "skip_real_catalog=false" >> "$GITHUB_OUTPUT"
+          echo "run_id=${run_id}"          >> "$GITHUB_OUTPUT"
 
       - name: Fetch TI OAuth token (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' }}
+        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: token
         env:
           TI_CLIENT_ID: ${{ secrets.TI_CLIENT_ID }}
           TI_CLIENT_SECRET: ${{ secrets.TI_CLIENT_SECRET }}
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          RUN_ID: ${{ steps.preflight.outputs.run_id }}
         run: |
           set -uo pipefail
           token_resp="$(mktemp)"
@@ -285,23 +298,35 @@ jobs:
           if [ "${http_code}" != "200" ]; then
             echo "::error::TI OAuth token endpoint returned HTTP ${http_code}"
             jq -c '{error, error_description, status}' < "$token_resp" 2>/dev/null || head -c 200 "$token_resp"
+            # Close the in_flight ledger row before exiting red.
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg r "$RUN_ID" --arg n "OAuth ${http_code}" '{runId:$r,status:"failed_before_fetch",httpStatus:0,notes:$n}')" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
             exit 1
           fi
           token="$(jq -r '.access_token // empty' < "$token_resp")"
           if [ -z "${token}" ]; then
             echo "::error::TI OAuth response did not contain access_token"
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg r "$RUN_ID" '{runId:$r,status:"failed_before_fetch",notes:"oauth no token"}')" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
             exit 1
           fi
-          # Mask the token in subsequent step logs.
           echo "::add-mask::${token}"
           echo "ti_token=${token}" >> "$GITHUB_OUTPUT"
           echo "Token acquired (value masked)."
 
       - name: Fetch TI catalog (one shot) (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' }}
+        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: fetch
         env:
           TI_TOKEN: ${{ steps.token.outputs.ti_token }}
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          RUN_ID: ${{ steps.preflight.outputs.run_id }}
         run: |
           set -uo pipefail
           mkdir -p artifacts
@@ -312,53 +337,75 @@ jobs:
           size=$(stat -c%s artifacts/catalog.json 2>/dev/null || stat -f%z artifacts/catalog.json)
           echo "TI catalog HTTP ${http_code}, body size: ${size} bytes"
           if [ "${http_code}" = "429" ]; then
-            echo "::error::TI full catalog quota exhausted. Do not rerun immediately. Wait at least 4 hours; safer 24 hours."
-            echo ""
-            echo "TI's /v2/store/products/catalog endpoint is officially rate-limited to 1 call every 4 hours / 6 calls per day."
-            echo "Probe, capture, and this workflow all share the same quota — count any prior attempt against the budget."
-            echo ""
-            echo "Sanitized response head (no secrets):"
-            head -c 500 artifacts/catalog.json || true
+            echo "::error::TI catalog quota exhausted. Next run will be blocked by quota preflight until safe."
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg r "$RUN_ID" '{runId:$r,status:"rate_limited",httpStatus:429,tiErrorCode:"TI-API-0429",notes:"TI returned 429 on /v2/store/products/catalog"}')" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
             exit 1
           fi
           if [ "${http_code}" != "200" ]; then
             echo "::error::TI catalog returned HTTP ${http_code}"
             head -c 500 artifacts/catalog.json
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg r "$RUN_ID" --argjson hs "${http_code}" '{runId:$r,status:"failed_after_fetch",httpStatus:$hs,notes:"non-200 catalog HTTP"}')" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
             exit 1
           fi
           if ! jq -e .catalog < artifacts/catalog.json > /dev/null 2>&1; then
-            # Try alternate top-level keys (defensive).
             if jq -e .products < artifacts/catalog.json > /dev/null 2>&1; then
               jq '{catalog: .products}' < artifacts/catalog.json > artifacts/catalog.normalized.json
               mv artifacts/catalog.normalized.json artifacts/catalog.json
             else
               echo "::error::TI catalog JSON has no .catalog or .products array"
+              curl -sS -X POST \
+                -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+                -H 'Content-Type: application/json' \
+                --data "$(jq -nc --arg r "$RUN_ID" '{runId:$r,status:"failed_after_fetch",notes:"catalog JSON missing .catalog/.products"}')" \
+                "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
               exit 1
             fi
           fi
           total=$(jq '.catalog | length' < artifacts/catalog.json)
           echo "Parsed ${total} products"
+          if [ "${total}" -le 0 ]; then
+            echo "::error::TI catalog parsed 0 products; failing run."
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg r "$RUN_ID" '{runId:$r,status:"failed_after_fetch",productsParsed:0,notes:"empty catalog"}')" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
+            exit 1
+          fi
           echo "body_byte_size=${size}" >> "$GITHUB_OUTPUT"
           echo "total_products=${total}" >> "$GITHUB_OUTPUT"
 
       - name: Split catalog into chunks (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' }}
+        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: split
         env:
           CHUNK_SIZE: ${{ inputs.chunk_size }}
+          RUN_ID: ${{ steps.preflight.outputs.run_id }}
         run: |
           set -uo pipefail
           mkdir -p artifacts/chunks
-          # Use Python for reliable streaming chunking.
           python3 - <<'PY'
-          import json, os, math, uuid, datetime
-          chunk_size = int(os.environ.get('CHUNK_SIZE') or '200')
+          import json, os, math, datetime
+          chunk_size = int(os.environ.get('CHUNK_SIZE') or '100')
+          # Cap matches the Worker's free-tier cap; the Worker rejects
+          # anything above 200 unless allow_large_chunk is set, and the
+          # workflow never sets it.
+          if chunk_size > 200:
+              chunk_size = 200
           with open('artifacts/catalog.json') as f:
               data = json.load(f)
           products = data.get('catalog') or []
           total = len(products)
           total_chunks = math.ceil(total / chunk_size) if chunk_size > 0 else 0
-          run_id = str(uuid.uuid4())
+          run_id = os.environ.get('RUN_ID') or 'no-run-id'
           captured_at = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
           for i in range(total_chunks):
               start = i * chunk_size
@@ -383,18 +430,16 @@ jobs:
               }, out, indent=2)
           print(f'Wrote {total_chunks} chunks ({chunk_size} products/chunk) to artifacts/chunks/')
           PY
-          run_id=$(jq -r .runId artifacts/run_meta.json)
           captured_at=$(jq -r .capturedAt artifacts/run_meta.json)
           total_chunks=$(jq -r .totalChunks artifacts/run_meta.json)
           total_products=$(jq -r .totalProducts artifacts/run_meta.json)
-          echo "run_id=${run_id}"                >> "$GITHUB_OUTPUT"
           echo "captured_at=${captured_at}"      >> "$GITHUB_OUTPUT"
           echo "total_chunks=${total_chunks}"    >> "$GITHUB_OUTPUT"
           echo "total_products=${total_products}" >> "$GITHUB_OUTPUT"
 
       - name: POST each chunk to Worker (real_catalog only)
         id: post_chunks
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && inputs.dry_run != 'true' }}
+        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           TOTAL_CHUNKS: ${{ steps.split.outputs.total_chunks }}
@@ -408,7 +453,9 @@ jobs:
           TOTAL_OUT_OF_STOCK=0
           TOTAL_STMTS=0
 
-          # Iterate chunks in lexical (chunk_0000.json …) order.
+          mkdir -p artifacts/diagnostics
+          # Iterate chunks sequentially in lexical order. No matrix, no
+          # parallel jobs — keeps GH minutes predictable on free plans.
           for chunk_file in $(ls artifacts/chunks/chunk_*.json | sort); do
             response_file="$(mktemp)"
             http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
@@ -422,6 +469,10 @@ jobs:
               echo "::error::${chunk_file} returned non-JSON (HTTP ${http_code})."
               head -c 300 "$response_file" || true
               FAILED_CHUNKS=$((FAILED_CHUNKS + 1))
+              # Keep the first non-JSON sample for upload; trim to 1KB.
+              if [ ! -f artifacts/diagnostics/sample_error_payload.json ]; then
+                head -c 1024 "$response_file" > artifacts/diagnostics/sample_error_payload.json || true
+              fi
               continue
             fi
 
@@ -446,10 +497,17 @@ jobs:
               echo "::warning::chunk ${chunk_idx} success=${success} attempted=${attempted} upserted=${upserted} errors=${errors_len} subBatchErrors=${sub_errs_len}"
               jq -c '{subBatchErrors, errors}' < "$response_file" || true
               FAILED_CHUNKS=$((FAILED_CHUNKS + 1))
+              if [ ! -f artifacts/diagnostics/sample_error_payload.json ]; then
+                jq -c '{chunkIndex, success, attempted, opnRowsUpserted, sqlStatementsExecuted, paramsPerRow, rowsPerStatement, errors, subBatchErrors}' < "$response_file" > artifacts/diagnostics/sample_error_payload.json || true
+              fi
             fi
 
-            # Light pacing — 100ms between chunks.
-            sleep 0.1
+            # Randomized 300–750 ms sleep between chunks (uniform). Avoids
+            # a synchronized burst on the Worker / D1 + keeps GH minutes
+            # predictable. With 720 chunks @ 100 this adds ~3.5–9 min of
+            # pacing on top of ~2–4 minutes actual work.
+            ms=$((RANDOM % 451 + 300))
+            sleep "$(awk -v m="$ms" 'BEGIN{printf "%.3f", m/1000}')"
           done
 
           echo "─── Chunk POST totals ───"
@@ -461,7 +519,19 @@ jobs:
           echo "  inStockOpns:            ${TOTAL_IN_STOCK}"
           echo "  outOfStockOpns:         ${TOTAL_OUT_OF_STOCK}"
 
-          # Surface for downstream finalize/validate steps + final fail check.
+          # Persist a tiny summary for the artifact upload (no chunk bodies).
+          jq -nc \
+            --arg totalChunks "${TOTAL_CHUNKS}" \
+            --arg failedChunks "${FAILED_CHUNKS}" \
+            --arg totalProducts "${TOTAL_PRODUCTS}" \
+            --arg opnUpserted "${TOTAL_OPN_UPSERTED}" \
+            --arg priced "${TOTAL_PRICED}" \
+            --arg inStock "${TOTAL_IN_STOCK}" \
+            --arg outOfStock "${TOTAL_OUT_OF_STOCK}" \
+            --arg sqlStatements "${TOTAL_STMTS}" \
+            '{totalChunks:$totalChunks, failedChunks:$failedChunks, totalProducts:$totalProducts, opnRowsUpserted:$opnUpserted, pricedOpns:$priced, inStockOpns:$inStock, outOfStockOpns:$outOfStock, sqlStatementsExecuted:$sqlStatements}' \
+            > artifacts/failed_chunks_summary.json
+
           echo "failed_chunks=${FAILED_CHUNKS}"             >> "$GITHUB_OUTPUT"
           echo "opn_upserted=${TOTAL_OPN_UPSERTED}"         >> "$GITHUB_OUTPUT"
           echo "priced_opns=${TOTAL_PRICED}"                >> "$GITHUB_OUTPUT"
@@ -469,8 +539,8 @@ jobs:
           echo "out_of_stock_opns=${TOTAL_OUT_OF_STOCK}"    >> "$GITHUB_OUTPUT"
           echo "sql_statements=${TOTAL_STMTS}"              >> "$GITHUB_OUTPUT"
 
-      - name: Finalize (rebuild GPN aggregates + insert snapshot run row) (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && inputs.dry_run != 'true' }}
+      - name: Finalize (rebuild GPN aggregates + insert snapshot run row)
+        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
@@ -489,9 +559,11 @@ jobs:
             "${BASE_URL}/api/ti/universe/catalog/finalize" \
             | jq -c .
 
-      - name: Read /catalog/status + validate (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && inputs.dry_run != 'true' }}
+      - name: Read /catalog/status + validate + close ledger (real_catalog only)
+        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          RUN_ID: ${{ steps.preflight.outputs.run_id }}
           PARSED_PRODUCTS: ${{ steps.split.outputs.total_products }}
           FAILED_CHUNKS: ${{ steps.post_chunks.outputs.failed_chunks }}
           OPN_UPSERTED: ${{ steps.post_chunks.outputs.opn_upserted }}
@@ -499,21 +571,23 @@ jobs:
           set -uo pipefail
           status_file="$(mktemp)"
           curl -sS "${BASE_URL}/api/ti/universe/catalog/status" -o "$status_file"
-          jq -c '{success, backend, opnCount, gpnCount, pricedOpnCount, inStockOpnCount, outOfStockOpnCount, latestCapturedAt}' < "$status_file"
+          jq -c '{success, backend, opnCount, gpnCount, pricedOpnCount, inStockOpnCount, outOfStockOpnCount, latestCapturedAt, parsedOk: (.latestRun.parsed_ok // null)}' < "$status_file"
 
           opn_count=$(jq -r '.opnCount // 0' < "$status_file")
           gpn_count=$(jq -r '.gpnCount // 0' < "$status_file")
           priced=$(jq -r '.pricedOpnCount // 0' < "$status_file")
           in_stock=$(jq -r '.inStockOpnCount // 0' < "$status_file")
           out_of_stock=$(jq -r '.outOfStockOpnCount // 0' < "$status_file")
+          latest_at=$(jq -r '.latestCapturedAt // ""' < "$status_file")
+          parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_file")
 
           fail=0
           if [ "${FAILED_CHUNKS:-0}" != "0" ]; then
-            echo "::error::Phase 23C.3 fail check: ${FAILED_CHUNKS} chunk(s) failed."
+            echo "::error::Phase 23C.4 fail check: ${FAILED_CHUNKS} chunk(s) failed."
             fail=1
           fi
           if [ "${OPN_UPSERTED:-0}" -lt "${PARSED_PRODUCTS:-0}" ]; then
-            echo "::error::Phase 23C.3 fail check: opnRowsUpserted (${OPN_UPSERTED}) < parsedProducts (${PARSED_PRODUCTS})."
+            echo "::error::Phase 23C.4 fail check: opnRowsUpserted (${OPN_UPSERTED}) < parsedProducts (${PARSED_PRODUCTS})."
             fail=1
           fi
           if [ "${opn_count}" != "${PARSED_PRODUCTS}" ]; then
@@ -528,27 +602,48 @@ jobs:
             echo "::error::status.pricedOpnCount (${priced}) must be > 0 — TI catalog always has priced rows."
             fail=1
           fi
-          # in_stock + out_of_stock should be close to opn_count. 'Close'
-          # = within 10% (catalog has some rows where quantity is unknown
-          # / null and they belong to neither bucket).
+          if [ -z "${latest_at}" ] || [ "${latest_at}" = "null" ]; then
+            echo "::error::status.latestCapturedAt missing after finalize."
+            fail=1
+          fi
+          if [ "${parsed_ok}" != "1" ] && [ "${parsed_ok}" != "true" ]; then
+            echo "::error::status.latestRun.parsed_ok != true (${parsed_ok})."
+            fail=1
+          fi
           if_known=$((in_stock + out_of_stock))
-          # Use awk for the percentage check (bash arithmetic is integer-only).
           ratio_ok=$(awk -v k="${if_known}" -v t="${opn_count}" 'BEGIN { if (t <= 0) { print 0 } else { print (k * 100 / t >= 90) ? 1 : 0 } }')
           if [ "${ratio_ok}" != "1" ]; then
             echo "::error::inStock (${in_stock}) + outOfStock (${out_of_stock}) = ${if_known} is < 90% of opnCount (${opn_count})."
             fail=1
           fi
+
           if [ "${fail}" = "1" ]; then
-            echo "::error::Phase 23C.3 post-status validation failed; workflow exiting red."
+            echo "::error::Phase 23C.4 post-status validation failed; closing quota ledger as failed_validation."
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg r "$RUN_ID" --argjson p "${PARSED_PRODUCTS}" --argjson o "${OPN_UPSERTED}" '{runId:$r,status:"failed_validation",productsParsed:$p,opnRowsUpserted:$o,notes:"post-status validation failed"}')" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
             exit 1
           fi
-          echo "Phase 23C.3 post-status validation passed."
+          echo "Phase 23C.4 post-status validation passed."
+          curl -sS -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            -H 'Content-Type: application/json' \
+            --data "$(jq -nc --arg r "$RUN_ID" --argjson p "${PARSED_PRODUCTS}" --argjson o "${OPN_UPSERTED}" --argjson hs 200 '{runId:$r,status:"success",httpStatus:$hs,productsParsed:$p,opnRowsUpserted:$o,notes:"validated end-to-end"}')" \
+            "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c .
 
-      - name: Upload chunk artifacts (debug)
-        if: failure()
+      - name: Upload tiny diagnostic artifacts (failure only)
+        if: failure() && inputs.test_mode != 'synthetic_chunk'
         uses: actions/upload-artifact@v4
         with:
-          name: ti-catalog-chunks-failure
-          path: artifacts/run_meta.json
+          name: ti-catalog-diagnostics
+          # Only the small JSON files — never the raw 50MB catalog body
+          # nor any of the per-chunk bodies. Keeps GH free-plan storage
+          # consumption near zero.
+          path: |
+            artifacts/run_meta.json
+            artifacts/failed_chunks_summary.json
+            artifacts/diagnostics/sample_error_payload.json
           if-no-files-found: warn
-          retention-days: 3
+          retention-days: 1

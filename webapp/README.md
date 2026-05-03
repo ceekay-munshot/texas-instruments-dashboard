@@ -1120,69 +1120,93 @@ batch and every verify passes.
   Bearer / `transact.ti.com` URL. The verify step also does a defensive
   `grep -F` over `/signals/latest` for forbidden tokens.
 
-### TI universe catalog ingest — chunked (Phase 23C.1, recommended)
+### TI universe catalog ingest — quota self-governing (Phase 23C.4, recommended)
 
 The TI catalog endpoint (`/v2/store/products/catalog`) is officially
 rate-limited to **1 call every 4 hours and 6 calls per day**. Probe
 (Phase 23B), capture (Phase 23C, experimental), and the chunked
 ingest workflow below all consume this same quota. Even a single
-probe + capture pair can trigger HTTP 429 for hours. Combined with
-the ~150MB peak memory pressure when parsing 50MB JSON inside a
-Cloudflare Worker, a single-shot Worker capture is fragile.
+probe + capture pair can trigger HTTP 429 for hours.
 
-**Do not retry failed catalog fetches immediately.** Wait at least 4
-hours, safer 24 hours, before re-dispatching. The Phase 23C.2
-workflow has an explicit acknowledgment input
-(`confirm_catalog_quota_available = YES`) that fails fast otherwise,
-so a casual re-run can't silently burn the next 4-hour window.
-
-**Recommended path:** the GH Action [`ti-catalog-universe-ingest.yml`](../.github/workflows/ti-catalog-universe-ingest.yml)
-fetches the catalog ONCE per dispatch, parses + chunks it locally
-(~7GB RAM, no Worker memory pressure), and POSTs 500-product chunks
-to three small Worker endpoints:
+**Operators do not need to remember the safe window.** Phase 23C.4
+moved the quota check inside the system: every real_catalog dispatch
+calls `/api/ti/universe/catalog/quota/preflight` BEFORE TI is
+contacted. If the next safe run is in the future the workflow exits
+success without touching TI; the quota ledger row is never created.
 
   | Endpoint | Auth | Behaviour |
   |---|---|---|
-  | `POST /api/ti/universe/catalog/ingest-chunk` | `X-Capture-Secret` | Upserts ≤500 pre-parsed products into `ti_catalog_latest_opn` |
-  | `POST /api/ti/universe/catalog/finalize`     | `X-Capture-Secret` | Rebuilds `ti_catalog_latest_gpn` via in-SQL `GROUP BY` (never pulls 72k rows into Worker memory). Inserts one `ti_catalog_snapshot_run` summary row. |
-  | `GET  /api/ti/universe/catalog/status`       | _(public, sanitized)_ | Read-only counts for the latest catalog snapshot. Safe for the UI. |
+  | `GET  /api/ti/universe/catalog/quota/status`     | _(public, sanitized)_ | Read-only quota state: `safeToRun`, `nextSafeRunAt`, `minutesUntilSafe`, `attemptsLast24h`, `lastCatalogAttemptAt`, `lastSuccessfulFetchAt`, `last429At`, `inFlight`. Safe for the UI. |
+  | `POST /api/ti/universe/catalog/quota/preflight`  | `X-Capture-Secret` | Atomic check + reserve. Never calls TI. If safe, inserts an `in_flight` ledger row and returns `runId`. If unsafe, returns `safeToRun:false` with the reason. |
+  | `POST /api/ti/universe/catalog/quota/complete`   | `X-Capture-Secret` | Closes an `in_flight` row with the run outcome: `success` / `rate_limited` / `failed_before_fetch` / `failed_after_fetch` / `failed_chunk_write` / `failed_validation`. |
+  | `POST /api/ti/universe/catalog/ingest-chunk`     | `X-Capture-Secret` | Upserts a chunk of pre-parsed products. **Chunk size capped at 200** unless `?allow_large_chunk=1` is passed; the workflow never sets it. Returns `paramsPerRow`, `rowsPerStatement`, `sqlStatementsExecuted`, `subBatchErrors[]`. |
+  | `POST /api/ti/universe/catalog/finalize`         | `X-Capture-Secret` | Rebuilds `ti_catalog_latest_gpn` via in-SQL `GROUP BY` (never pulls 72k rows into Worker memory). Inserts one `ti_catalog_snapshot_run` summary row. |
+  | `GET  /api/ti/universe/catalog/status`           | _(public, sanitized)_ | Counts for the latest catalog snapshot **plus** the embedded `quotaStatus` block, `nextSafeCatalogRunAt`, `minutesUntilSafe`, `attemptsLast24h`. Safe for the UI. |
 
-Worker stays under the 128MB memory cap. TI gets exactly one catalog
-fetch per dispatch.
+#### Operator rules
 
-**Required GH Actions secrets** (one-time setup, **Settings → Secrets and variables → Actions → New repository secret**):
+- **Read `/quota/status` first.** It tells you whether the next real
+  catalog fetch is safe and, if not, exactly when it will be.
+- **The workflow is preflight-gated.** Re-dispatching during the
+  cooldown window will exit success without touching TI; nothing
+  breaks. Do **not** use GitHub's "Re-run jobs" after a failure
+  unless preflight reports safe — re-runs share the same quota.
+- **`synthetic_chunk` never consumes TI quota.** Use it whenever you
+  want to sanity-check the D1 writer; it skips OAuth, the catalog
+  fetch, and the quota ledger entirely.
+- **Run `real_catalog` at most once per day** unless a real
+  refresh need exists. The 4 hr / 6 per 24 hr TI quota is shared
+  with /probe and /capture.
+- **GitHub free-plan friendly.** The workflow is sequential
+  (no matrix, no cache), uses chunk_size 100, sleeps 300–750 ms
+  between chunks, never uploads the raw 50MB catalog body, and only
+  uploads tiny (`run_meta.json`, `failed_chunks_summary.json`,
+  optional `sample_error_payload.json`) artifacts on failure with
+  `retention-days: 1`.
+- **Cloudflare D1 free-tier safety.** Worker chunks are capped at
+  200 products; D1 statements are micro-batched at 5 rows × 16
+  columns = 80 binds (under the ~100-bind D1 effective cap). Larger
+  chunks are rejected unless `?allow_large_chunk=1` is set.
+
+#### Required GH Actions secrets
 
   - `TI_CLIENT_ID` — same value as the Cloudflare Pages env var
   - `TI_CLIENT_SECRET` — same value as the Cloudflare Pages env var
   - `SNAPSHOT_CAPTURE_SECRET` — same one [`ti-inventory-capture.yml`](../.github/workflows/ti-inventory-capture.yml) already uses
 
-**One-time D1 schema setup** (paste the four chunks from
-[`migrations/0003_ti_catalog.sql`](migrations/0003_ti_catalog.sql)
-into the D1 console — same flow as the 0002 migration). Verify with
-`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ti_catalog%';`
-→ should return three rows.
+#### One-time D1 schema setup
 
-**Manual dispatch:**
+Apply [`migrations/0003_ti_catalog.sql`](migrations/0003_ti_catalog.sql)
+(catalog tables) and [`migrations/0004_ti_catalog_quota_ledger.sql`](migrations/0004_ti_catalog_quota_ledger.sql)
+(Phase 23C.4 quota ledger) via the D1 console. Verify with
+`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ti_catalog%';`
+→ should return four rows including `ti_catalog_quota_ledger`.
+
+#### Manual dispatch
 
 ```bash
+# Real catalog fetch — preflight decides whether TI is touched.
+gh workflow run ti-catalog-universe-ingest.yml --ref main
+
+# Synthetic writer test — never touches TI, never writes ledger.
 gh workflow run ti-catalog-universe-ingest.yml --ref main \
-  -f confirm_catalog_quota_available=YES
-# Or browser: Repo → Actions → "TI Catalog Universe Ingest" → Run workflow → main,
-# then type YES in the "confirm_catalog_quota_available" field.
+  -f test_mode=synthetic_chunk
+
+# Or browser: Repo → Actions → "TI Catalog Universe Ingest" → Run workflow.
 ```
 
-The workflow exposes three inputs:
+The workflow exposes four inputs:
 
-  - `confirm_catalog_quota_available` (**required**, default `NO`) —
-    must be exactly `YES` or the workflow fails fast at the gate
-    step. The gate prints the quota rules + a short pre-flight
-    checklist (4-hour wait minimum, 24-hour preferred, no
-    concurrent fetch). Phase 23C.2 added this as a guard against
-    casual re-dispatch burning the next 4-hour quota window.
-  - `chunk_size` (default `500`) — products per chunk POSTed to the
-    Worker.
-  - `dry_run` (default `false`) — parse + chunk without POSTing
-    (no D1 write).
+  - `test_mode` (default `real_catalog`) — pick `synthetic_chunk`
+    to verify the D1 writer in production without touching TI.
+  - `chunk_size` (default `100`, max `200`) — products per chunk.
+    Phase 23C.4 lowered the default from 200 (Phase 23C.3) and 500
+    (Phase 23C.1) to leave headroom for D1 free-tier per-call limits.
+  - `synthetic_chunk_size` (default `25`) — only used in
+    `test_mode=synthetic_chunk`.
+  - `dry_run` (default `false`) — `real_catalog` only: parse +
+    chunk without POSTing (no D1 write). Still calls `/quota/preflight`
+    so a dry run can't bypass the quota gate.
 
 ### TI universe catalog endpoints — experimental (Phase 23B / 23C, not for normal use)
 

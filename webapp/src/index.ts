@@ -76,6 +76,15 @@ import {
   insertSnapshotRunRow,
 } from './sources/tiCatalogIngest'
 import {
+  readQuotaStatus,
+  preflightAndReserve,
+  completeRun,
+  isAllowedCompleteStatus,
+  MAX_ATTEMPTS_PER_24H,
+  MIN_HOURS_BETWEEN_CATALOG_CALLS,
+  SAFETY_BUFFER_MINUTES,
+} from './sources/tiCatalogQuotaLedger'
+import {
   fetchWatchedPartsProductInfo,
   TI_WATCHED_PARTS,
   summarizeWatchedBaskets,
@@ -3050,8 +3059,22 @@ app.post('/api/ti/universe/catalog/ingest-chunk', async (c) => {
   if (!runId || !capturedAt || chunkIndex < 0 || totalChunks <= 0 || !products) {
     return c.json({ success: false, status: 'invalid_payload', message: 'Missing or invalid runId / capturedAt / chunkIndex / totalChunks / products[].' }, 400)
   }
-  if (products.length > 1000) {
-    return c.json({ success: false, status: 'chunk_too_large', message: `Chunk size ${products.length} exceeds the 1000-product safety cap.` }, 413)
+  // Phase 23C.4 — tighten the chunk-size cap from 1000 to 200 to keep
+  // every Worker invocation comfortably inside D1 free-tier per-call
+  // budgets and the ~128MB memory ceiling. Operators can opt past the
+  // cap with `?allow_large_chunk=1` (or { allowLargeChunk: true } in
+  // the body) when knowingly testing on a paid tier; the workflow
+  // never sets that flag.
+  const allowLarge = c.req.query('allow_large_chunk') === '1' || body?.allowLargeChunk === true
+  const chunkCap = allowLarge ? 1000 : 200
+  if (products.length > chunkCap) {
+    return c.json({
+      success: false,
+      status: 'chunk_too_large',
+      message: `Chunk size ${products.length} exceeds the ${chunkCap}-product safety cap.${allowLarge ? '' : ' Set allow_large_chunk=1 (paid tier) to bypass.'}`,
+      cap: chunkCap,
+      allowLargeChunk: allowLarge,
+    }, 413)
   }
   const result = await ingestCatalogChunk(env.TI_INVENTORY_HISTORY_DB as any, {
     runId, capturedAt, chunkIndex, totalChunks, products,
@@ -3139,12 +3162,23 @@ app.get('/api/ti/universe/catalog/status', async (c) => {
       opnCount: 0, gpnCount: 0,
       pricedOpnCount: 0, inStockOpnCount: 0, outOfStockOpnCount: 0,
       latestCapturedAt: null,
+      // Phase 23C.4 — quota fields default to 'unavailable' when D1 isn't
+      // bound. Operators / clients should treat that as 'do not run'.
+      quotaStatus: null,
+      nextSafeCatalogRunAt: null,
+      minutesUntilSafe: 0,
+      lastCatalogAttemptAt: null,
+      lastSuccessfulFetchAt: null,
+      attemptsLast24h: 0,
       refreshPolicy: CATALOG_REFRESH_POLICY,
       message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.',
     })
   }
-  const counts = await readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any)
-  const latestRun = await readLatestSnapshotRun(env.TI_INVENTORY_HISTORY_DB as any)
+  const [counts, latestRun, quota] = await Promise.all([
+    readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any),
+    readLatestSnapshotRun(env.TI_INVENTORY_HISTORY_DB as any),
+    readQuotaStatus(env.TI_INVENTORY_HISTORY_DB as any),
+  ])
   return c.json({
     success: true,
     backend: 'd1',
@@ -3155,8 +3189,152 @@ app.get('/api/ti/universe/catalog/status', async (c) => {
     inStockOpnCount: counts.inStockOpns,
     outOfStockOpnCount: counts.outOfStockOpns,
     latestCapturedAt: counts.latestCapturedAt,
+    // Phase 23C.4 — embed the quota state directly so a single
+    // /catalog/status read tells the operator both 'how full are the
+    // catalog tables' and 'when can I safely refresh next'.
+    quotaStatus: quota,
+    nextSafeCatalogRunAt: quota.nextSafeRunAt,
+    minutesUntilSafe: quota.minutesUntilSafe,
+    lastCatalogAttemptAt: quota.lastCatalogAttemptAt,
+    lastSuccessfulFetchAt: quota.lastSuccessfulFetchAt,
+    attemptsLast24h: quota.attemptsLast24h,
     refreshPolicy: CATALOG_REFRESH_POLICY,
   })
+})
+
+// ── Phase 23C.4 — TI catalog quota self-governance ───────────────────────────
+// Three endpoints back the workflow's preflight gate and operator visibility.
+// Together they ensure the rate-limited TI /v2/store/products/catalog endpoint
+// is never called outside its safe window:
+//   GET  /catalog/quota/status     — public read; UI / dashboards / humans
+//   POST /catalog/quota/preflight  — auth; reserve an in_flight ledger row
+//   POST /catalog/quota/complete   — auth; close that row with the outcome
+// synthetic_chunk runs do NOT call any of these — they don't touch TI.
+
+// GET /api/ti/universe/catalog/quota/status — public, sanitized.
+app.get('/api/ti/universe/catalog/quota/status', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({
+      success: false,
+      backend: 'none',
+      message: 'TI_INVENTORY_HISTORY_DB not bound; quota ledger unavailable.',
+      maxAttemptsPer24h: MAX_ATTEMPTS_PER_24H,
+      minimumHoursBetweenCatalogCalls: MIN_HOURS_BETWEEN_CATALOG_CALLS,
+      safetyBufferMinutes: SAFETY_BUFFER_MINUTES,
+    })
+  }
+  const status = await readQuotaStatus(env.TI_INVENTORY_HISTORY_DB as any)
+  return c.json({ success: true, backend: 'd1', ...status })
+})
+
+// POST /api/ti/universe/catalog/quota/preflight — auth-gated.
+// Never calls TI. Reads the ledger; if safe, inserts an in_flight row and
+// returns runId. The workflow MUST call /quota/complete with that runId
+// after the catalog fetch (success, 429, or any post-fetch failure) so
+// the row never lingers as in_flight forever.
+app.post('/api/ti/universe/catalog/quota/preflight', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot reserve quota row.' }, 500)
+  }
+  let body: any = {}
+  try { body = await c.req.json() } catch { /* allow empty body */ }
+  const source = typeof body?.source === 'string' && body.source.trim().length > 0
+    ? body.source.trim().slice(0, 96)
+    : 'github_actions_catalog_ingest'
+  const notes = typeof body?.notes === 'string' ? body.notes.slice(0, 256) : null
+  const result = await preflightAndReserve(env.TI_INVENTORY_HISTORY_DB as any, { source, notes })
+  if (!result.safeToRun) {
+    return c.json({
+      success: true,
+      safeToRun: false,
+      reason: result.status.reason,
+      nextSafeRunAt: result.status.nextSafeRunAt,
+      minutesUntilSafe: result.status.minutesUntilSafe,
+      quotaStatus: result.status,
+    })
+  }
+  return c.json({
+    success: true,
+    safeToRun: true,
+    runId: result.runId,
+    quotaStatus: result.status,
+  })
+})
+
+// POST /api/ti/universe/catalog/quota/complete — auth-gated.
+// Closes an in_flight ledger row with the run outcome. Allowed statuses:
+// success | rate_limited | failed_before_fetch | failed_after_fetch |
+// failed_chunk_write | failed_validation. Never echoes secrets, raw TI
+// bodies, or OAuth tokens.
+app.post('/api/ti/universe/catalog/quota/complete', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot complete quota row.' }, 500)
+  }
+  let body: any = {}
+  try { body = await c.req.json() } catch {
+    return c.json({ success: false, status: 'invalid_payload', message: 'Body must be JSON.' }, 400)
+  }
+  const runId = typeof body?.runId === 'string' ? body.runId.trim() : ''
+  const statusStr = typeof body?.status === 'string' ? body.status.trim() : ''
+  if (!runId || !statusStr) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'runId and status are required.' }, 400)
+  }
+  if (!isAllowedCompleteStatus(statusStr)) {
+    return c.json({
+      success: false, status: 'invalid_status',
+      message: `status must be one of: success | rate_limited | failed_before_fetch | failed_after_fetch | failed_chunk_write | failed_validation. Got '${statusStr}'.`,
+    }, 400)
+  }
+  const httpStatus = Number.isFinite(body?.httpStatus) ? Math.trunc(body.httpStatus) : null
+  const tiErrorCode = typeof body?.tiErrorCode === 'string' ? body.tiErrorCode : null
+  const productsParsed = Number.isFinite(body?.productsParsed) ? Math.trunc(body.productsParsed) : null
+  const opnRowsUpserted = Number.isFinite(body?.opnRowsUpserted) ? Math.trunc(body.opnRowsUpserted) : null
+  const notes = typeof body?.notes === 'string' ? body.notes : null
+  const res = await completeRun(env.TI_INVENTORY_HISTORY_DB as any, {
+    runId,
+    status: statusStr,
+    httpStatus,
+    tiErrorCode,
+    productsParsed,
+    opnRowsUpserted,
+    notes,
+  })
+  if (!res.updated) {
+    return c.json({
+      success: false,
+      status: 'not_updated',
+      reason: res.reason,
+      message: res.reason === 'no_in_flight_row_for_id'
+        ? 'No in_flight quota row matched the supplied runId. Either the row was already completed or the id is wrong.'
+        : 'Quota ledger update did not apply; see reason.',
+    }, 409)
+  }
+  return c.json({ success: true, runId, status: statusStr })
 })
 
 // Phase 22.2 — POST /api/ti/inventory/staged/validate
