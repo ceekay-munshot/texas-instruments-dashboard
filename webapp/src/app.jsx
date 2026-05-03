@@ -3418,6 +3418,11 @@ function UniversePanel() {
   const [selectedFamily, setSelectedFamily]      = useState(null);
   const [drillLoading, setDrillLoading]          = useState(false);
   const [drillError, setDrillError]              = useState(null);
+  // Phase 24B.1 — second-by-second tick for the locked-refresh card so the
+  // countdown stays accurate without refetching /overview every second.
+  // Only ticks while the cooldown window is active; the effect tears the
+  // interval down once safeToRun flips back to true.
+  const [tickNow, setTickNow]                    = useState(() => Date.now());
 
   // ── Fetchers ────────────────────────────────────────────────────────────
   const fetchOverview = useCallback(async () => {
@@ -3517,6 +3522,24 @@ function UniversePanel() {
     return () => clearTimeout(handle);
   }, [searchQ, runSearch]);
 
+  // Phase 24B.1 — tick once a second WHILE the catalog is in cooldown so the
+  // locked-refresh banner counts down live. Once the cooldown clears, refetch
+  // /overview once and stop ticking until the next cooldown begins.
+  const nextSafeAtMs = overview?.nextSafeCatalogRunAt ? new Date(overview.nextSafeCatalogRunAt).getTime() : 0;
+  const refreshLocked = nextSafeAtMs > tickNow;
+  useEffect(() => {
+    if (!refreshLocked) return undefined;
+    const handle = setInterval(() => setTickNow(Date.now()), 1000);
+    return () => clearInterval(handle);
+  }, [refreshLocked]);
+  useEffect(() => {
+    // Cooldown just cleared — pull fresh /overview so the new safe state is
+    // reflected (lastSuccessfulFetchAt etc. won't move without a real run,
+    // but the lock visual flips immediately).
+    if (!nextSafeAtMs) return;
+    if (tickNow >= nextSafeAtMs) fetchOverview();
+  }, [nextSafeAtMs, tickNow, fetchOverview]);
+
   // ── Helpers ─────────────────────────────────────────────────────────────
   const fmtN = (n) => (n == null ? '—' : Number(n).toLocaleString());
   const fmtPrice = (n) => (n == null ? '—' : `$${Number(n).toFixed(4)}`);
@@ -3534,6 +3557,9 @@ function UniversePanel() {
   };
 
   // ── Card grid ───────────────────────────────────────────────────────────
+  // Phase 24B.1 — "Next safe refresh" no longer lives in the card grid; it
+  // gets its own banner above with a live countdown so the locked state is
+  // unambiguous.
   const cards = overview ? [
     { label: 'Total OPNs',        value: fmtN(overview.opnCount) },
     { label: 'GPN families',      value: fmtN(overview.gpnCount) },
@@ -3544,8 +3570,20 @@ function UniversePanel() {
     { label: 'Median price',      value: fmtPrice(overview.medianNormalizedUnitPrice) },
     { label: 'Min / Max price',   value: `${fmtPrice(overview.minNormalizedUnitPrice)} / ${fmtPrice(overview.maxNormalizedUnitPrice)}` },
     { label: 'Latest capture',    value: fmtDate(overview.latestCapturedAt) },
-    { label: 'Next safe refresh', value: overview.minutesUntilSafe > 0 ? `in ${overview.minutesUntilSafe} min` : 'safe now' },
   ] : [];
+
+  // Phase 24B.1 — live countdown formatter. Always shows mm:ss; prefixes
+  // hours when the cooldown is ≥ 1 hour. Returns 'now' when ms <= 0.
+  const fmtCountdown = (ms) => {
+    if (ms <= 0) return 'now';
+    const total = Math.ceil(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}h ${pad(m)}m ${pad(s)}s` : `${m}m ${pad(s)}s`;
+  };
+  const refreshRemainingMs = Math.max(0, nextSafeAtMs - tickNow);
 
   const SORT_OPTIONS = [
     { id: 'inventory_desc', label: 'Total inventory ↓' },
@@ -3572,6 +3610,69 @@ function UniversePanel() {
         <div style={{ background: '#2a1010', border: '1px solid #5a2020', borderRadius: 6, padding: '8px 12px', marginBottom: 12, fontSize: '0.65rem', color: '#ffb0b0' }}>
           Overview unavailable: {overviewError}
         </div>
+      )}
+
+      {/* Phase 24B.1 — catalog refresh state banner. Locked + amber while in
+          cooldown; green + 'safe now' once the window opens. The actual
+          refresh is operator-only via GitHub Actions; this surface is purely
+          informational so customers know exactly when the next safe window
+          starts. */}
+      {overview && (
+        refreshLocked ? (
+          <div style={{
+            background: '#1a1000',
+            border: '1px solid #5a3a00',
+            borderRadius: 6,
+            padding: '10px 14px',
+            marginBottom: 16,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 14,
+            fontSize: '0.7rem',
+          }}>
+            <span style={{ fontSize: '1.1rem' }} aria-hidden>🔒</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ color: '#f0a84e', fontWeight: 'bold', letterSpacing: '0.06em', textTransform: 'uppercase', fontSize: '0.6rem', marginBottom: 2 }}>
+                Catalog refresh locked
+              </div>
+              <div style={{ color: '#c4d4e8' }}>
+                TI catalog quota cooling down — next safe refresh in
+                {' '}
+                <span style={{ color: '#f0a84e', fontWeight: 'bold', fontFamily: 'monospace' }}>{fmtCountdown(refreshRemainingMs)}</span>
+                {' '}
+                <span style={{ color: '#7a96b8' }}>(at {fmtDate(overview.nextSafeCatalogRunAt)})</span>
+              </div>
+            </div>
+            <span style={{ color: '#8a6020', fontSize: '0.55rem', letterSpacing: '0.1em', textTransform: 'uppercase', border: '1px solid #5a3a00', padding: '4px 8px', borderRadius: 4 }}>operator only</span>
+          </div>
+        ) : (
+          <div style={{
+            background: '#0a1a14',
+            border: '1px solid #1f4a36',
+            borderRadius: 6,
+            padding: '10px 14px',
+            marginBottom: 16,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 14,
+            fontSize: '0.7rem',
+          }}>
+            <span style={{ fontSize: '1.1rem' }} aria-hidden>✅</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ color: '#4dffc3', fontWeight: 'bold', letterSpacing: '0.06em', textTransform: 'uppercase', fontSize: '0.6rem', marginBottom: 2 }}>
+                Catalog refresh window open
+              </div>
+              <div style={{ color: '#c4d4e8' }}>
+                TI catalog quota is in its safe window. Operator may dispatch
+                {' '}
+                <code style={{ color: '#7a96b8' }}>ti-catalog-universe-ingest</code>
+                {' '}
+                via GitHub Actions.
+              </div>
+            </div>
+            <span style={{ color: '#4a6a8a', fontSize: '0.55rem', letterSpacing: '0.1em', textTransform: 'uppercase', border: `1px solid ${B}`, padding: '4px 8px', borderRadius: 4 }}>operator only</span>
+          </div>
+        )
       )}
 
       {/* ── Cards ─────────────────────────────────────────────────────── */}
