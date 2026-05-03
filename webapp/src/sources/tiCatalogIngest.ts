@@ -858,6 +858,98 @@ export type RebuildOneSubcategoryResult = {
   errors: string[]
 }
 
+// ── Phase 24C.2 — rollup mapping-quality classifier ─────────────────────────
+// Customer-facing rollups should be flagged honestly when they were
+// largely produced by low-confidence rules. Production verification
+// showed e.g. interface_can opnCount=12842, low=12458 — a "high signal"
+// surface dominated by keyword-fallback contamination. The classifier
+// reads each rollup's mapping_confidence_summary and emits:
+//
+//   highConfidenceOpnCount / mediumConfidenceOpnCount / lowConfidenceOpnCount
+//   highConfidencePct       — high / opnCount * 100, rounded 2dp
+//   qualityLabel            — high | medium | low | mixed
+//   usableForPricesLiveEvidence — true for high|medium, false otherwise
+//   qualityWarning          — short string when label is low|mixed; null otherwise
+//
+// Rules (per Phase 24C.2 spec):
+//   high   — highConfidencePct >= 70 AND opnCount >= 10
+//   medium — (high+medium)/total >= 70% AND opnCount >= 10
+//   low    — lowConfidencePct > 50 OR opnCount < 10
+//   mixed  — anything else
+
+export type RollupQualityLabel = 'high' | 'medium' | 'low' | 'mixed'
+
+export type RollupQuality = {
+  highConfidenceOpnCount: number
+  mediumConfidenceOpnCount: number
+  lowConfidenceOpnCount: number
+  highConfidencePct: number
+  mediumConfidencePct: number
+  lowConfidencePct: number
+  qualityLabel: RollupQualityLabel
+  usableForPricesLiveEvidence: boolean
+  qualityWarning: string | null
+}
+
+export function computeRollupQuality(args: {
+  opnCount: number
+  mappingConfidenceSummary: unknown
+}): RollupQuality {
+  const total = Math.max(0, Number(args.opnCount) || 0)
+  let summary: Record<string, number> = {}
+  if (args.mappingConfidenceSummary && typeof args.mappingConfidenceSummary === 'object') {
+    summary = args.mappingConfidenceSummary as Record<string, number>
+  } else if (typeof args.mappingConfidenceSummary === 'string') {
+    try { summary = JSON.parse(args.mappingConfidenceSummary) } catch {}
+  }
+  const high = Math.max(0, Number(summary.high ?? 0) || 0)
+  const med  = Math.max(0, Number(summary.medium ?? 0) || 0)
+  const low  = Math.max(0, Number(summary.low ?? 0) || 0)
+  const pct = (n: number) => total > 0 ? Math.round((n / total) * 10000) / 100 : 0
+  const highPct = pct(high)
+  const medPct = pct(med)
+  const lowPct = pct(low)
+  // Empty subcategories (opnCount=0) are 'low' per the spec ("opnCount < 10").
+  let qualityLabel: RollupQualityLabel
+  if (highPct >= 70 && total >= 10) qualityLabel = 'high'
+  else if ((highPct + medPct) >= 70 && total >= 10) qualityLabel = 'medium'
+  else if (lowPct > 50 || total < 10) qualityLabel = 'low'
+  else qualityLabel = 'mixed'
+  const usable = qualityLabel === 'high' || qualityLabel === 'medium'
+  // Phase 24C.2 — distinguish the three reasons a rollup lands in
+  // low/mixed so the warning text is honest about what's wrong:
+  //   - empty:           no OPNs mapped at all
+  //   - small_sample:    < 10 OPNs (the high-confidence rule for the
+  //                      subcategory exists but barely fired)
+  //   - contaminated:    enough OPNs but >50% used low-confidence
+  //                      keyword/broad rules
+  //   - mixed:           reasonable spread of confidences but neither
+  //                      high nor medium thresholds met
+  let qualityWarning: string | null = null
+  if (qualityLabel === 'low') {
+    if (total === 0) {
+      qualityWarning = 'No OPNs map to this canonical subcategory under the current rule set.'
+    } else if (lowPct > 50) {
+      qualityWarning = `${lowPct}% of mapped OPNs use low-confidence keyword/broad rules across ${total} OPNs. Treat as context, not signal.`
+    } else {
+      qualityWarning = `Small sample (${total} OPNs); minimum 10 needed for high-confidence signal. Treat as context, not signal.`
+    }
+  } else if (qualityLabel === 'mixed') {
+    qualityWarning = `Mixed confidence: ${highPct}% high · ${medPct}% medium · ${lowPct}% low across ${total} OPNs. Use as context, not signal.`
+  }
+  return {
+    highConfidenceOpnCount: high,
+    mediumConfidenceOpnCount: med,
+    lowConfidenceOpnCount: low,
+    highConfidencePct: highPct,
+    mediumConfidencePct: medPct,
+    lowConfidencePct: lowPct,
+    qualityLabel,
+    usableForPricesLiveEvidence: usable,
+    qualityWarning,
+  }
+}
+
 export type RollupStatusResult = {
   totalCanonicalSubcategories: number
   completedSubcategories: number

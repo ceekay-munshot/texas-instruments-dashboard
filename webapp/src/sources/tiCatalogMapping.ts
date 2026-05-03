@@ -145,36 +145,36 @@ export const CANONICAL_MAPPING_RULES: MappingRule[] = [
   // samples).
   rule('power_ldo_tps7a', gpnPrefix(['TPS7A']),                      'power_management',  'power_ldo',              'high'),
   rule('power_ldo',     gpnPrefix(['TLV7', 'TLV8', 'TLV9', 'TPS779', 'LP590', 'TLV767', 'TPS73', 'TPS74']), 'power_management', 'power_ldo', 'high'),
-  // Phase 24C.1 — LED / backlight drivers (LM3*, TPS9*, TLC59*) and
-  // motor drivers (DRV8/3/5) bucket under DC-DC switching since the
-  // taxonomy doesn't have a dedicated driver bucket.
-  rule('power_led_driver', gpnPrefix(['LM3', 'TPS9', 'TLC59']),      'power_management',  'power_dcdc_switching',   'medium'),
+  // Phase 24C.1 — motor drivers (DRV8/3/5) bucket under DC-DC switching
+  // since the taxonomy doesn't have a dedicated motor-driver bucket.
+  // Phase 24C.2 — removed `power_led_driver` (LM3*/TPS9*/TLC59*) because
+  // the LM3* prefix matched LM358 op-amps and other unrelated parts;
+  // also removed analog_voltage_ref, analog_temp_sensor, interface_logic_switch,
+  // interface_esd_protection, and all desc_* keyword fallbacks because
+  // production verification (interface_can opnCount=12842, low=12458;
+  // amp_opamps highest-inv=TMP113AIYBGR; isolation_digital
+  // highest-inv=TLV61046 boost converter) showed they were placing
+  // unrelated parts into customer-facing categories. Better to leave
+  // them unmapped and surface that honestly than to ship contaminated
+  // rollups. Operator can re-add narrower rules later.
   rule('power_motor_driver', gpnPrefix(['DRV8', 'DRV3', 'DRV5']),    'power_management',  'power_dcdc_switching',   'medium'),
   // Catch-all DC-DC AFTER the more specific TPS546 / TPS25xx rules above.
   rule('power_dcdc_switching', gpnPrefix(['TPS54', 'TPS55', 'TPS56', 'TPS57', 'TPS61', 'TPS62', 'TPS63', 'LMR1', 'LMR2', 'LMR3', 'LM5145', 'LM5146']), 'power_management', 'power_dcdc_switching', 'high'),
 
-  // ── Phase 24C.1 additional precision-analog rules ───────────────────────
-  // Voltage references and temperature sensors bucket under amp_opamps
-  // (closest precision-analog subcategory in the canonical taxonomy).
-  rule('analog_voltage_ref', gpnPrefix(['REF', 'LM4040', 'LM4041', 'LM4128']), 'amplifiers', 'amp_opamps', 'medium'),
-  rule('analog_temp_sensor', gpnPrefix(['TMP1', 'TMP2', 'TMP3', 'LM35', 'LM75', 'LM84']), 'amplifiers', 'amp_opamps', 'medium'),
+  // ── Phase 24C.2 — desc_* keyword fallbacks intentionally absent ────────
+  // The Phase 24C low-confidence keyword fallbacks (`desc_ldo`,
+  // `desc_buck`, `desc_opamp`, `desc_adc`, `desc_dac`, `desc_can`,
+  // `desc_isolator`) generated the bulk of the mapping contamination
+  // observed on production: free-form description keywords matched
+  // unrelated parts ("isolation" appears in many non-isolator
+  // descriptions, including TLV61046 boost converters). Removing them
+  // drops mappingCoveragePct from ~57% to ~25–30% but the remaining
+  // mapped rows are clean enough to drive Prices tab evidence.
 
-  // ── Phase 24C.1 interface-side fallbacks ────────────────────────────────
-  // Logic / analog switches → interface_can bucket (closest "switching
-  // logic" sibling); ESD / protection diodes → interface_ethernet_phy
-  // bucket (closest signal-integrity sibling). Both low-confidence — the
-  // operator can dig into the rollup row to see they're keyword fallbacks.
-  rule('interface_logic_switch', gpnPrefix(['SN74', 'SN54', 'TS5A', 'TS3A', 'CD74']), 'interface_ics', 'interface_can',          'low'),
-  rule('interface_esd_protection', gpnPrefix(['TPD', 'ESD']),        'interface_ics',     'interface_ethernet_phy', 'low'),
-
-  // ── Description keyword fallbacks (low confidence) ──────────────────────
-  rule('desc_ldo',   descKeyword([/\bldo\b/i, /low.?dropout/i]),     'power_management', 'power_ldo',              'low'),
-  rule('desc_buck',  descKeyword([/buck.?conv/i, /step.?down/i]),    'power_management', 'power_dcdc_switching',   'low'),
-  rule('desc_opamp', descKeyword([/op[- ]?amp/i, /operational amplifier/i]), 'amplifiers', 'amp_opamps',           'low'),
-  rule('desc_adc',   descKeyword([/\badc\b/i, /analog.to.digital/i]), 'data_converters', 'conv_adc',               'low'),
-  rule('desc_dac',   descKeyword([/\bdac\b/i, /digital.to.analog/i]), 'data_converters', 'conv_dac',               'low'),
-  rule('desc_can',   descKeyword([/can transceiver/i, /can bus/i]),   'interface_ics',   'interface_can',          'low'),
-  rule('desc_isolator', descKeyword([/isolator/i, /isolation/i]),     'isolation',       'isolation_digital',      'low'),
+  // Description keyword fallbacks intentionally removed — see Phase 24C.2
+  // comment block above. The descKeyword() helper is kept defined for
+  // future narrow rules that combine a tight prefix + a description
+  // qualifier; no current rules use it.
 ]
 
 export type MappingResult = {

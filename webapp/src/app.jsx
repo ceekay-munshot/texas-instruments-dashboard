@@ -4379,10 +4379,23 @@ function App(){
         const canonical = combinedEvidence?.legacyToCanonical?.[catId];
         const r = canonical ? tiRollupsByCanonical[canonical] : null;
         if (!r) return null;
+        // Phase 24C.2 — server-supplied quality fields. Fall back to a
+        // local recomputation from mappingConfidenceSummary so the
+        // tooltip still degrades gracefully if the rollup row predates
+        // 24C.2.
         const conf = r.mappingConfidenceSummary || {};
-        const high = Number(conf.high || 0), med = Number(conf.medium || 0), low = Number(conf.low || 0);
-        const confLabel = high > 0 ? 'high' : med > 0 ? 'medium' : low > 0 ? 'low' : 'unknown';
-        const confColor = confLabel === 'high' ? '#4dffc3' : confLabel === 'medium' ? '#00c9a7' : confLabel === 'low' ? '#f0a84e' : '#4a6a8a';
+        const high = Number(r.highConfidenceOpnCount ?? conf.high ?? 0);
+        const med  = Number(r.mediumConfidenceOpnCount ?? conf.medium ?? 0);
+        const low  = Number(r.lowConfidenceOpnCount ?? conf.low ?? 0);
+        const highPct = r.highConfidencePct != null ? Number(r.highConfidencePct) : null;
+        const qualityLabel = r.qualityLabel || 'unknown';
+        const usable = r.usableForPricesLiveEvidence === true;
+        const qualityWarning = r.qualityWarning || null;
+        const qualityColor = qualityLabel === 'high' ? '#4dffc3'
+                           : qualityLabel === 'medium' ? '#00c9a7'
+                           : qualityLabel === 'low' ? '#f0a84e'
+                           : qualityLabel === 'mixed' ? '#f0a84e'
+                           : '#4a6a8a';
         const lifecycleEntries = r.lifecycleSummary && typeof r.lifecycleSummary === 'object'
           ? Object.entries(r.lifecycleSummary) : [];
         const fmtP = (n) => n == null ? '—' : `$${Number(n).toFixed(4)}`;
@@ -4393,7 +4406,7 @@ function App(){
               <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· canonical subcategory · 72k-OPN snapshot</span>
             </div>
             <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
-              <div>Snapshot: {r.latestCapturedAt ? new Date(r.latestCapturedAt).toISOString().slice(0,10) : '—'} · mapping <span style={{color:confColor,fontWeight:'bold'}}>{confLabel}</span></div>
+              <div>Snapshot: {r.latestCapturedAt ? new Date(r.latestCapturedAt).toISOString().slice(0,10) : '—'} · mapping quality <span style={{color:qualityColor,fontWeight:'bold'}}>{qualityLabel}</span>{!usable && qualityLabel !== 'unknown' ? ' · use as context, not signal' : ''}</div>
               <div>OPNs: {Number(r.opnCount).toLocaleString()} · GPN families: {Number(r.gpnCount).toLocaleString()} · priced: {Number(r.pricedOpnCount).toLocaleString()}</div>
               <div>Stocked: {Number(r.stockedOpnCount).toLocaleString()} ({r.stockedPct == null ? '—' : `${r.stockedPct}%`}) · Out of stock: {Number(r.outOfStockOpnCount).toLocaleString()}</div>
               <div>Total qty: {Number(r.totalQuantity || 0).toLocaleString()}</div>
@@ -4402,6 +4415,21 @@ function App(){
               {r.highestInventoryOpn && <div>Highest-inv OPN: <span style={{color:'#e0eaf8'}}>{r.highestInventoryOpn}</span></div>}
               {lifecycleEntries.length > 0 && (
                 <div>Lifecycle: {lifecycleEntries.map(([k,v]) => `${k}:${v}`).join(' · ')}</div>
+              )}
+              {/* Phase 24C.2 — mapping-quality block. Always shown so
+                  the operator can see exactly what's behind the
+                  qualityLabel; warning banner only when low/mixed. */}
+              <div style={{marginTop:4,paddingTop:4,borderTop:'1px dashed #1a2740'}}>
+                <span style={{color:'#7a96b8'}}>Mapping: </span>
+                <span style={{color:'#4dffc3'}}>{high} high</span>
+                <span style={{color:'#7a96b8'}}> · </span>
+                <span style={{color:'#00c9a7'}}>{med} medium</span>
+                <span style={{color:'#7a96b8'}}> · </span>
+                <span style={{color:'#f0a84e'}}>{low} low</span>
+                {highPct != null && <span style={{color:'#7a96b8'}}> · {highPct}% high-conf</span>}
+              </div>
+              {qualityWarning && (
+                <div style={{color:qualityColor,fontStyle:'italic',marginTop:3}}>⚠ {qualityWarning}</div>
               )}
               <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</div>
             </div>
@@ -4495,8 +4523,10 @@ function App(){
         <span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ ≥5%</span>
         <span style={{color:'#4a6a8a'}}>· Historical = QoQ %; Live row = Mouser qty=1 vs latest baseline · hover any cell for detail</span>
-        {/* Phase 24C — TI marker key + caveat about single-snapshot evidence. */}
-        <span style={{color:'#4dffc3'}}>· <sup style={{fontSize:'0.55rem'}}>TI</sup>=Direct full-catalog rollup</span>
+        {/* Phase 24C / 24C.2 — TI marker key + caveat. TI = clean
+            (high/medium quality); TI? = broad/experimental (low/mixed). */}
+        <span style={{color:'#4dffc3'}}>· <sup style={{fontSize:'0.55rem'}}>TI</sup>=Direct full-catalog rollup (clean)</span>
+        <span style={{color:'#f0a84e'}}>· <sup style={{fontSize:'0.55rem',opacity:0.55}}>TI?</sup>=broad mapping (use as context, not signal)</span>
         <span style={{color:'#7a96b8'}}>· TI Direct evidence is latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</span>
       </div>
 
@@ -4557,20 +4587,29 @@ function App(){
                 const isLive=d&&!d.error&&d.parts?.length>0;
                 const isRLCell = d?.error?.includes('Rate limit');
                 const hasBasket=!!basketCatFor(c.id);
-                // Phase 24C — TI Direct full-catalog rollup availability
+                // Phase 24C / 24C.2 — TI Direct full-catalog rollup availability
                 // for this canonical subcategory. Drives the small "TI"
                 // marker AND lets us reach hover even when Mouser/Nexar
-                // are silent (rate-limited or out-of-basket).
+                // are silent (rate-limited or out-of-basket). Phase 24C.2
+                // gates the marker color + warning on the server-supplied
+                // qualityLabel (high|medium|low|mixed) so contaminated
+                // rollups appear as caution rather than clean signal.
                 const canonicalForCell = combinedEvidence?.legacyToCanonical?.[c.id];
                 const tiRollup = canonicalForCell ? tiRollupsByCanonical[canonicalForCell] : null;
                 const hasTiRollup = !!tiRollup;
-                const tiConf = tiRollup?.mappingConfidenceSummary || {};
-                const tiConfLabel = (Number(tiConf.high||0) > 0) ? 'high'
-                                  : (Number(tiConf.medium||0) > 0) ? 'medium'
-                                  : (Number(tiConf.low||0) > 0) ? 'low' : 'unknown';
-                const tiBadgeColor = tiConfLabel === 'high' ? '#4dffc3'
-                                   : tiConfLabel === 'medium' ? '#00c9a7'
-                                   : tiConfLabel === 'low' ? '#f0a84e' : '#7a96b8';
+                const tiQualityLabel = tiRollup?.qualityLabel || 'unknown';
+                const tiUsable = tiRollup?.usableForPricesLiveEvidence === true;
+                const tiBadgeColor = tiQualityLabel === 'high'   ? '#4dffc3'
+                                   : tiQualityLabel === 'medium' ? '#00c9a7'
+                                   : tiQualityLabel === 'low'    ? '#f0a84e'
+                                   : tiQualityLabel === 'mixed'  ? '#f0a84e'
+                                   : '#7a96b8';
+                const tiBadgeOpacity = tiUsable ? 1 : 0.55;
+                const tiBadgeTitle = !hasTiRollup
+                  ? undefined
+                  : tiUsable
+                    ? `TI Direct full-catalog rollup available (${tiQualityLabel} mapping quality) — hover for detail`
+                    : `TI Direct rollup is broad/experimental for this category (${tiQualityLabel}); use as context, not signal.`;
                 // Hover fires when Mouser is live OR Nexar basket has cross-source
                 // data — so a Mouser rate-limited cell still surfaces the Nexar
                 // section (Phase 9: cross-source enrichment must be reachable).
@@ -4585,7 +4624,7 @@ function App(){
                     onMouseLeave={hasTooltip?()=>setTooltip(null):undefined}
                     title={isRLCell?'Rate limited — will retry automatically':undefined}
                     style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:hasTooltip?'crosshair':'default'}}>
-                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}{hasTiRollup&&<sup style={{fontSize:'0.42rem',color:tiBadgeColor,marginLeft:1}} title={`TI Direct full-catalog rollup available (${tiConfLabel} mapping confidence) — hover for detail`}>TI</sup>}
+                    {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}{hasTiRollup&&<sup style={{fontSize:'0.42rem',color:tiBadgeColor,marginLeft:1,opacity:tiBadgeOpacity}} title={tiBadgeTitle}>{tiUsable ? 'TI' : 'TI?'}</sup>}
                   </td>
                 );
               })}

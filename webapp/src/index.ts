@@ -81,6 +81,7 @@ import {
   readSnapshotCounts,
   readLatestSnapshotRun,
   insertSnapshotRunRow,
+  computeRollupQuality,
 } from './sources/tiCatalogIngest'
 import type { SubcategoryPredicate } from './sources/tiCatalogMapping'
 import {
@@ -3449,31 +3450,160 @@ app.get('/api/ti/universe/catalog/rollups/latest', async (c) => {
     if (typeof s !== 'string') return s ?? null
     try { return JSON.parse(s) } catch { return s }
   }
-  const rows = (result.results ?? []).map((r: Row) => ({
-    canonicalGroup: r.canonical_group,
-    canonicalSubcategory: r.canonical_subcategory,
-    opnCount: r.opn_count,
-    gpnCount: r.gpn_count,
-    pricedOpnCount: r.priced_opn_count,
-    stockedOpnCount: r.stocked_opn_count,
-    outOfStockOpnCount: r.out_of_stock_opn_count,
-    stockedPct: r.stocked_pct,
-    totalQuantity: r.total_quantity,
-    medianNormalizedUnitPrice: r.median_normalized_unit_price,
-    minNormalizedUnitPrice: r.min_normalized_unit_price,
-    maxNormalizedUnitPrice: r.max_normalized_unit_price,
-    cheapestOpn: r.cheapest_opn,
-    highestInventoryOpn: r.highest_inventory_opn,
-    lifecycleSummary: parseJson(r.lifecycle_summary),
-    mappingConfidenceSummary: parseJson(r.mapping_confidence_summary),
-    latestCapturedAt: r.latest_captured_at,
-  }))
+  const rows = (result.results ?? []).map((r: Row) => {
+    const mappingConfidenceSummary = parseJson(r.mapping_confidence_summary)
+    // Phase 24C.2 — derive mapping-quality flags so the Prices tab can
+    // visually distinguish clean (high/medium) from contaminated
+    // (low/mixed) rollups. Quality fields never alter the underlying
+    // counts; they're advisory.
+    const quality = computeRollupQuality({
+      opnCount: r.opn_count,
+      mappingConfidenceSummary,
+    })
+    return {
+      canonicalGroup: r.canonical_group,
+      canonicalSubcategory: r.canonical_subcategory,
+      opnCount: r.opn_count,
+      gpnCount: r.gpn_count,
+      pricedOpnCount: r.priced_opn_count,
+      stockedOpnCount: r.stocked_opn_count,
+      outOfStockOpnCount: r.out_of_stock_opn_count,
+      stockedPct: r.stocked_pct,
+      totalQuantity: r.total_quantity,
+      medianNormalizedUnitPrice: r.median_normalized_unit_price,
+      minNormalizedUnitPrice: r.min_normalized_unit_price,
+      maxNormalizedUnitPrice: r.max_normalized_unit_price,
+      cheapestOpn: r.cheapest_opn,
+      highestInventoryOpn: r.highest_inventory_opn,
+      lifecycleSummary: parseJson(r.lifecycle_summary),
+      mappingConfidenceSummary,
+      latestCapturedAt: r.latest_captured_at,
+      ...quality,
+    }
+  })
   return c.json({
     success: true,
     backend: 'd1',
     filters: { group, subcategory, confidence, limit },
     rows,
-    note: 'Phase 24C — TI Direct evidence is the latest catalog snapshot only. Historical trend requires at least two TI catalog snapshots.',
+    note: 'Phase 24C / 24C.2 — TI Direct evidence is the latest catalog snapshot only; quality fields advise whether each row is clean enough for live signal. Historical trend requires at least two TI catalog snapshots.',
+  })
+})
+
+// GET /api/ti/universe/catalog/rollups/quality — public, sanitized.
+//
+// Phase 24C.2 — operator + customer-facing diagnostic that surfaces
+// rollup-mapping quality at a glance: how many subcategories fall in
+// each quality bucket, the worst 10 rows by lowConfidencePct, the
+// largest 10 rows by absolute low-confidence OPN count, and example
+// suspicious cheapest/highest OPNs from low/mixed rollups so the
+// operator can see exactly what's contaminating the signal.
+app.get('/api/ti/universe/catalog/rollups/quality', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; rollup quality unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  type RawRow = {
+    canonical_group: string;
+    canonical_subcategory: string;
+    opn_count: number; gpn_count: number;
+    priced_opn_count: number; stocked_opn_count: number; out_of_stock_opn_count: number;
+    stocked_pct: number | null; total_quantity: number | null;
+    median_normalized_unit_price: number | null;
+    min_normalized_unit_price: number | null;
+    max_normalized_unit_price: number | null;
+    cheapest_opn: string | null; highest_inventory_opn: string | null;
+    lifecycle_summary: string | null; mapping_confidence_summary: string | null;
+    latest_captured_at: string;
+  }
+  const all = await d1.prepare(
+    `SELECT canonical_group, canonical_subcategory,
+            opn_count, gpn_count, priced_opn_count,
+            stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+            total_quantity, median_normalized_unit_price,
+            min_normalized_unit_price, max_normalized_unit_price,
+            cheapest_opn, highest_inventory_opn,
+            lifecycle_summary, mapping_confidence_summary,
+            latest_captured_at
+       FROM ti_catalog_rollup_latest`,
+  ).all<RawRow>()
+  const parseJson = (s: string | null) => {
+    if (typeof s !== 'string') return s ?? null
+    try { return JSON.parse(s) } catch { return s }
+  }
+  const rows = (all.results ?? []).map((r: RawRow) => {
+    const mappingConfidenceSummary = parseJson(r.mapping_confidence_summary)
+    const quality = computeRollupQuality({ opnCount: r.opn_count, mappingConfidenceSummary })
+    return {
+      canonicalGroup: r.canonical_group,
+      canonicalSubcategory: r.canonical_subcategory,
+      opnCount: r.opn_count,
+      cheapestOpn: r.cheapest_opn,
+      highestInventoryOpn: r.highest_inventory_opn,
+      mappingConfidenceSummary,
+      ...quality,
+    }
+  })
+  const byLabel: Record<string, typeof rows> = { high: [], medium: [], low: [], mixed: [] }
+  for (const r of rows) byLabel[r.qualityLabel].push(r)
+  const counts = {
+    total: rows.length,
+    high: byLabel.high.length,
+    medium: byLabel.medium.length,
+    low: byLabel.low.length,
+    mixed: byLabel.mixed.length,
+  }
+  // Worst-by-low-percentage AND largest-by-absolute-low-count are useful
+  // operator views: the first highlights subcategories that are mostly
+  // junk, the second highlights subcategories where most parts are
+  // clean but a few thousand low-confidence rows still swamp the count.
+  const worstByLowPct = [...rows]
+    .filter(r => r.opnCount >= 10) // exclude empty/tiny subcategories from the leaderboard
+    .sort((a, b) => b.lowConfidencePct - a.lowConfidencePct)
+    .slice(0, 10)
+    .map(r => ({
+      canonicalSubcategory: r.canonicalSubcategory,
+      qualityLabel: r.qualityLabel,
+      opnCount: r.opnCount,
+      lowConfidencePct: r.lowConfidencePct,
+      lowConfidenceOpnCount: r.lowConfidenceOpnCount,
+      qualityWarning: r.qualityWarning,
+    }))
+  const largestLowCount = [...rows]
+    .sort((a, b) => b.lowConfidenceOpnCount - a.lowConfidenceOpnCount)
+    .slice(0, 10)
+    .map(r => ({
+      canonicalSubcategory: r.canonicalSubcategory,
+      qualityLabel: r.qualityLabel,
+      opnCount: r.opnCount,
+      lowConfidenceOpnCount: r.lowConfidenceOpnCount,
+      lowConfidencePct: r.lowConfidencePct,
+    }))
+  // Sample suspicious OPNs from low/mixed rollups: cheapest + highest-
+  // inventory entries are the customer-visible names in the tooltip,
+  // so flagging which ones came out of contaminated buckets is the
+  // most useful single hint.
+  const suspiciousOpns = rows
+    .filter(r => r.qualityLabel === 'low' || r.qualityLabel === 'mixed')
+    .filter(r => r.cheapestOpn || r.highestInventoryOpn)
+    .slice(0, 10)
+    .map(r => ({
+      canonicalSubcategory: r.canonicalSubcategory,
+      qualityLabel: r.qualityLabel,
+      cheapestOpn: r.cheapestOpn,
+      highestInventoryOpn: r.highestInventoryOpn,
+      qualityWarning: r.qualityWarning,
+    }))
+  return c.json({
+    success: true,
+    backend: 'd1',
+    counts,
+    rows,
+    worstByLowPct,
+    largestLowCount,
+    suspiciousOpns,
+    note: 'Phase 24C.2 — Rollup quality flags. Use rows.qualityLabel + usableForPricesLiveEvidence to drive customer-facing UI gating. Operator: tighten mapping rules (tiCatalogMapping.ts) for any subcategory that lands in low/mixed; remove broad keyword fallbacks first.',
   })
 })
 
