@@ -3782,27 +3782,49 @@ function App(){
           </div>
         );
       })()}
-      {agree&&(combinedEvidence?.latestMouserSnapshotDate||combinedEvidence?.latestNexarSnapshotDate)&&(()=>{
+      {agree&&(combinedEvidence?.latestMouserSnapshotDate||combinedEvidence?.latestNexarSnapshotDate||combinedEvidence?.latestTiDirectSnapshotDate)&&(()=>{
         const aColor = agree.agreementStatus==='strong_agreement'?'#4dffc3'
                     : agree.agreementStatus==='moderate_agreement'?'#00c9a7'
                     : agree.agreementStatus==='divergent'?'#f0a84e'
                     : agree.agreementStatus==='single_source_only'?'#7a96b8'
                     : '#4a6a8a';
         const aLabel = agree.agreementStatus.replace(/_/g,' ');
+        // Phase 23C.6 — surface TI direct alongside Mouser + Nexar.
+        // Δ is signed % vs Mouser baseline (matches Nexar-vs-Mouser
+        // formula). Sample size is the number of watched parts with
+        // a parsed normalizedUnitPrice that mapped into this canonical.
+        const tiPrice = agree.tiDirectPrice;
+        const tiInv = agree.tiDirectInventory;
+        const tiSamples = agree.tiDirectSampleSize ?? 0;
+        const tiPriceDelta = agree.tiPriceDeltaPctVsMouser;
+        const tiInvDelta = agree.tiInventoryDeltaPctVsMouser;
+        const hasTi = tiPrice != null || tiInv != null;
+        const fmtSigned = (v) => v == null ? '—' : `${v > 0 ? '+' : ''}${v}%`;
         return (
           <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
             <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
               Combined source evidence
-              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· Mouser backbone + Nexar rotating</span>
+              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· Mouser backbone + Nexar rotating + TI direct</span>
             </div>
             <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
               {combinedEvidence?.latestMouserSnapshotDate&&<div>Mouser latest: {combinedEvidence.latestMouserSnapshotDate}</div>}
               {combinedEvidence?.latestNexarSnapshotDate&&<div>Nexar latest: {combinedEvidence.latestNexarSnapshotDate}</div>}
+              {combinedEvidence?.latestTiDirectSnapshotDate&&<div>TI direct latest: {combinedEvidence.latestTiDirectSnapshotDate}</div>}
               <div>Agreement: <span style={{color:aColor,fontWeight:'bold'}}>{aLabel}</span></div>
-              {agree.mouserPrice!=null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar ${agree.nexarTrustedPrice.toFixed(4)} · Δ {agree.priceDeltaPct!=null?`${agree.priceDeltaPct>0?'+':''}${agree.priceDeltaPct}%`:'—'}</div>}
+              {agree.mouserPrice!=null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar ${agree.nexarTrustedPrice.toFixed(4)} · Δ {fmtSigned(agree.priceDeltaPct)}</div>}
               {agree.mouserPrice!=null&&agree.nexarTrustedPrice==null&&<div>Price: Mouser ${agree.mouserPrice.toFixed(4)} · Nexar —</div>}
               {agree.mouserPrice==null&&agree.nexarTrustedPrice!=null&&<div>Price: Mouser — · Nexar ${agree.nexarTrustedPrice.toFixed(4)}</div>}
-              {(agree.mouserInventory!=null||agree.nexarTrustedInventory!=null)&&<div>Inventory: Mouser {(agree.mouserInventory||0).toLocaleString()} · Nexar {(agree.nexarTrustedInventory||0).toLocaleString()}{agree.inventoryDeltaPct!=null?` · Δ ${agree.inventoryDeltaPct>0?'+':''}${agree.inventoryDeltaPct}%`:''}</div>}
+              {hasTi&&(
+                <div>
+                  TI direct: {tiPrice!=null?`$${tiPrice.toFixed(4)}`:'—'}
+                  {tiPriceDelta!=null?` · Δ vs Mouser ${fmtSigned(tiPriceDelta)}`:''}
+                  {tiSamples>0?` · n=${tiSamples}`:''}
+                </div>
+              )}
+              {(agree.mouserInventory!=null||agree.nexarTrustedInventory!=null)&&<div>Inventory: Mouser {(agree.mouserInventory||0).toLocaleString()} · Nexar {(agree.nexarTrustedInventory||0).toLocaleString()}{agree.inventoryDeltaPct!=null?` · Δ ${fmtSigned(agree.inventoryDeltaPct)}`:''}</div>}
+              {hasTi&&tiInv!=null&&(
+                <div>TI direct inv: {tiInv.toLocaleString()}{tiInvDelta!=null?` · Δ vs Mouser ${fmtSigned(tiInvDelta)}`:''}</div>
+              )}
               <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Source agreement only — shortage/easing labels still gated by ≥2 dated snapshots.</div>
             </div>
           </div>

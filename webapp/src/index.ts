@@ -3415,10 +3415,89 @@ app.get('/api/snapshots/evidence/latest', async (c) => {
   })
 })
 
+// ── Phase 23C.6 — TI watched-part subcategory → canonical taxonomy mapping ───
+// Bridges the freeform `WatchedSubcategory` strings used in tiWatchedParts.ts
+// (e.g. "Op-amps", "Buck converters") to the 28 canonical subcategory IDs
+// the Mouser/Nexar evidence table is keyed on. Approximate where TI's labels
+// are coarser than the canonical taxonomy — the goal is a directional TI
+// data point alongside Mouser+Nexar, not pixel-perfect taxonomy alignment.
+const TI_SUBCATEGORY_TO_CANONICAL: Record<string, string> = {
+  // Power
+  'LDO regulators': 'power_ldo',
+  'Buck converters': 'power_dcdc_switching',
+  'Buck-boost converters': 'power_dcdc_switching',
+  'Boost converters': 'power_dcdc_switching',
+  'PFC controllers': 'power_acdc_switching',
+  'Supervisors': 'power_supervisor_reset',
+  'Safety PMIC': 'power_supervisor_reset',
+  'Battery management': 'power_battery_mgmt',
+  'LED drivers': 'power_dcdc_switching',
+  'Motor drivers': 'power_dcdc_switching',
+  // Data center power
+  'Hot-swap / eFuse': 'dc_efuses',
+  'Gate drivers': 'dc_smart_power_stages',
+  'Multi-phase VR': 'dc_tps536xx_ai_power',
+  'Power stages': 'dc_smart_power_stages',
+  'Bus converters': 'dc_48v_bus',
+  // GaN / discrete
+  'GaN power': 'gan_lmg342x',
+  'Power MOSFETs': 'gan_lmg5200',
+  // Amplifiers
+  'Op-amps': 'amp_opamps',
+  'Instrumentation amps': 'amp_instrumentation',
+  'Audio amps': 'amp_audio',
+  'Current/power monitors': 'amp_opamps',
+  // Data converters
+  'ADCs': 'conv_adc',
+  'DACs': 'conv_dac',
+  // Isolation
+  'Isolation amps': 'isolation_reinforced',
+  'Digital isolators': 'isolation_digital',
+  // Interface
+  'CAN/LIN transceivers': 'interface_can',
+  'RS-485 transceivers': 'interface_can',
+  'Ethernet PHYs': 'interface_ethernet_phy',
+  'PoE controllers': 'interface_ethernet_phy',
+  'Clock distribution': 'interface_ethernet_phy',
+  // Microcontrollers / wireless
+  'Embedded MCU': 'mcu_mspm0',
+  'Safety MCU': 'mcu_c2000',
+  'Embedded MPU': 'mcu_sitara',
+  'Wireless MCU': 'mcu_simplelink',
+  'RF transceivers': 'mcu_simplelink',
+  'RF synthesizers': 'mcu_simplelink',
+  'Radar': 'mcu_simplelink',
+}
+
+/** Build {partNumber|genericPartNumber → canonicalCategoryId} once per
+ *  request. Uppercases both keys so lookups against the TI snapshot
+ *  shape (which preserves whatever case TI returns) always hit. */
+function buildTiPartToCanonical(): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const part of TI_WATCHED_PARTS) {
+    const sub = part.subcategory
+    if (!sub) continue
+    const canonical = TI_SUBCATEGORY_TO_CANONICAL[sub]
+    if (!canonical) continue
+    if (part.preferredOrderablePartNumber) {
+      map.set(part.preferredOrderablePartNumber.toUpperCase(), canonical)
+    }
+    if (part.genericPartNumber) {
+      map.set(part.genericPartNumber.toUpperCase(), canonical)
+    }
+  }
+  return map
+}
+
 // ── Phase 16A — combined Mouser + Nexar evidence ─────────────────────────────
 // Reads BOTH the latest Mouser full snapshot and the latest Nexar rotating
 // snapshot; computes a per-canonical-subcategory agreement table. Read-only,
 // never calls Nexar, never triggers capture.
+//
+// Phase 23C.6 — also reads the latest TI direct-Store inventory snapshot and
+// aggregates per-part `normalizedUnitPrice` + `quantityAvailable` into the
+// same canonical buckets so the tooltip can show TI direct alongside Mouser
+// and Nexar. Reuses the in-memory KV snapshot (no extra TI API calls).
 app.get('/api/snapshots/evidence/combined', async (c) => {
   const env = c.env
   const base = snapshotMemoryBaseEnv(env)
@@ -3462,13 +3541,18 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
   // Phase 18A — also pull the latest snapshot per manual source (one KV op
   // each via `getLatestSnapshotFor`'s internal list+get; KV is cheap).
   const TREND_WINDOW_DAYS = 30
-  const [mouserSnaps, nexarSnaps, dkManualSnap, arManualSnap, tiManualSnap, otManualSnap] = await Promise.all([
+  const [mouserSnaps, nexarSnaps, dkManualSnap, arManualSnap, tiManualSnap, otManualSnap, tiDirectSnap] = await Promise.all([
     getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, MOUSER_SOURCE, MOUSER_MODE, TREND_WINDOW_DAYS),
     getRecentSnapshotsFor(env.SOURCE_SNAPSHOTS_KV, 'octopart_nexar', 'representative_basket_preview', TREND_WINDOW_DAYS),
     getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'digikey_manual', MANUAL_MODE),
     getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'arrow_manual', MANUAL_MODE),
     getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'ti_manual', MANUAL_MODE),
     getLatestSnapshotFor(env.SOURCE_SNAPSHOTS_KV, 'other_manual', MANUAL_MODE),
+    // Phase 23C.6 — pull the latest TI direct-Store inventory snapshot
+    // alongside the other source snapshots so we can fold direct TI
+    // pricing into the same per-canonical agreement table. Reuses the
+    // already-captured KV blob; no live TI API calls.
+    readLatestInventorySnapshot(env.SOURCE_SNAPSHOTS_KV),
   ])
   const mouserSnap: Snapshot | null = mouserSnaps.length > 0 ? mouserSnaps[mouserSnaps.length - 1] : null
   const nexarSnap: Snapshot | null = nexarSnaps.length > 0 ? nexarSnaps[nexarSnaps.length - 1] : null
@@ -3499,9 +3583,45 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     })
   }
 
+  // Phase 23C.6 — aggregate TI direct-Store snapshot rows per canonical
+  // subcategory. For each watched part with a usable normalizedUnitPrice
+  // (qty=1 break parsed from TI Store), bucket by its mapped canonical id
+  // and accumulate sum/count for averaging. Inventory is summed (not
+  // averaged) so the TI line reflects total stock surfaced by TI direct
+  // for that subcategory — directly comparable to Mouser's
+  // totalTrustedAvailableInventory.
+  const tiPartToCanonical = buildTiPartToCanonical()
+  const tiAgg = new Map<string, { priceSum: number; priceCount: number; inventory: number; sampleSize: number }>()
+  for (const part of tiDirectSnap?.parts ?? []) {
+    const opn = part.partNumber?.toUpperCase()
+    const gpn = part.genericPartNumber?.toUpperCase() ?? null
+    const canonical = (opn && tiPartToCanonical.get(opn)) || (gpn && tiPartToCanonical.get(gpn)) || null
+    if (!canonical) continue
+    const bucket = tiAgg.get(canonical) ?? { priceSum: 0, priceCount: 0, inventory: 0, sampleSize: 0 }
+    bucket.sampleSize += 1
+    if (typeof part.normalizedUnitPrice === 'number' && part.normalizedUnitPrice > 0) {
+      bucket.priceSum += part.normalizedUnitPrice
+      bucket.priceCount += 1
+    }
+    if (typeof part.quantityAvailable === 'number' && part.quantityAvailable >= 0) {
+      bucket.inventory += part.quantityAvailable
+    }
+    tiAgg.set(canonical, bucket)
+  }
+  const tiByCanonical = new Map<string, { price: number | null; inventory: number; sampleSize: number }>()
+  for (const [canonical, b] of tiAgg.entries()) {
+    tiByCanonical.set(canonical, {
+      price: b.priceCount > 0 ? Math.round((b.priceSum / b.priceCount) * 10000) / 10000 : null,
+      inventory: b.inventory,
+      sampleSize: b.sampleSize,
+    })
+  }
+  const latestTiDirectSnapshotDate = tiDirectSnap?.capturedAt ? tiDirectSnap.capturedAt.slice(0, 10) : null
+
   const sourceAgreement = TI_TAXONOMY_FLAT.map(sub => {
     const m = mouserByCanonical.get(sub.categoryId) ?? null
     const n = nexarByCanonical.get(sub.categoryId) ?? null
+    const t = tiByCanonical.get(sub.categoryId) ?? null
     let priceDeltaPct: number | null = null
     if (m?.price != null && n?.price != null && m.price > 0) {
       priceDeltaPct = Math.round(((n.price - m.price) / m.price) * 1000) / 10
@@ -3510,18 +3630,46 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     if (m && n && m.inventory > 0) {
       inventoryDeltaPct = Math.round(((n.inventory - m.inventory) / m.inventory) * 1000) / 10
     }
+    // Phase 23C.6 — TI direct deltas vs Mouser backbone. Mouser is the
+    // anchor because it has full daily coverage; TI direct is a sparse
+    // sample over the watched-parts universe. Δ %s use the same
+    // formula as Mouser↔Nexar so the tooltip can compare them eyeball.
+    let tiPriceDeltaPctVsMouser: number | null = null
+    if (t?.price != null && m?.price != null && m.price > 0) {
+      tiPriceDeltaPctVsMouser = Math.round(((t.price - m.price) / m.price) * 1000) / 10
+    }
+    let tiInventoryDeltaPctVsMouser: number | null = null
+    if (t && m && m.inventory > 0) {
+      tiInventoryDeltaPctVsMouser = Math.round(((t.inventory - m.inventory) / m.inventory) * 1000) / 10
+    }
+    // Phase 23C.6 — agreement classification now considers TI direct
+    // when a usable price exists. Tolerance bands (±5% strong, ±15%
+    // moderate) match the Mouser↔Nexar logic. With three sources we
+    // count how many price points fall inside the strong band to pick
+    // the headline status.
     let agreementStatus:
       | 'strong_agreement'
       | 'moderate_agreement'
       | 'divergent'
       | 'single_source_only'
       | 'insufficient_data' = 'insufficient_data'
-    if (m && n && m.price != null && n.price != null) {
-      const absPct = Math.abs(priceDeltaPct ?? 0)
-      if (absPct <= 5) agreementStatus = 'strong_agreement'
-      else if (absPct <= 15) agreementStatus = 'moderate_agreement'
+    const pricedSources: Array<{ key: 'mouser' | 'nexar' | 'ti'; price: number }> = []
+    if (m?.price != null) pricedSources.push({ key: 'mouser', price: m.price })
+    if (n?.price != null) pricedSources.push({ key: 'nexar', price: n.price })
+    if (t?.price != null) pricedSources.push({ key: 'ti', price: t.price })
+    if (pricedSources.length >= 2) {
+      // Pairwise % deltas vs Mouser anchor when present, else vs the first
+      // priced source. Anything within ±5% counts as strong; ±15% moderate.
+      const anchor = (pricedSources.find(p => p.key === 'mouser') ?? pricedSources[0]).price
+      const deltas = pricedSources
+        .filter(p => p.price !== anchor)
+        .map(p => Math.abs(((p.price - anchor) / anchor) * 100))
+      const allStrong = deltas.every(d => d <= 5)
+      const allModerate = deltas.every(d => d <= 15)
+      if (allStrong) agreementStatus = 'strong_agreement'
+      else if (allModerate) agreementStatus = 'moderate_agreement'
       else agreementStatus = 'divergent'
-    } else if ((m && m.price != null) || (n && n.price != null)) {
+    } else if (pricedSources.length === 1) {
       agreementStatus = 'single_source_only'
     }
     return {
@@ -3535,6 +3683,13 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
       mouserInventory: m?.inventory ?? null,
       nexarTrustedInventory: n?.inventory ?? null,
       inventoryDeltaPct,
+      // Phase 23C.6 — direct TI Store fields. Null when no watched part
+      // with a parsed normalizedUnitPrice maps to this canonical bucket.
+      tiDirectPrice: t?.price ?? null,
+      tiDirectInventory: t?.inventory ?? null,
+      tiDirectSampleSize: t?.sampleSize ?? 0,
+      tiPriceDeltaPctVsMouser,
+      tiInventoryDeltaPctVsMouser,
       agreementStatus,
     }
   })
@@ -3957,6 +4112,12 @@ app.get('/api/snapshots/evidence/combined', async (c) => {
     status,
     latestMouserSnapshotDate: mouserSnap?.snapshotDate ?? null,
     latestNexarSnapshotDate: nexarSnap?.snapshotDate ?? null,
+    // Phase 23C.6 — date the TI direct-Store inventory snapshot was
+    // captured (UTC day). Null when no TI capture has run yet. Drives
+    // the "TI direct latest" line in the Combined source evidence
+    // tooltip; the per-row tiDirectPrice/tiDirectInventory fields
+    // surface the actual numbers.
+    latestTiDirectSnapshotDate,
     taxonomyCoverage,
     mouserCoverage,
     nexarCoverage,
