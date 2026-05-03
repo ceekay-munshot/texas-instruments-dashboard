@@ -135,10 +135,37 @@ export const CANONICAL_MAPPING_RULES: MappingRule[] = [
   // ── Power Management (after data-center / GaN to avoid clobber) ─────────
   rule('power_battery_mgmt', gpnPrefix(['BQ24', 'BQ25', 'BQ27', 'BQ40', 'BQ34', 'BQ76']), 'power_management', 'power_battery_mgmt', 'high'),
   rule('power_acdc_switching', gpnPrefix(['UCC28', 'UCC25']),        'power_management',  'power_acdc_switching', 'high'),
+  // Phase 24C.1 — load switches (TPS22*) bucket under supervisor/reset
+  // since the canonical taxonomy doesn't have a dedicated load-switch
+  // subcategory; medium confidence flags this for the operator.
+  rule('power_load_switch_tps22', gpnPrefix(['TPS22']),              'power_management',  'power_supervisor_reset', 'medium'),
   rule('power_supervisor_reset', gpnPrefix(['TPS3', 'TPS779', 'TLV803', 'TLV810']), 'power_management', 'power_supervisor_reset', 'medium'),
+  // Phase 24C.1 — TPS7A* LDOs explicitly (TPS779 already covered by
+  // existing list; TPS7A* is a wider TI LDO family seen in unmapped
+  // samples).
+  rule('power_ldo_tps7a', gpnPrefix(['TPS7A']),                      'power_management',  'power_ldo',              'high'),
   rule('power_ldo',     gpnPrefix(['TLV7', 'TLV8', 'TLV9', 'TPS779', 'LP590', 'TLV767', 'TPS73', 'TPS74']), 'power_management', 'power_ldo', 'high'),
+  // Phase 24C.1 — LED / backlight drivers (LM3*, TPS9*, TLC59*) and
+  // motor drivers (DRV8/3/5) bucket under DC-DC switching since the
+  // taxonomy doesn't have a dedicated driver bucket.
+  rule('power_led_driver', gpnPrefix(['LM3', 'TPS9', 'TLC59']),      'power_management',  'power_dcdc_switching',   'medium'),
+  rule('power_motor_driver', gpnPrefix(['DRV8', 'DRV3', 'DRV5']),    'power_management',  'power_dcdc_switching',   'medium'),
   // Catch-all DC-DC AFTER the more specific TPS546 / TPS25xx rules above.
   rule('power_dcdc_switching', gpnPrefix(['TPS54', 'TPS55', 'TPS56', 'TPS57', 'TPS61', 'TPS62', 'TPS63', 'LMR1', 'LMR2', 'LMR3', 'LM5145', 'LM5146']), 'power_management', 'power_dcdc_switching', 'high'),
+
+  // ── Phase 24C.1 additional precision-analog rules ───────────────────────
+  // Voltage references and temperature sensors bucket under amp_opamps
+  // (closest precision-analog subcategory in the canonical taxonomy).
+  rule('analog_voltage_ref', gpnPrefix(['REF', 'LM4040', 'LM4041', 'LM4128']), 'amplifiers', 'amp_opamps', 'medium'),
+  rule('analog_temp_sensor', gpnPrefix(['TMP1', 'TMP2', 'TMP3', 'LM35', 'LM75', 'LM84']), 'amplifiers', 'amp_opamps', 'medium'),
+
+  // ── Phase 24C.1 interface-side fallbacks ────────────────────────────────
+  // Logic / analog switches → interface_can bucket (closest "switching
+  // logic" sibling); ESD / protection diodes → interface_ethernet_phy
+  // bucket (closest signal-integrity sibling). Both low-confidence — the
+  // operator can dig into the rollup row to see they're keyword fallbacks.
+  rule('interface_logic_switch', gpnPrefix(['SN74', 'SN54', 'TS5A', 'TS3A', 'CD74']), 'interface_ics', 'interface_can',          'low'),
+  rule('interface_esd_protection', gpnPrefix(['TPD', 'ESD']),        'interface_ics',     'interface_ethernet_phy', 'low'),
 
   // ── Description keyword fallbacks (low confidence) ──────────────────────
   rule('desc_ldo',   descKeyword([/\bldo\b/i, /low.?dropout/i]),     'power_management', 'power_ldo',              'low'),
@@ -221,4 +248,102 @@ export function listCanonicalSubcategories(): Array<{ canonicalGroup: string; ca
     }
   }
   return Array.from(map.values())
+}
+
+// ── Phase 24C.1 — per-subcategory SQL predicates for resumable rebuild ─────
+// The Phase 24C one-shot rebuild evaluated the entire mapping CASE
+// expression (~30 rules) against every one of 72k OPNs inside a single
+// nested-subquery + GROUP BY + json_group_object pipeline. D1 hit its
+// per-statement CPU limit and aborted with no rows written. The fix is
+// to scope every SQL pass to ONE canonical subcategory at a time:
+//
+//   matchClause   — the OR of just this subcategory's rule SQL fragments.
+//                   Filters the OPN table down to (typically) ≤ a few
+//                   thousand rows in one pass.
+//   excludeClause — the OR of every earlier rule that maps to a DIFFERENT
+//                   subcategory. Mirrors "first match wins" so a row that
+//                   would fall to a more-specific earlier rule is removed
+//                   from this subcategory's bucket. Without this, e.g.
+//                   `dc_tps536xx_ai_power` rows would also be counted in
+//                   `power_dcdc_switching`.
+//
+// The combined `WHERE (matchClause) AND NOT (excludeClause)` exactly
+// reproduces the JS first-match-wins semantics. Each emitted predicate
+// is small (≤ ~30 OR'd LIKEs in the worst case) and safely sits inside
+// D1's per-statement budget.
+
+export type SubcategoryPredicate = {
+  canonicalGroup: string
+  canonicalSubcategory: string
+  ruleIds: string[]
+  /** SQL WHERE clause body (no leading 'WHERE') — combines the own-rules
+   *  match with NOT-earlier-rules exclusion so first-match-wins holds. */
+  whereClause: string
+  /** ORDER-preserved per-rule SQL fragments for this subcategory. Used
+   *  by the rebuilder to compute mapping_confidence_summary inside the
+   *  same single-subcategory aggregation, with ROW_NUMBER()-style "first
+   *  rule wins" logic via nested CASE. */
+  ownRules: Array<{ ruleId: string; sql: string; confidence: MappingConfidence }>
+}
+
+export function buildSubcategoryPredicates(): SubcategoryPredicate[] {
+  // Group rules by subcategory while keeping global rule order (for
+  // first-match precedence). Walk the rule list once.
+  type SubcatBucket = {
+    canonicalGroup: string
+    canonicalSubcategory: string
+    ruleIds: string[]
+    ownRuleSqls: string[]
+    ownRuleConfidences: MappingConfidence[]
+    excludingRuleSqls: string[]
+  }
+  const map = new Map<string, SubcatBucket>()
+  // Maintain "rules seen so far per subcategory" so we can compute
+  // excludingRuleSqls (rules with a DIFFERENT subcategory that appear
+  // earlier in the global list) in a single pass.
+  const earlierRulesGlobal: MappingRule[] = []
+  for (const r of CANONICAL_MAPPING_RULES) {
+    let bucket = map.get(r.canonicalSubcategory)
+    if (!bucket) {
+      // First time we've seen this subcategory — its `excludingRuleSqls`
+      // are exactly the rules currently in earlierRulesGlobal that map
+      // to a DIFFERENT subcategory. We freeze that list now; later own-
+      // rules don't add to the exclusion set (they're own).
+      bucket = {
+        canonicalGroup: r.canonicalGroup,
+        canonicalSubcategory: r.canonicalSubcategory,
+        ruleIds: [],
+        ownRuleSqls: [],
+        ownRuleConfidences: [],
+        excludingRuleSqls: earlierRulesGlobal
+          .filter(er => er.canonicalSubcategory !== r.canonicalSubcategory)
+          .map(er => er.sql),
+      }
+      map.set(r.canonicalSubcategory, bucket)
+    }
+    bucket.ruleIds.push(r.ruleId)
+    bucket.ownRuleSqls.push(r.sql)
+    bucket.ownRuleConfidences.push(r.confidence)
+    earlierRulesGlobal.push(r)
+  }
+  // Render per-subcategory predicates.
+  return Array.from(map.values()).map(b => {
+    const matchClause = b.ownRuleSqls.map(s => `(${s})`).join(' OR ')
+    const excludeClause = b.excludingRuleSqls.map(s => `(${s})`).join(' OR ')
+    const whereClause = excludeClause
+      ? `(${matchClause}) AND NOT (${excludeClause})`
+      : `(${matchClause})`
+    const ownRules = b.ruleIds.map((id, i) => ({
+      ruleId: id,
+      sql: b.ownRuleSqls[i],
+      confidence: b.ownRuleConfidences[i],
+    }))
+    return {
+      canonicalGroup: b.canonicalGroup,
+      canonicalSubcategory: b.canonicalSubcategory,
+      ruleIds: b.ruleIds,
+      whereClause,
+      ownRules,
+    }
+  })
 }

@@ -72,11 +72,17 @@ import {
   ingestCatalogChunk,
   rebuildGpnFromOpn,
   rebuildGpnEnrichment,
-  rebuildCatalogRollups,
+  clearLatestRollups,
+  listSubcategoryPredicates,
+  pendingSubcategoryPredicates,
+  rebuildOneSubcategory,
+  readRollupStatus,
+  appendRollupHistory,
   readSnapshotCounts,
   readLatestSnapshotRun,
   insertSnapshotRunRow,
 } from './sources/tiCatalogIngest'
+import type { SubcategoryPredicate } from './sources/tiCatalogMapping'
 import {
   readQuotaStatus,
   preflightAndReserve,
@@ -3123,12 +3129,29 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
   // standalone if the chain failed.
   const enrichment = await rebuildGpnEnrichment(env.TI_INVENTORY_HISTORY_DB as any)
   for (const e of enrichment.errors) errors.push(e)
-  // Phase 24C — rebuild per-canonical-subcategory rollups + append a
-  // history row per snapshot. Append-history is only safe at finalize
-  // time (one snapshot just landed), not at the standalone rebuild
-  // endpoint. Errors flow into the same errors[] array.
-  const rollups = await rebuildCatalogRollups(env.TI_INVENTORY_HISTORY_DB as any, { appendHistory: true })
-  for (const e of rollups.errors) errors.push(e)
+  // Phase 24C.1 — rebuild rollups per-subcategory (CPU-safe, resumable).
+  // Loop sequentially through every canonical subcategory; failures on
+  // one don't block the next. Operator can finish with the standalone
+  // /rollups/rebuild?mode=run endpoint if any subcategory failed here.
+  const rollupErrors: string[] = []
+  let rollupRebuiltRows = 0
+  let rollupSubcatsProcessed = 0
+  try {
+    const predicates = listSubcategoryPredicates()
+    await clearLatestRollups(env.TI_INVENTORY_HISTORY_DB as any)
+    for (const p of predicates) {
+      const r = await rebuildOneSubcategory(env.TI_INVENTORY_HISTORY_DB as any, p)
+      rollupSubcatsProcessed += 1
+      if (r.upserted) rollupRebuiltRows += 1
+      for (const e of r.errors) rollupErrors.push(e)
+    }
+  } catch (e: any) {
+    rollupErrors.push(`rollup_loop:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+  for (const e of rollupErrors) errors.push(e)
+  // Append a history snapshot row per subcategory just landed.
+  const rollupHistory = await appendRollupHistory(env.TI_INVENTORY_HISTORY_DB as any, { snapshotRunId: null })
+  for (const e of rollupHistory.errors) errors.push(e)
   const counts = await readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any)
   const summary = {
     totalOpns: counts.totalOpns,
@@ -3157,11 +3180,10 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
       nullLifecycleSummaryCount: enrichment.nullLifecycleSummaryCount,
     },
     rollups: {
-      totalOpns: rollups.totalOpns,
-      mappedOpns: rollups.mappedOpns,
-      mappingCoveragePct: rollups.mappingCoveragePct,
-      rollupRows: rollups.rollupRows,
-      appendedHistoryRows: rollups.appendedHistoryRows,
+      subcategoriesProcessed: rollupSubcatsProcessed,
+      rollupRowsWritten: rollupRebuiltRows,
+      appendedHistoryRows: rollupHistory.appendedRows,
+      errorCount: rollupErrors.length,
     },
     ...summary,
     note: 'Phase 24C — finalize chains: GPN GROUP BY → GPN enrichment (UPDATE-FROM-CTE) → canonical-subcategory rollup rebuild + history append. No TI calls beyond the chunked-ingest fetch already performed.',
@@ -3212,13 +3234,31 @@ app.post('/api/ti/universe/catalog/gpn/rebuild-enrichment', async (c) => {
 
 // ── Phase 24C — TI catalog rollups (canonical-subcategory aggregates) ───────
 
-// POST /api/ti/universe/catalog/rollups/rebuild — auth-gated.
+// POST /api/ti/universe/catalog/rollups/rebuild — auth-gated, resumable.
 //
-// Maps every OPN in ti_catalog_latest_opn to one of the 28 canonical
-// subcategories via deterministic JS rules (rendered into a single SQL
-// CASE), aggregates per subcategory, and writes one row per canonical
-// bucket into ti_catalog_rollup_latest. Never calls TI; pure SQL on
-// existing rows.
+// Phase 24C.1 — replaces the Phase 24C one-shot rebuild that hit D1's
+// per-statement CPU limit on the 72k-OPN production catalog. Instead of
+// one mega-statement, the rebuild is split per canonical subcategory.
+// The operator drives it from Terminal with one of three modes:
+//
+//   ?mode=reset
+//     - Auth-gated. Truncates ti_catalog_rollup_latest (single small
+//       DELETE). Returns the canonical-subcategory list so the caller
+//       knows what's pending. Never scans the OPN table heavily.
+//
+//   ?mode=step[&subcategory=...&limit=1..5]
+//     - Auth-gated. Rebuilds 1..limit pending subcategories (or the
+//       single requested one if `subcategory` is given). Each pass is
+//       small (≤ a few thousand OPNs) so D1's per-statement CPU
+//       budget is never under pressure.
+//
+//   ?mode=run[&limit=1..5]
+//     - Same as step but loops internally up to `limit` (default 3,
+//       capped at 5) within one HTTP request. Safe to call repeatedly
+//       until /rollups/rebuild/status reports pending = 0.
+//
+// Never calls TI. Never mutates ti_catalog_latest_opn /
+// ti_catalog_latest_gpn / catalog snapshot rows.
 app.post('/api/ti/universe/catalog/rollups/rebuild', async (c) => {
   const env = c.env
   if (!env.SNAPSHOT_CAPTURE_SECRET) {
@@ -3235,21 +3275,108 @@ app.post('/api/ti/universe/catalog/rollups/rebuild', async (c) => {
   if (!env.TI_INVENTORY_HISTORY_DB) {
     return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot rebuild rollups.' }, 500)
   }
-  const result = await rebuildCatalogRollups(env.TI_INVENTORY_HISTORY_DB as any, { appendHistory: false })
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  const modeRaw = (c.req.query('mode') || 'step').toLowerCase().trim()
+  const mode = (modeRaw === 'reset' || modeRaw === 'step' || modeRaw === 'run') ? modeRaw : 'step'
+  const subcatFilter = (c.req.query('subcategory') || '').trim() || null
+  const limitRaw = parseInt(c.req.query('limit') || '3', 10) || 3
+  const limit = Math.max(1, Math.min(5, limitRaw))
+
+  if (mode === 'reset') {
+    const errors: string[] = []
+    try { await clearLatestRollups(d1) } catch (e: any) {
+      errors.push(`reset_clear:${(e?.message || 'failed').slice(0, 140)}`)
+    }
+    const all = listSubcategoryPredicates()
+    return c.json({
+      success: errors.length === 0,
+      mode: 'reset',
+      totalCanonicalSubcategories: all.length,
+      pendingSubcategories: all.map(p => p.canonicalSubcategory),
+      completedSubcategories: 0,
+      errors,
+      note: 'Phase 24C.1 — ti_catalog_rollup_latest cleared. Operator: loop POST .../rollups/rebuild?mode=run until /status reports pending = 0.',
+    })
+  }
+
+  // mode = step | run — pick the next batch of subcategories.
+  // When `?subcategory=...` is supplied, target that one explicitly even
+  // if it's already been built (lets the operator force-rebuild a
+  // single subcategory in place). Otherwise, pull only pending ones.
+  let candidates: SubcategoryPredicate[]
+  if (subcatFilter) {
+    candidates = listSubcategoryPredicates().filter(p => p.canonicalSubcategory === subcatFilter)
+    if (candidates.length === 0) {
+      return c.json({
+        success: false,
+        mode,
+        status: 'unknown_subcategory',
+        message: `Subcategory '${subcatFilter}' is not in the canonical mapping list.`,
+      }, 404)
+    }
+  } else {
+    candidates = await pendingSubcategoryPredicates(d1)
+  }
+
+  const targets = candidates.slice(0, limit)
+  const processed: Array<{
+    canonicalSubcategory: string;
+    canonicalGroup: string;
+    upserted: boolean;
+    matchedOpns: number;
+    matchedGpns: number;
+    errors: string[];
+  }> = []
+  for (const p of targets) {
+    const r = await rebuildOneSubcategory(d1, p)
+    processed.push({
+      canonicalSubcategory: r.canonicalSubcategory,
+      canonicalGroup: r.canonicalGroup,
+      upserted: r.upserted,
+      matchedOpns: r.matchedOpns,
+      matchedGpns: r.matchedGpns,
+      errors: r.errors,
+    })
+  }
+  // Re-read pending after the batch so the response is accurate.
+  const pendingAfter = await pendingSubcategoryPredicates(d1)
+  const all = listSubcategoryPredicates()
+  const errors = processed.flatMap(p => p.errors)
   return c.json({
-    success: result.errors.length === 0,
-    totalOpns: result.totalOpns,
-    mappedOpns: result.mappedOpns,
-    unmappedOpns: result.unmappedOpns,
-    mappingCoveragePct: result.mappingCoveragePct,
-    rollupRows: result.rollupRows,
-    highConfidenceRows: result.highConfidenceRows,
-    mediumConfidenceRows: result.mediumConfidenceRows,
-    lowConfidenceRows: result.lowConfidenceRows,
-    sampleRollups: result.sampleRollups,
-    unmappedSamples: result.unmappedSamples,
-    errors: result.errors,
-    note: 'Phase 24C — pure SQL rebuild over ti_catalog_latest_opn. No TI calls. Idempotent.',
+    success: errors.length === 0,
+    mode,
+    limit,
+    processed,
+    completedSubcategories: all.length - pendingAfter.length,
+    pendingSubcategories: pendingAfter.map(p => p.canonicalSubcategory),
+    totalCanonicalSubcategories: all.length,
+    errors,
+    note: `Phase 24C.1 — ${processed.length} subcategor${processed.length === 1 ? 'y' : 'ies'} processed. Repeat until pending = 0.`,
+  })
+})
+
+// GET /api/ti/universe/catalog/rollups/rebuild/status — public, sanitized.
+//
+// Phase 24C.1 progress check. Tells the operator how many of the (≤28)
+// canonical subcategories have a row in ti_catalog_rollup_latest, which
+// are still pending, and (when fully complete) the cumulative
+// mapped/unmapped OPN counts. Cheap — at most two small SELECTs.
+app.get('/api/ti/universe/catalog/rollups/rebuild/status', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({
+      success: false, status: 'd1_not_bound',
+      message: 'TI_INVENTORY_HISTORY_DB not bound; rollup status unavailable.',
+    }, 503)
+  }
+  const status = await readRollupStatus(env.TI_INVENTORY_HISTORY_DB as any)
+  return c.json({
+    success: true,
+    backend: 'd1',
+    ...status,
+    note: status.pendingSubcategories.length === 0
+      ? 'All canonical subcategories rebuilt.'
+      : 'Loop POST /rollups/rebuild?mode=run until pendingSubcategories is empty.',
   })
 })
 

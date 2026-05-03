@@ -1208,6 +1208,63 @@ The workflow exposes four inputs:
     chunk without POSTing (no D1 write). Still calls `/quota/preflight`
     so a dry run can't bypass the quota gate.
 
+### TI catalog rollups — resumable rebuild (Phase 24C.1)
+
+Per-canonical-subcategory rollups power the TI badge + tooltip
+evidence on the Prices tab. The Phase 24C one-shot rebuild evaluated
+the full mapping CASE expression against all 72k OPNs in a single
+D1 statement and hit the per-statement CPU limit. Phase 24C.1
+splits the rebuild **per subcategory** so every pass is small and
+the operator can drive it from Terminal until done — never via the
+D1 Console directly.
+
+**Endpoints:**
+
+  | Endpoint | Auth | Behaviour |
+  |---|---|---|
+  | `GET  /api/ti/universe/catalog/rollups/rebuild/status` | _(public, sanitized)_ | Progress: `totalCanonicalSubcategories`, `completedSubcategories`, `pendingSubcategories[]`, `latestRows`, `lastUpdatedAt`, and (only when complete) `mappedOpns` / `unmappedOpns` / `mappingCoveragePct`. Cheap. |
+  | `POST /api/ti/universe/catalog/rollups/rebuild?mode=reset` | `X-Capture-Secret` | Truncates `ti_catalog_rollup_latest` (single small DELETE). Returns the canonical-subcategory list. Safe — never scans the OPN table heavily. |
+  | `POST /api/ti/universe/catalog/rollups/rebuild?mode=step[&subcategory=...&limit=1..5]` | `X-Capture-Secret` | Rebuilds 1..limit pending subcategories (default `limit=3`, capped at 5) using narrow per-subcategory WHERE clauses. Each pass touches at most a few thousand OPNs. Idempotent. |
+  | `POST /api/ti/universe/catalog/rollups/rebuild?mode=run[&limit=1..5]` | `X-Capture-Secret` | Same as `step` but loops internally up to `limit` (default `3`, max `5`) within one HTTP request. Safe to call repeatedly until `pendingSubcategories=[]`. |
+
+**Operator workflow** — drive from Terminal, never from the D1 Console:
+
+```bash
+BASE=https://texas-instruments-dashboard-final.pages.dev
+SECRET="$SNAPSHOT_CAPTURE_SECRET"
+
+# 1. Reset.
+curl -sS -X POST -H "X-Capture-Secret: $SECRET" \
+  "$BASE/api/ti/universe/catalog/rollups/rebuild?mode=reset" | jq
+
+# 2. Loop step until pending = 0. The default limit (3) keeps each
+#    request well inside D1's per-request CPU budget.
+while true; do
+  resp=$(curl -sS -X POST -H "X-Capture-Secret: $SECRET" \
+    "$BASE/api/ti/universe/catalog/rollups/rebuild?mode=run&limit=3")
+  pending=$(echo "$resp" | jq '.pendingSubcategories | length')
+  echo "$resp" | jq -c '{processed: (.processed | map(.canonicalSubcategory)), pending: (.pendingSubcategories | length)}'
+  [ "$pending" = "0" ] && break
+done
+
+# 3. Verify.
+curl -sS "$BASE/api/ti/universe/catalog/rollups/rebuild/status" | jq
+curl -sS "$BASE/api/ti/universe/catalog/rollups/latest?limit=5" | jq '.rows | map({canonicalSubcategory, opnCount, medianNormalizedUnitPrice})'
+```
+
+**Rules:**
+
+- Never call TI from this flow — the entire pipeline reads from
+  `ti_catalog_latest_opn` / `ti_catalog_latest_gpn` only.
+- Never run the rebuild against the D1 Console — those queries
+  bypass the per-subcategory CPU-safe shape.
+- A single `mode=run` call processes at most 5 subcategories; the
+  default 3 leaves comfortable headroom for D1 free-tier limits.
+- A new full catalog snapshot land (via `ti-catalog-universe-ingest`
+  finalize) automatically runs the same per-subcategory loop, so
+  the manual rebuild is only needed for backfills or when finalize
+  reported partial errors.
+
 ### TI universe catalog endpoints — experimental (Phase 23B / 23C, not for normal use)
 
 Two earlier endpoints **are still wired** but should not be invoked in
