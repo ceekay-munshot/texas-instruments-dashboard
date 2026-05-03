@@ -4509,8 +4509,86 @@ function App(){
       else if(dist===1) confidence='single-source';
     }
     const confColor=confidence==='multi-source'?'#00c9a7':confidence==='single-source'?'#f0a84e':'#f05c5c';
+    // Phase 24E — TI Direct primary, channel checks secondary. Compute the
+    // TI Direct rollup eagerly so the primary block can render first.
+    const tiCanonical = combinedEvidence?.legacyToCanonical?.[catId];
+    const tiRollupRow = tiCanonical ? tiRollupsByCanonical[tiCanonical] : null;
     return <>
-      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null} · Mouser qty=1 · vs latest baseline (28-Apr-26)</div>
+      {/* Header — TI Direct framed as canonical, channel APIs as
+          corroboration. The real-time +X% in the Live cell comes from
+          Mouser because the TI catalog refreshes every ~24h, not every
+          second; the framing makes that explicit. */}
+      <div style={{fontSize:'0.65rem',color:'#ffd700',marginBottom:6,fontWeight:'bold'}}>{cat?.l}{catId==='gan_365'?<span style={{color:'#f0a84e',fontSize:'0.55rem',marginLeft:6}}>⚠ reel/2000 price — no unit break</span>:null}</div>
+      <div style={{fontSize:'0.55rem',color:'#7a96b8',marginBottom:7,fontStyle:'italic',lineHeight:1.5}}>
+        TI Direct primary · channel checks secondary
+        <br/>
+        <span style={{color:'#4a6a8a'}}>Live cell tick from Mouser real-time API; canonical state from TI Direct catalog snapshot.</span>
+      </div>
+
+      {/* ── PRIMARY: TI Direct full catalog ──────────────────────────── */}
+      {tiRollupRow ? (() => {
+        const r = tiRollupRow;
+        const conf = r.mappingConfidenceSummary || {};
+        const high = Number(r.highConfidenceOpnCount ?? conf.high ?? 0);
+        const med  = Number(r.mediumConfidenceOpnCount ?? conf.medium ?? 0);
+        const low  = Number(r.lowConfidenceOpnCount ?? conf.low ?? 0);
+        const highPct = r.highConfidencePct != null ? Number(r.highConfidencePct) : null;
+        const qualityLabel = r.qualityLabel || 'unknown';
+        const usable = r.usableForPricesLiveEvidence === true;
+        const qualityWarning = r.qualityWarning || null;
+        const qualityColor = qualityLabel === 'high' ? '#4dffc3'
+                           : qualityLabel === 'medium' ? '#00c9a7'
+                           : qualityLabel === 'low' ? '#f0a84e'
+                           : qualityLabel === 'mixed' ? '#f0a84e'
+                           : '#4a6a8a';
+        const lifecycleEntries = r.lifecycleSummary && typeof r.lifecycleSummary === 'object'
+          ? Object.entries(r.lifecycleSummary) : [];
+        const fmtP = (n) => n == null ? '—' : `$${Number(n).toFixed(4)}`;
+        return (
+          <div style={{paddingTop:4,paddingBottom:4,borderTop:'2px solid #2a4060',borderBottom:'1px solid #1a2740',marginBottom:6}}>
+            <div style={{fontSize:'0.6rem',color:'#4dffc3',fontWeight:'bold',marginBottom:3,letterSpacing:'0.04em',textTransform:'uppercase'}}>
+              ★ Primary: TI Direct full catalog
+              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem',textTransform:'none',letterSpacing:0}}>· canonical subcategory · 72k-OPN snapshot</span>
+            </div>
+            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
+              <div>Snapshot: {r.latestCapturedAt ? new Date(r.latestCapturedAt).toISOString().slice(0,10) : '—'} · mapping quality <span style={{color:qualityColor,fontWeight:'bold'}}>{qualityLabel}</span>{!usable && qualityLabel !== 'unknown' ? ' · use as context, not signal' : ''}</div>
+              <div>OPNs: {Number(r.opnCount).toLocaleString()} · GPN families: {Number(r.gpnCount).toLocaleString()} · priced: {Number(r.pricedOpnCount).toLocaleString()}</div>
+              <div>Stocked: {Number(r.stockedOpnCount).toLocaleString()} ({r.stockedPct == null ? '—' : `${r.stockedPct}%`}) · Out of stock: {Number(r.outOfStockOpnCount).toLocaleString()}</div>
+              <div>Total qty: {Number(r.totalQuantity || 0).toLocaleString()}</div>
+              <div>Price: median {fmtP(r.medianNormalizedUnitPrice)} · min {fmtP(r.minNormalizedUnitPrice)} · max {fmtP(r.maxNormalizedUnitPrice)}</div>
+              {r.cheapestOpn && <div>Cheapest OPN: <span style={{color:'#e0eaf8'}}>{r.cheapestOpn}</span></div>}
+              {r.highestInventoryOpn && <div>Highest-inv OPN: <span style={{color:'#e0eaf8'}}>{r.highestInventoryOpn}</span></div>}
+              {lifecycleEntries.length > 0 && (
+                <div>Lifecycle: {lifecycleEntries.map(([k,v]) => `${k}:${v}`).join(' · ')}</div>
+              )}
+              <div style={{marginTop:4,paddingTop:4,borderTop:'1px dashed #1a2740'}}>
+                <span style={{color:'#7a96b8'}}>Mapping: </span>
+                <span style={{color:'#4dffc3'}}>{high} high</span>
+                <span style={{color:'#7a96b8'}}> · </span>
+                <span style={{color:'#00c9a7'}}>{med} medium</span>
+                <span style={{color:'#7a96b8'}}> · </span>
+                <span style={{color:'#f0a84e'}}>{low} low</span>
+                {highPct != null && <span style={{color:'#7a96b8'}}> · {highPct}% high-conf</span>}
+              </div>
+              {qualityWarning && (
+                <div style={{color:qualityColor,fontStyle:'italic',marginTop:3}}>⚠ {qualityWarning}</div>
+              )}
+              <div style={{color:'#3d8ef0',marginTop:3}}>→ Click cell to inspect mapped TI parts</div>
+              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Forward history requires stored TI snapshots — distributor data only fills gaps until the next TI capture lands.</div>
+            </div>
+          </div>
+        );
+      })() : (
+        <div style={{paddingTop:4,paddingBottom:4,borderTop:'2px solid #2a4060',borderBottom:'1px solid #1a2740',marginBottom:6,fontSize:'0.55rem',color:'#7a96b8',lineHeight:1.55}}>
+          <div style={{color:'#4dffc3',fontWeight:'bold',marginBottom:3,letterSpacing:'0.04em',textTransform:'uppercase',fontSize:'0.6rem'}}>★ Primary: TI Direct full catalog</div>
+          <div style={{fontStyle:'italic'}}>No TI Direct rollup mapped to this category yet — falling back to channel data below until the next catalog capture lands or a narrower mapping rule covers it.</div>
+        </div>
+      )}
+
+      {/* ── SECONDARY: real-time channel tick (Mouser qty=1) ─────────── */}
+      <div style={{fontSize:'0.55rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3,letterSpacing:'0.04em',textTransform:'uppercase'}}>
+        Channel check · Mouser qty=1 <span style={{color:'#4a6a8a',fontWeight:'normal',letterSpacing:0,textTransform:'none'}}>· real-time tick · vs latest baseline (28-Apr-26)</span>
+      </div>
       {d?(d.parts?.length>0?d.parts.map((p,i)=>(
         <div key={i} style={{fontSize:'0.6rem',marginBottom:3,display:'flex',justifyContent:'space-between',gap:14}}>
           <span style={{color:'#c4d4e8',fontFamily:'monospace'}}>{p.part}</span>
@@ -4519,11 +4597,11 @@ function App(){
         </div>
       )):<div style={{fontSize:'0.58rem',color:'#f05c5c'}}>{d.error||'No live data'}</div>):<div style={{fontSize:'0.58rem',color:'#7a96b8'}}>No Mouser live data yet</div>}
       {d&&<div style={{marginTop:5,paddingTop:4,borderTop:'1px solid #1a2740',fontSize:'0.52rem',color:'#2d4a6b'}}>
-        Live ${d.avgPriceUSD?.toFixed(4)} · Baseline ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser
+        Live ${d.avgPriceUSD?.toFixed(4)} · Baseline ${d.baselinePriceUSD?.toFixed(4)} · Δ={(d.avgPriceUSD&&d.baselinePriceUSD?(((d.avgPriceUSD-d.baselinePriceUSD)/d.baselinePriceUSD)*100).toFixed(1):'—')}% · qty=1 · Mouser channel
       </div>}
       {basket&&<div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
         <div style={{fontSize:'0.6rem',color:'#3d8ef0',fontWeight:'bold',marginBottom:3}}>
-          Nexar trusted basket check
+          Channel check · Nexar trusted basket
           <span style={{color:'#f0a84e',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· tiny basket preview, not full coverage</span>
         </div>
         <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
@@ -4547,7 +4625,7 @@ function App(){
         return (
           <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
             <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
-              Snapshot evidence <span style={{color:'#4a6a8a',fontWeight:'normal'}}>· {evid.snapshotDate}</span>
+              Channel check · Nexar snapshot evidence <span style={{color:'#4a6a8a',fontWeight:'normal'}}>· {evid.snapshotDate}</span>
             </div>
             <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
               <div>Confidence: <span style={{color:evColor,fontWeight:'bold'}}>{evid.sourceConfidenceScore}/100 · {evid.evidenceStatus.replace(/_current_evidence$/,'').replace(/_/g,' ')}</span></div>
@@ -4585,8 +4663,7 @@ function App(){
         return (
           <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
             <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
-              Combined source evidence
-              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· Mouser backbone + Nexar rotating + TI direct</span>
+              Channel agreement <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· corroboration only · Mouser × Nexar × 64-part TI watch</span>
             </div>
             <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
               {combinedEvidence?.latestMouserSnapshotDate&&<div>Mouser latest: {combinedEvidence.latestMouserSnapshotDate}</div>}
@@ -4613,75 +4690,9 @@ function App(){
         );
       })()}
 
-      {/* Phase 24C — TI Direct full-catalog rollup for this canonical
-          subcategory. Sourced from /api/ti/universe/catalog/rollups/latest.
-          Hidden when no rollup row exists (legacy cell didn't map to a
-          canonical, or TI catalog not yet captured). */}
-      {(() => {
-        const canonical = combinedEvidence?.legacyToCanonical?.[catId];
-        const r = canonical ? tiRollupsByCanonical[canonical] : null;
-        if (!r) return null;
-        // Phase 24C.2 — server-supplied quality fields. Fall back to a
-        // local recomputation from mappingConfidenceSummary so the
-        // tooltip still degrades gracefully if the rollup row predates
-        // 24C.2.
-        const conf = r.mappingConfidenceSummary || {};
-        const high = Number(r.highConfidenceOpnCount ?? conf.high ?? 0);
-        const med  = Number(r.mediumConfidenceOpnCount ?? conf.medium ?? 0);
-        const low  = Number(r.lowConfidenceOpnCount ?? conf.low ?? 0);
-        const highPct = r.highConfidencePct != null ? Number(r.highConfidencePct) : null;
-        const qualityLabel = r.qualityLabel || 'unknown';
-        const usable = r.usableForPricesLiveEvidence === true;
-        const qualityWarning = r.qualityWarning || null;
-        const qualityColor = qualityLabel === 'high' ? '#4dffc3'
-                           : qualityLabel === 'medium' ? '#00c9a7'
-                           : qualityLabel === 'low' ? '#f0a84e'
-                           : qualityLabel === 'mixed' ? '#f0a84e'
-                           : '#4a6a8a';
-        const lifecycleEntries = r.lifecycleSummary && typeof r.lifecycleSummary === 'object'
-          ? Object.entries(r.lifecycleSummary) : [];
-        const fmtP = (n) => n == null ? '—' : `$${Number(n).toFixed(4)}`;
-        return (
-          <div style={{marginTop:7,paddingTop:6,borderTop:'1px solid #1a2740'}}>
-            <div style={{fontSize:'0.6rem',color:'#7a96b8',fontWeight:'bold',marginBottom:3}}>
-              TI Direct full catalog
-              <span style={{color:'#4a6a8a',fontWeight:'normal',marginLeft:5,fontSize:'0.52rem'}}>· canonical subcategory · 72k-OPN snapshot</span>
-            </div>
-            <div style={{fontSize:'0.55rem',color:'#c4d4e8',lineHeight:1.55,fontFamily:'monospace'}}>
-              <div>Snapshot: {r.latestCapturedAt ? new Date(r.latestCapturedAt).toISOString().slice(0,10) : '—'} · mapping quality <span style={{color:qualityColor,fontWeight:'bold'}}>{qualityLabel}</span>{!usable && qualityLabel !== 'unknown' ? ' · use as context, not signal' : ''}</div>
-              <div>OPNs: {Number(r.opnCount).toLocaleString()} · GPN families: {Number(r.gpnCount).toLocaleString()} · priced: {Number(r.pricedOpnCount).toLocaleString()}</div>
-              <div>Stocked: {Number(r.stockedOpnCount).toLocaleString()} ({r.stockedPct == null ? '—' : `${r.stockedPct}%`}) · Out of stock: {Number(r.outOfStockOpnCount).toLocaleString()}</div>
-              <div>Total qty: {Number(r.totalQuantity || 0).toLocaleString()}</div>
-              <div>Price: median {fmtP(r.medianNormalizedUnitPrice)} · min {fmtP(r.minNormalizedUnitPrice)} · max {fmtP(r.maxNormalizedUnitPrice)}</div>
-              {r.cheapestOpn && <div>Cheapest OPN: <span style={{color:'#e0eaf8'}}>{r.cheapestOpn}</span></div>}
-              {r.highestInventoryOpn && <div>Highest-inv OPN: <span style={{color:'#e0eaf8'}}>{r.highestInventoryOpn}</span></div>}
-              {lifecycleEntries.length > 0 && (
-                <div>Lifecycle: {lifecycleEntries.map(([k,v]) => `${k}:${v}`).join(' · ')}</div>
-              )}
-              {/* Phase 24C.2 — mapping-quality block. Always shown so
-                  the operator can see exactly what's behind the
-                  qualityLabel; warning banner only when low/mixed. */}
-              <div style={{marginTop:4,paddingTop:4,borderTop:'1px dashed #1a2740'}}>
-                <span style={{color:'#7a96b8'}}>Mapping: </span>
-                <span style={{color:'#4dffc3'}}>{high} high</span>
-                <span style={{color:'#7a96b8'}}> · </span>
-                <span style={{color:'#00c9a7'}}>{med} medium</span>
-                <span style={{color:'#7a96b8'}}> · </span>
-                <span style={{color:'#f0a84e'}}>{low} low</span>
-                {highPct != null && <span style={{color:'#7a96b8'}}> · {highPct}% high-conf</span>}
-              </div>
-              {qualityWarning && (
-                <div style={{color:qualityColor,fontStyle:'italic',marginTop:3}}>⚠ {qualityWarning}</div>
-              )}
-              {/* Phase 24D — CTA: clicking the cell opens the Universe
-                  tab pre-filtered to this canonical subcategory's
-                  drilldown (rollup + GPN families + OPN rows). */}
-              <div style={{color:'#3d8ef0',marginTop:3}}>→ Click cell to inspect mapped TI parts</div>
-              <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</div>
-            </div>
-          </div>
-        );
-      })()}
+      {/* Phase 24E — TI Direct full catalog block was lifted to the
+          top of the tooltip (★ Primary). Channel sections above are
+          now framed as corroboration only. */}
     </>;
   }
 
@@ -4768,12 +4779,12 @@ function App(){
         <span style={{color:'#00c9a7'}}>■ positive</span>
         <span style={{color:'#f05c5c'}}>■ negative (brackets)</span>
         <span style={{color:'#4dffc3',fontWeight:'bold'}}>■ ≥5%</span>
-        <span style={{color:'#4a6a8a'}}>· Historical = QoQ %; Live row = Mouser qty=1 vs latest baseline · hover any cell for detail</span>
-        {/* Phase 24C / 24C.2 — TI marker key + caveat. TI = clean
-            (high/medium quality); TI? = broad/experimental (low/mixed). */}
-        <span style={{color:'#4dffc3'}}>· <sup style={{fontSize:'0.55rem'}}>TI</sup>=Direct full-catalog rollup (clean)</span>
+        {/* Phase 24E — investor framing: TI Direct is canonical;
+            distributors are channel corroboration + fallback. */}
+        <span style={{color:'#4a6a8a'}}>· Historical = QoQ %; Live row tick = Mouser real-time channel · TI Direct catalog is the canonical state · hover any cell for detail</span>
+        <span style={{color:'#4dffc3'}}>· <sup style={{fontSize:'0.55rem'}}>TI</sup>=Direct full-catalog rollup (primary, clean)</span>
         <span style={{color:'#f0a84e'}}>· <sup style={{fontSize:'0.55rem',opacity:0.55}}>TI?</sup>=broad mapping (use as context, not signal)</span>
-        <span style={{color:'#7a96b8'}}>· TI Direct evidence is latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</span>
+        <span style={{color:'#7a96b8'}}>· TI Direct is the canonical source. Distributor APIs (Mouser / Nexar / DigiKey) are used only for channel corroboration and fallback. Forward history requires stored TI snapshots — backfill rows are channel-derived.</span>
       </div>
 
       {/* ── Table ── */}
