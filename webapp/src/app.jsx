@@ -97,47 +97,6 @@ function writePersistedRateLimit(retryAt) {
   } catch {}
 }
 
-// Countdown toast component for rate limiting
-function RateLimitToast({ retryAt, onDismiss }) {
-  const [secsLeft, setSecsLeft] = useState(null);
-  useEffect(() => {
-    function tick() {
-      const diff = Math.max(0, Math.ceil((new Date(retryAt) - Date.now()) / 1000));
-      setSecsLeft(diff);
-      if (diff <= 0) onDismiss && onDismiss();
-    }
-    tick();
-    const t = setInterval(tick, 1000);
-    return () => clearInterval(t);
-  }, [retryAt]);
-
-  const totalSecs = Math.ceil((new Date(retryAt) - Date.now()) / 1000 + (secsLeft||0));
-  const pct = secsLeft != null && totalSecs > 0 ? Math.max(0, (secsLeft / Math.max(totalSecs, 60)) * 100) : 100;
-  const mins = secsLeft != null ? Math.floor(secsLeft / 60) : '—';
-  const secs = secsLeft != null ? String(secsLeft % 60).padStart(2,'0') : '—';
-
-  return (
-    <div style={{color:'#f0a84e'}}>
-      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
-        <span style={{fontSize:'0.9rem'}}>⚡</span>
-        <span style={{fontWeight:'bold',fontSize:'0.7rem',letterSpacing:'0.05em'}}>MOUSER API RATE LIMIT</span>
-      </div>
-      <div style={{fontSize:'0.62rem',color:'#c4d4e8',lineHeight:1.5}}>
-        The API's hourly quota was reached mid-fetch. Historical data is unaffected.<br/>
-        Live prices will auto-refresh when the limit resets.
-      </div>
-      <div style={{marginTop:10,display:'flex',alignItems:'center',gap:10}}>
-        <span style={{fontSize:'0.58rem',color:'#2d4a6b'}}>RETRY IN</span>
-        <span style={{fontSize:'1.1rem',fontFamily:'monospace',color:'#ffd700',letterSpacing:'0.1em',fontWeight:'bold'}}>
-          {mins}:{secs}
-        </span>
-      </div>
-      <div className="progress-bar-outer" style={{marginTop:6}}>
-        <div className="progress-bar-inner" style={{width:`${pct}%`,background:'linear-gradient(90deg,#7a3f00,#f0a84e)'}}/>
-      </div>
-    </div>
-  );
-}
 
 function ToastShell({ toast, onDismiss }) {
   const border = toast.type==='error' ? '#4a1010' : toast.type==='warn' ? '#3a2800' : toast.type==='success' ? '#0a2a1a' : '#1a2740';
@@ -4460,34 +4419,30 @@ function App(){
   const grps=[];
   visCats.forEach(c=>{const last=grps[grps.length-1];if(last&&last.g===c.g)last.n++;else grps.push({g:c.g,n:1});});
 
-  // Auto-retry after rate limit window expires
+  // Auto-retry after rate limit window expires (silent — no customer toast)
   function scheduleRetry(retryAt) {
     if (retryTimer.current) clearTimeout(retryTimer.current);
     const ms = Math.max(0, new Date(retryAt) - Date.now()) + 2000;
     retryTimer.current = setTimeout(() => {
       setRateLimitedUntil(null);
       writePersistedRateLimit(null);
-      push('Rate limit cleared — auto-refreshing live prices…', 'info', 4000);
       fetchLive(true, true);
     }, ms);
   }
 
   const fetchLive = useCallback(async(force=false, silent=false) => {
-    // Phase 23C.5 — pre-flight guard. If a manual refresh fires while we
-    // already know the Mouser quota is cooling down, skip the network call
-    // entirely and surface a calm one-line info toast. Prevents the loud
-    // RateLimitToast countdown from re-popping every time the user clicks.
+    // Pre-flight guard — if the channel API is in a known cooldown window,
+    // skip the network call entirely. The cooldown is reflected by inline
+    // button state ("Channel refresh pending"), not by a customer toast.
     if (force) {
       const persisted = readPersistedRateLimit();
       const until = rateLimitedUntil || persisted;
       if (until && new Date(until).getTime() > Date.now()) {
-        const secsLeft = Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / 1000));
-        if (!silent) push(`Live refresh available in ~${secsLeft}s — Mouser quota cooling down.`, 'info', 4000);
+        console.warn('[ti-prices] channel cooldown active — skipping refresh', { until });
         return;
       }
     }
     setLoading(true);
-    if (!silent) push('Querying Mouser Electronics API — fetching 28 categories in parallel…', 'info', 15000);
     try {
       // No client-side timeout — let the server complete (parallel batches take ~8-10s)
       const res = await fetch(force ? '/api/prices?refresh=true' : '/api/prices');
@@ -4514,58 +4469,35 @@ function App(){
         });
       }
 
+      // Rate-limit / empty-response handling is now silent for customers.
+      // Internal state (cooldown timer, persisted key) is preserved so the
+      // dashboard self-heals; diagnostics go to console only.
       if (json.rateLimited) {
-        // Rate limited — may be 0/28 (hit on first call) or partial
-        // retryAt from server; if missing, default to 60s from now
         const retryAt = json.retryAt || new Date(Date.now() + 65_000).toISOString();
         setRateLimitedUntil(retryAt);
         writePersistedRateLimit(retryAt);
-        if (rateLimitToastId.current) dismiss(rateLimitToastId.current);
-        const id = push(
-          <RateLimitToast retryAt={retryAt} onDismiss={()=>dismiss(id)} />,
-          'warn', 0
-        );
-        rateLimitToastId.current = id;
         scheduleRetry(retryAt);
-        const got = json.fetchedCount ?? 0;
-        const msg = got === 0
-          ? 'Mouser API rate limit hit — historical data shown. Live row will auto-refresh when limit clears.'
-          : `Got ${got}/${json.totalCount} categories before rate limit. Partial data shown.`;
-        push(msg, 'warn', 9000);
-      } else if (json.source === 'cache') {
-        if (!silent) {
-          const age = json.cachedAt ? Math.round((Date.now() - new Date(json.cachedAt)) / 60000) : '?';
-          push(`Showing cached data from ${age} min ago — next auto-refresh in ${Math.round((json.nextRefreshMs||0)/60000)} min`, 'info', 5000);
-        }
+        console.warn('[ti-prices] channel cooldown', {
+          retryAt,
+          fetchedCount: json.fetchedCount,
+          totalCount: json.totalCount,
+        });
       } else if ((json.fetchedCount ?? 0) === 0 && json.source === 'live') {
-        // Fetched 0 categories but no rateLimited flag — likely all parts returned no pricing
+        // 0/28 with no explicit rateLimited flag — treat as cooldown internally.
         const retryAt2 = new Date(Date.now() + 65_000).toISOString();
         setRateLimitedUntil(retryAt2);
         writePersistedRateLimit(retryAt2);
-        if (rateLimitToastId.current) dismiss(rateLimitToastId.current);
-        const id2 = push(
-          <RateLimitToast retryAt={retryAt2} onDismiss={()=>dismiss(id2)} />,
-          'warn', 0
-        );
-        rateLimitToastId.current = id2;
         scheduleRetry(retryAt2);
-        push('Mouser API returned no pricing data — possibly rate limited. Auto-retry in ~1 min.', 'warn', 9000);
+        console.warn('[ti-prices] channel returned no data — cooldown scheduled', { retryAt: retryAt2 });
       } else {
-        if (!silent) {
-          const got = json.fetchedCount ?? '?';
-          const total = json.totalCount ?? 28;
-          push(`Live prices loaded — ${got}/${total} categories fetched from Mouser`, 'success', 5000);
-        }
-        // Phase 23C.5 — clear cooldown state, persisted key, retry timer,
-        // and the persistent RateLimitToast so a successful refresh leaves
-        // no stale UI behind.
+        // Successful fetch — clear cooldown state.
         setRateLimitedUntil(null);
         writePersistedRateLimit(null);
         if (retryTimer.current) { clearTimeout(retryTimer.current); retryTimer.current = null; }
         if (rateLimitToastId.current) { dismiss(rateLimitToastId.current); rateLimitToastId.current = null; }
       }
     } catch(e) {
-      push(`Failed to load live prices: ${e.message}`, 'error', 8000);
+      console.warn('[ti-prices] live fetch failed', e);
     }
     setLoading(false);
   }, [push, dismiss]);
@@ -4887,7 +4819,7 @@ function App(){
           {fetchedAt&&<div style={{fontSize:'0.65rem',color:'#7a96b8',marginTop:3}}>
             Updated {new Date(fetchedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
             {fetchCount&&` · ${fetchCount.got}/${fetchCount.total} categories live`}
-            {isRateLimited&&<span style={{color:'#f0a84e',marginLeft:6}}>· rate limited (auto-retry)</span>}
+            {isRateLimited&&<span style={{color:'#7a96b8',marginLeft:6,fontStyle:'italic'}}>· channel refresh pending</span>}
           </div>}
         </div>
         <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
@@ -4895,17 +4827,17 @@ function App(){
           <button
             onClick={()=>fetchLive(true)}
             disabled={loading || isRateLimited}
-            title={isRateLimited ? `Rate limited — retrying automatically` : 'Refresh live prices from Mouser API'}
+            title={isRateLimited ? 'Channel refresh pending — will retry automatically' : 'Refresh latest channel check'}
             style={{
-              background: loading ? '#1a2740' : isRateLimited ? '#1a1000' : '#1565c0',
-              border: isRateLimited ? '1px solid #3a2800' : 'none',
+              background: loading ? '#1a2740' : isRateLimited ? '#0d1422' : '#1565c0',
+              border: isRateLimited ? `1px solid ${B}` : 'none',
               borderRadius:4, padding:'6px 14px', fontSize:'0.72rem',
-              color: loading ? '#4a6480' : isRateLimited ? '#8a6020' : '#fff',
+              color: loading ? '#4a6480' : isRateLimited ? '#7a96b8' : '#fff',
               cursor: loading || isRateLimited ? 'not-allowed' : 'pointer',
               display:'flex', alignItems:'center', gap:6
             }}>
             {loading && <span style={{width:7,height:7,border:'1.5px solid #4a6480',borderTopColor:'#fff',borderRadius:'50%',display:'inline-block',animation:'spin 0.7s linear infinite'}}/>}
-            {loading ? 'FETCHING…' : isRateLimited ? '⚡ RATE LIMITED' : '⟳ REFRESH LIVE'}
+            {loading ? 'Refreshing…' : isRateLimited ? 'Channel refresh pending' : '⟳ Refresh live'}
           </button>
         </div>
       </div>
@@ -4964,6 +4896,7 @@ function App(){
         <summary style={{padding:'6px 16px',fontSize:'0.6rem',color:'#4a6a8a',cursor:'pointer',letterSpacing:'0.06em',textTransform:'uppercase',userSelect:'none'}}>Sources &amp; methodology</summary>
         <div style={{padding:'4px 16px 10px',fontSize:'0.62rem',color:'#7a96b8',lineHeight:1.5,maxWidth:880}}>
           TI Direct is treated as the primary catalog source. Distributor APIs are used for channel checks and fallback validation. Historical rows are quarterly price movements; the live row reflects the latest available channel check.
+          {isRateLimited && <div style={{marginTop:6,color:'#4a6a8a',fontStyle:'italic'}}>Latest channel check delayed; TI Direct catalog signal remains available.</div>}
         </div>
       </details>
 
@@ -5002,8 +4935,8 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ LIVE {fetchedAt?`· checked ${new Date(fetchedAt).toLocaleString()}`:'· click REFRESH LIVE to load'}</span>
-                  {isRateLimited && <span style={{color:'#f0a84e'}}>⚡ RATE LIMITED — auto-retry scheduled</span>}
+                  <span>▼ LIVE {fetchedAt?`· checked ${new Date(fetchedAt).toLocaleString()}`:'· click Refresh live to load'}</span>
+                  {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· channel check pending</span>}
                 </div>
               </td>
             </tr>
@@ -5076,7 +5009,7 @@ function App(){
                 } : undefined;
                 const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':'—',col:'#2a4060',bold:false};
                 const cellTitle = isRLCell && v == null
-                  ? 'Live channel check temporarily rate-limited — auto-retry scheduled'
+                  ? 'Channel check pending — TI Direct catalog signal remains available'
                   : fromTiTrend
                     ? 'Latest TI Direct catalog snapshot delta'
                     : hasTiRollup
