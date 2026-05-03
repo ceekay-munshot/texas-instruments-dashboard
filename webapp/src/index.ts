@@ -78,6 +78,8 @@ import {
   rebuildOneSubcategory,
   readRollupStatus,
   appendRollupHistory,
+  appendCurrentRollupsToHistory,
+  readHistoryStatus,
   readSnapshotCounts,
   readLatestSnapshotRun,
   insertSnapshotRunRow,
@@ -3343,6 +3345,17 @@ app.post('/api/ti/universe/catalog/rollups/rebuild', async (c) => {
   const pendingAfter = await pendingSubcategoryPredicates(d1)
   const all = listSubcategoryPredicates()
   const errors = processed.flatMap(p => p.errors)
+  // Phase 26C — append the rebuilt rollups into ti_catalog_rollup_history
+  // (idempotent). Without this step, operator-driven rebuilds populated
+  // rollup_latest but left rollup_history empty, which is exactly the
+  // production state Phase 26B uncovered. The helper skips rows whose
+  // (canonical_subcategory, captured_at) pair is already there, so a
+  // re-run during the same snapshot window is a no-op.
+  let historyAppend: Awaited<ReturnType<typeof appendCurrentRollupsToHistory>> | null = null
+  if (processed.some(p => p.upserted)) {
+    historyAppend = await appendCurrentRollupsToHistory(d1, { snapshotRunId: null })
+    for (const e of historyAppend.errors) errors.push(e)
+  }
   return c.json({
     success: errors.length === 0,
     mode,
@@ -3351,8 +3364,13 @@ app.post('/api/ti/universe/catalog/rollups/rebuild', async (c) => {
     completedSubcategories: all.length - pendingAfter.length,
     pendingSubcategories: pendingAfter.map(p => p.canonicalSubcategory),
     totalCanonicalSubcategories: all.length,
+    historyAppend: historyAppend ? {
+      insertedRows: historyAppend.insertedRows,
+      skippedExistingRows: historyAppend.skippedExistingRows,
+      latestCapturedAt: historyAppend.latestCapturedAt,
+    } : null,
     errors,
-    note: `Phase 24C.1 — ${processed.length} subcategor${processed.length === 1 ? 'y' : 'ies'} processed. Repeat until pending = 0.`,
+    note: `Phase 24C.1 — ${processed.length} subcategor${processed.length === 1 ? 'y' : 'ies'} processed. Phase 26C — history append is idempotent; safe to repeat.`,
   })
 })
 
@@ -3378,6 +3396,73 @@ app.get('/api/ti/universe/catalog/rollups/rebuild/status', async (c) => {
     note: status.pendingSubcategories.length === 0
       ? 'All canonical subcategories rebuilt.'
       : 'Loop POST /rollups/rebuild?mode=run until pendingSubcategories is empty.',
+  })
+})
+
+// POST /api/ti/universe/catalog/rollups/history/backfill-current — auth-gated.
+//
+// Phase 26C — operator one-shot to seed ti_catalog_rollup_history with the
+// current ti_catalog_rollup_latest snapshot. Use case: production is
+// running with rollup_latest populated (e.g. via the resumable
+// /rollups/rebuild?mode=run path) but rollup_history is empty, so the
+// shortage/oversupply detector is permanently stuck on
+// "insufficient history". This endpoint copies the current latest
+// rollups across to the history table verbatim, idempotently.
+//
+// Idempotent: re-running the endpoint never inserts duplicate rows for
+// the same (canonical_subcategory, captured_at) pair. The next real
+// catalog snapshot will append a new history row per subcategory under
+// its own captured_at.
+app.post('/api/ti/universe/catalog/rollups/history/backfill-current', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot backfill history.' }, 500)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  const append = await appendCurrentRollupsToHistory(d1, { snapshotRunId: null })
+  // Pull post-state diagnostics so the operator sees the new totals
+  // alongside the per-call insert/skip counts.
+  const post = await readHistoryStatus(d1)
+  return c.json({
+    success: append.errors.length === 0,
+    insertedRows: append.insertedRows,
+    skippedExistingRows: append.skippedExistingRows,
+    latestCapturedAt: append.latestCapturedAt,
+    historyRowsAfter: post.historyRows,
+    distinctHistorySnapshotsAfter: post.distinctSnapshots,
+    distinctSubcategoriesAfter: post.distinctSubcategories,
+    errors: append.errors,
+    note: 'Phase 26C — idempotent backfill of ti_catalog_rollup_history from ti_catalog_rollup_latest. Safe to re-run; never duplicates rows.',
+  })
+})
+
+// GET /api/ti/universe/catalog/rollups/history/status — public, sanitized.
+//
+// Phase 26C — diagnostic for the shortage/oversupply trend engine.
+// Customer-facing dashboards never call this; operators use it to
+// confirm history is accumulating snapshot-by-snapshot.
+app.get('/api/ti/universe/catalog/rollups/history/status', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; history status unavailable.' }, 503)
+  }
+  const status = await readHistoryStatus(env.TI_INVENTORY_HISTORY_DB as any)
+  return c.json({
+    success: status.errors.length === 0,
+    backend: 'd1',
+    ...status,
+    note: 'Phase 26C — hasBaseline = at least one history row exists; hasTrendReady = at least one canonical subcategory has ≥2 stored snapshots in the last 30 days.',
   })
 })
 

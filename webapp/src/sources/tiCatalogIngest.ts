@@ -1297,16 +1297,54 @@ export async function readRollupStatus(d1: CatalogD1): Promise<RollupStatusResul
   }
 }
 
-/** Small fast helper for /finalize so it can append a snapshot row to
- *  ti_catalog_rollup_history without re-running any heavy computation.
- *  Always called after rebuildOneSubcategory(...) has populated the
- *  per-subcategory rollup_latest rows. */
-export async function appendRollupHistory(
+/** Phase 26C — idempotent append of every current ti_catalog_rollup_latest
+ *  row into ti_catalog_rollup_history. Each (canonical_subcategory,
+ *  captured_at) pair is unique by convention; the WHERE NOT EXISTS guard
+ *  enforces it without requiring a schema-level unique constraint
+ *  (migration 0006 didn't add one and we don't want a destructive
+ *  migration on a populated production table).
+ *
+ *  This single helper is the only path that ever writes to
+ *  ti_catalog_rollup_history. Three callers:
+ *   1. POST /api/ti/universe/catalog/rollups/history/backfill-current
+ *      — operator one-shot to seed the first baseline snapshot.
+ *   2. /rollups/rebuild?mode=run|step — appends history after the
+ *      per-subcategory loop, so a later real_catalog snapshot rebuild
+ *      grows the trend automatically.
+ *   3. The catalog finalize chain — same helper, idempotent so a
+ *      retry never duplicates rows.
+ *
+ *  Returns row-level diagnostics so the caller can report exactly what
+ *  changed.
+ *
+ *  Backward-compat alias: `appendRollupHistory` is exported as a thin
+ *  wrapper that maps the new return shape to the old `{ appendedRows,
+ *  errors }` shape — keeps old test fixtures and any external callers
+ *  working without modification. */
+export async function appendCurrentRollupsToHistory(
   d1: CatalogD1,
   opts: { snapshotRunId?: number | null },
-): Promise<{ appendedRows: number; errors: string[] }> {
+): Promise<{ insertedRows: number; skippedExistingRows: number; latestCapturedAt: string | null; latestRowsConsidered: number; errors: string[] }> {
   const errors: string[] = []
-  let appendedRows = 0
+  let insertedRows = 0
+  let skippedExistingRows = 0
+  let latestCapturedAt: string | null = null
+  let latestRowsConsidered = 0
+  // Pre-flight count + latestCapturedAt so the response can report
+  // skippedExistingRows accurately even when the SQL driver doesn't
+  // surface meta.changes.
+  try {
+    const pre = await d1.prepare(
+      `SELECT COUNT(*) AS n, MAX(latest_captured_at) AS latest FROM ti_catalog_rollup_latest`,
+    ).first<{ n: number; latest: string | null }>()
+    latestRowsConsidered = Number(pre?.n ?? 0) || 0
+    latestCapturedAt = pre?.latest ?? null
+  } catch (e: any) {
+    errors.push(`history_append_preflight:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+  if (latestRowsConsidered === 0) {
+    return { insertedRows: 0, skippedExistingRows: 0, latestCapturedAt, latestRowsConsidered, errors }
+  }
   try {
     const res: any = await d1.prepare(
       `INSERT INTO ti_catalog_rollup_history (
@@ -1318,22 +1356,118 @@ export async function appendRollupHistory(
          min_normalized_unit_price, max_normalized_unit_price,
          cheapest_opn, highest_inventory_opn,
          lifecycle_summary, mapping_confidence_summary)
-       SELECT latest_captured_at, ?,
-              canonical_subcategory, canonical_group,
-              opn_count, gpn_count, priced_opn_count,
-              stocked_opn_count, out_of_stock_opn_count, stocked_pct,
-              total_quantity, median_normalized_unit_price,
-              min_normalized_unit_price, max_normalized_unit_price,
-              cheapest_opn, highest_inventory_opn,
-              lifecycle_summary, mapping_confidence_summary
-         FROM ti_catalog_rollup_latest`,
+       SELECT l.latest_captured_at, ?,
+              l.canonical_subcategory, l.canonical_group,
+              l.opn_count, l.gpn_count, l.priced_opn_count,
+              l.stocked_opn_count, l.out_of_stock_opn_count, l.stocked_pct,
+              l.total_quantity, l.median_normalized_unit_price,
+              l.min_normalized_unit_price, l.max_normalized_unit_price,
+              l.cheapest_opn, l.highest_inventory_opn,
+              l.lifecycle_summary, l.mapping_confidence_summary
+         FROM ti_catalog_rollup_latest l
+         WHERE NOT EXISTS (
+           SELECT 1 FROM ti_catalog_rollup_history h
+           WHERE h.canonical_subcategory = l.canonical_subcategory
+             AND h.captured_at = l.latest_captured_at
+         )`,
     ).bind(opts.snapshotRunId ?? null).run()
     const c = res?.meta?.changes ?? res?.changes
-    if (typeof c === 'number') appendedRows = c
+    if (typeof c === 'number') insertedRows = c
   } catch (e: any) {
     errors.push(`rollup_history_append:${(e?.message || 'failed').slice(0, 150)}`)
   }
-  return { appendedRows, errors }
+  skippedExistingRows = Math.max(0, latestRowsConsidered - insertedRows)
+  return { insertedRows, skippedExistingRows, latestCapturedAt, latestRowsConsidered, errors }
+}
+
+/** Backward-compatible wrapper. Old return shape so existing callers
+ *  (the catalog finalize chain, anything still importing the old name)
+ *  keep working without code changes. New callers should use
+ *  appendCurrentRollupsToHistory directly. */
+export async function appendRollupHistory(
+  d1: CatalogD1,
+  opts: { snapshotRunId?: number | null },
+): Promise<{ appendedRows: number; errors: string[] }> {
+  const r = await appendCurrentRollupsToHistory(d1, opts)
+  return { appendedRows: r.insertedRows, errors: r.errors }
+}
+
+/** Phase 26C — read-only diagnostic for ti_catalog_rollup_history.
+ *  Cheap: three small COUNT/MAX queries + one window-function scan to
+ *  count subcategories that already cleared the snapshotCount >= 2
+ *  threshold (the same threshold the Insights tab uses). */
+export type HistoryStatusResult = {
+  historyRows: number
+  distinctSnapshots: number
+  distinctSubcategories: number
+  latestHistoryCapturedAt: string | null
+  latestRollupCapturedAt: string | null
+  hasBaseline: boolean
+  hasTrendReady: boolean
+  trendReadySubcategories: number
+  errors: string[]
+}
+
+export async function readHistoryStatus(d1: CatalogD1): Promise<HistoryStatusResult> {
+  const errors: string[] = []
+  let historyRows = 0
+  let distinctSnapshots = 0
+  let distinctSubcategories = 0
+  let latestHistoryCapturedAt: string | null = null
+  let latestRollupCapturedAt: string | null = null
+  let trendReadySubcategories = 0
+  try {
+    const counts = await d1.prepare(
+      `SELECT COUNT(*) AS rows,
+              COUNT(DISTINCT captured_at) AS snapshots,
+              COUNT(DISTINCT canonical_subcategory) AS subs,
+              MAX(captured_at) AS latest
+         FROM ti_catalog_rollup_history`,
+    ).first<{ rows: number; snapshots: number; subs: number; latest: string | null }>()
+    if (counts) {
+      historyRows = Number(counts.rows) || 0
+      distinctSnapshots = Number(counts.snapshots) || 0
+      distinctSubcategories = Number(counts.subs) || 0
+      latestHistoryCapturedAt = counts.latest ?? null
+    }
+  } catch (e: any) {
+    errors.push(`history_status_counts:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+  try {
+    const latest = await d1.prepare(
+      `SELECT MAX(latest_captured_at) AS latest FROM ti_catalog_rollup_latest`,
+    ).first<{ latest: string | null }>()
+    latestRollupCapturedAt = latest?.latest ?? null
+  } catch (e: any) {
+    errors.push(`history_status_latest_rollup:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+  try {
+    // Subcategories with >= 2 distinct snapshots in the last 30 days,
+    // mirroring the Insights classifier's hasEnoughHistory check.
+    const trendReady = await d1.prepare(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT canonical_subcategory
+           FROM ti_catalog_rollup_history
+          WHERE captured_at >= datetime('now', '-30 days')
+          GROUP BY canonical_subcategory
+         HAVING COUNT(*) >= 2
+       )`,
+    ).first<{ n: number }>()
+    trendReadySubcategories = Number(trendReady?.n ?? 0) || 0
+  } catch (e: any) {
+    errors.push(`history_status_trend_ready:${(e?.message || 'failed').slice(0, 150)}`)
+  }
+  return {
+    historyRows,
+    distinctSnapshots,
+    distinctSubcategories,
+    latestHistoryCapturedAt,
+    latestRollupCapturedAt,
+    hasBaseline: historyRows > 0,
+    hasTrendReady: trendReadySubcategories > 0,
+    trendReadySubcategories,
+    errors,
+  }
 }
 
 export type SnapshotRunSummary = {
