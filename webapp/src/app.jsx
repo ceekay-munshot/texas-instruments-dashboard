@@ -4745,16 +4745,7 @@ function App(){
     const latestDate = dateCands.length ? dateCands[dateCands.length - 1] : null;
     const latestCheckText = latestDate ? `${sourcesText} · ${latestDate}` : sourcesText;
 
-    let interp;
-    if (tiRollupRow && d?.parts?.length > 0) {
-      interp = 'Latest live channel check supports the current price signal.';
-    } else if (tiRollupRow) {
-      interp = 'Price movement is based on TI catalog history.';
-    } else if (d?.parts?.length > 0 || basket || evid) {
-      interp = 'Latest signal from live distributor channel data.';
-    } else {
-      interp = 'Latest signal from TI price history.';
-    }
+    const interp = 'Latest price move';
 
     return <>
       {/* Header */}
@@ -4785,7 +4776,7 @@ function App(){
 
       {/* Source detail */}
       <div style={{fontSize:'0.55rem',color:'#4a6a8a',marginBottom:9,fontStyle:'italic',lineHeight:1.45}}>
-        Primary source: TI Direct · Channel checks: Mouser / Nexar
+        Source: TI data · Live updates: Mouser / Nexar
       </div>
 
       {/* CTA footer */}
@@ -4819,7 +4810,7 @@ function App(){
           {fetchedAt&&<div style={{fontSize:'0.65rem',color:'#7a96b8',marginTop:3}}>
             Updated {new Date(fetchedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
             {fetchCount&&` · ${fetchCount.got}/${fetchCount.total} categories live`}
-            {isRateLimited&&<span style={{color:'#7a96b8',marginLeft:6,fontStyle:'italic'}}>· channel refresh pending</span>}
+            {isRateLimited&&<span style={{color:'#7a96b8',marginLeft:6,fontStyle:'italic'}}>· update pending</span>}
           </div>}
         </div>
         <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
@@ -4827,7 +4818,7 @@ function App(){
           <button
             onClick={()=>fetchLive(true)}
             disabled={loading || isRateLimited}
-            title={isRateLimited ? 'Channel refresh pending — will retry automatically' : 'Refresh latest channel check'}
+            title={isRateLimited ? 'Update pending — will retry automatically' : 'Click Refresh to get the latest data'}
             style={{
               background: loading ? '#1a2740' : isRateLimited ? '#0d1422' : '#1565c0',
               border: isRateLimited ? `1px solid ${B}` : 'none',
@@ -4837,7 +4828,7 @@ function App(){
               display:'flex', alignItems:'center', gap:6
             }}>
             {loading && <span style={{width:7,height:7,border:'1.5px solid #4a6480',borderTopColor:'#fff',borderRadius:'50%',display:'inline-block',animation:'spin 0.7s linear infinite'}}/>}
-            {loading ? 'Refreshing…' : isRateLimited ? 'Channel refresh pending' : '⟳ Refresh live'}
+            {loading ? 'Refreshing…' : isRateLimited ? 'Update pending' : '⟳ Refresh'}
           </button>
         </div>
       </div>
@@ -4888,15 +4879,15 @@ function App(){
         <span><span style={{color:'#00c9a7'}}>■</span> Price increase</span>
         <span><span style={{color:'#f05c5c'}}>■</span> Price decrease</span>
         <span style={{color:'#4a6a8a'}}>· Quarterly rows show QoQ price movement</span>
-        <span style={{color:'#4a6a8a'}}>· Live row shows latest available channel check</span>
+        <span style={{color:'#4a6a8a'}}>· Live row shows the latest update</span>
       </div>
 
-      {/* ── Sources & methodology (collapsed) ── */}
+      {/* ── Data sources (collapsed) ── */}
       <details style={{borderBottom:`1px solid #0d1520`,background:'#050810'}}>
-        <summary style={{padding:'6px 16px',fontSize:'0.6rem',color:'#4a6a8a',cursor:'pointer',letterSpacing:'0.06em',textTransform:'uppercase',userSelect:'none'}}>Sources &amp; methodology</summary>
+        <summary style={{padding:'6px 16px',fontSize:'0.6rem',color:'#4a6a8a',cursor:'pointer',letterSpacing:'0.06em',textTransform:'uppercase',userSelect:'none'}}>Data sources</summary>
         <div style={{padding:'4px 16px 10px',fontSize:'0.62rem',color:'#7a96b8',lineHeight:1.5,maxWidth:880}}>
-          TI Direct is treated as the primary catalog source. Distributor APIs are used for channel checks and fallback validation. Historical rows are quarterly price movements; the live row reflects the latest available channel check.
-          {isRateLimited && <div style={{marginTop:6,color:'#4a6a8a',fontStyle:'italic'}}>Latest channel check delayed; TI Direct catalog signal remains available.</div>}
+          TI is the primary data source. Live updates come from Mouser and Nexar. Quarterly rows show price changes from one quarter to the next; the live row shows the latest update.
+          {isRateLimited && <div style={{marginTop:6,color:'#4a6a8a',fontStyle:'italic'}}>Some live data is still updating. TI data is still available.</div>}
         </div>
       </details>
 
@@ -4935,8 +4926,8 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ LIVE {fetchedAt?`· checked ${new Date(fetchedAt).toLocaleString()}`:'· click Refresh live to load'}</span>
-                  {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· channel check pending</span>}
+                  <span>▼ LIVE {fetchedAt?`· updated ${new Date(fetchedAt).toLocaleString()}`:'· Click Refresh to get the latest data'}</span>
+                  {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· update pending</span>}
                 </div>
               </td>
             </tr>
@@ -5009,11 +5000,11 @@ function App(){
                 } : undefined;
                 const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':'—',col:'#2a4060',bold:false};
                 const cellTitle = isRLCell && v == null
-                  ? 'Channel check pending — TI Direct catalog signal remains available'
+                  ? 'Update pending — TI data is still available'
                   : fromTiTrend
-                    ? 'Latest TI Direct catalog snapshot delta'
+                    ? 'Latest price move from TI data'
                     : hasTiRollup
-                      ? 'Click to inspect mapped TI parts in Universe tab'
+                      ? 'Click to see the TI parts in this category'
                       : undefined;
                 return(
                   <td key={c.id}
