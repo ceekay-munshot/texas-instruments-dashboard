@@ -3178,222 +3178,258 @@ function InventoryPanel() {
 // ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
 // Shows only what answers the customer's question: are prices moving, by how
 // much, where, and any outliers. Hides empty sections. No operator chrome.
-function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, tiStatus }) {
+function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, tiStatus, tiRollupsByCanonical }) {
+  // Phase 24F — customer-focused Insights tab. The previous panel had an
+  // operator/admin slant (TI Direct API token status, X-Capture-Secret-
+  // gated controls, raw watched-parts table, source agreement matrix).
+  // The buy-side customer asked for one thing: detect shortage vs
+  // oversupply by correlating price moves with stock moves. This panel
+  // is built around that question and nothing else.
+  //
+  // Trend semantics: stock-trend classification (shortage / oversupply /
+  // mixed) requires ≥2 stored TI Direct snapshots so we can compute
+  // stockDeltaPct. Until that history exists we honestly show
+  // "Insufficient history" rather than fabricating a trend from a
+  // single snapshot.
   const sig = useMemo(() => computeSignal(liveData), [liveData]);
-  const fmt = v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+  const fmtPct = v => (v == null || !Number.isFinite(v)) ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
 
-  // Section styles
   const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
   const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 10 };
+  const card = { background: '#0c1426', border: '1px solid #1a2740', borderRadius: 6, padding: '14px 16px' };
 
-  // Loading / no live data — keep it short and human, but still surface the
-  // TI watched-parts universe (which doesn't depend on Mouser live signal).
+  // ── Per-cell trend classification ──────────────────────────────────────
+  // For each visible Mouser-live category, we already have a price delta
+  // (qoqPct vs latest baseline). Stock delta requires multiple TI Direct
+  // snapshots — until those land we report stockDeltaPct=null and the
+  // classifier defaults to insufficient_history.
+  const SHORTAGE_THRESHOLDS = {
+    SHORTAGE_PRICE: 2, SHORTAGE_STOCK: -20,
+    EARLY_PRICE_LO: -1, EARLY_PRICE_HI: 2, EARLY_STOCK: -30,
+    OVERSUPPLY_PRICE: -2, OVERSUPPLY_STOCK: 30,
+    PRICING_POWER_PRICE: 2, PRICING_POWER_STOCK: 10,
+    WEAK_PRICE: -2, WEAK_STOCK: -10,
+  };
+  function classify(priceDeltaPct, stockDeltaPct) {
+    if (priceDeltaPct == null || stockDeltaPct == null) return 'insufficient_history';
+    const t = SHORTAGE_THRESHOLDS;
+    if (priceDeltaPct >= t.SHORTAGE_PRICE && stockDeltaPct <= t.SHORTAGE_STOCK) return 'shortage_risk';
+    if (priceDeltaPct > t.EARLY_PRICE_LO && priceDeltaPct < t.EARLY_PRICE_HI && stockDeltaPct <= t.EARLY_STOCK) return 'early_shortage_watch';
+    if (priceDeltaPct <= t.OVERSUPPLY_PRICE && stockDeltaPct >= t.OVERSUPPLY_STOCK) return 'oversupply_easing';
+    if (priceDeltaPct >= t.PRICING_POWER_PRICE && stockDeltaPct >= t.PRICING_POWER_STOCK) return 'pricing_power_mixed';
+    if (priceDeltaPct <= t.WEAK_PRICE && stockDeltaPct <= t.WEAK_STOCK) return 'weak_unclear';
+    return 'stable';
+  }
+
+  // Build per-cell rows: every visible CAT mapped to its canonical
+  // subcategory, current TI Direct stock + price (canonical state) AND
+  // current Mouser channel-tick price delta. stockDeltaPct stays null
+  // until ≥2 TI Direct snapshots are stored.
+  const cellRows = useMemo(() => {
+    return CATS.map(c => {
+      const live = liveData?.[c.id];
+      const priceDeltaPct = (live && Number.isFinite(live.qoqPct)) ? Number(live.qoqPct) : null;
+      const canonical = combinedEvidence?.legacyToCanonical?.[c.id] || null;
+      const tiRollup = canonical ? tiRollupsByCanonical?.[canonical] : null;
+      const tiUsable = tiRollup?.usableForPricesLiveEvidence === true;
+      const stockDeltaPct = null; // requires ≥2 stored TI Direct snapshots
+      const signal = classify(priceDeltaPct, stockDeltaPct);
+      return {
+        id: c.id,
+        group: c.g,
+        subcategory: c.l,
+        priceDeltaPct,
+        stockDeltaPct,
+        latestStock: tiRollup ? Number(tiRollup.totalQuantity || 0) : null,
+        tiUsable,
+        signal,
+      };
+    });
+  }, [liveData, combinedEvidence, tiRollupsByCanonical]);
+
+  // ── 1. Shortage / Oversupply readout ──────────────────────────────────
+  const counts = cellRows.reduce((acc, r) => {
+    if (r.signal === 'shortage_risk' || r.signal === 'early_shortage_watch') acc.shortage += 1;
+    else if (r.signal === 'oversupply_easing') acc.oversupply += 1;
+    else if (r.signal === 'pricing_power_mixed' || r.signal === 'weak_unclear') acc.mixed += 1;
+    else if (r.signal === 'insufficient_history') acc.insufficient += 1;
+    else acc.stable += 1;
+    return acc;
+  }, { shortage: 0, oversupply: 0, mixed: 0, stable: 0, insufficient: 0 });
+  const trendHistoryReady = counts.insufficient < cellRows.length;
+  const headlineSentence = trendHistoryReady
+    ? `Latest TI Direct snapshots show ${counts.shortage} shortage-risk basket${counts.shortage===1?'':'s'} and ${counts.oversupply} oversupply/easing basket${counts.oversupply===1?'':'s'} across ${cellRows.length} monitored categories.`
+    : `Latest source snapshot shows ${sig?.tone ? sig.tone.toLowerCase() : 'mixed'} price action. Stock-price trend detection will start after multiple TI Direct snapshots are stored.`;
+
+  // ── 2. Price + Stock Matrix (educational) ──────────────────────────────
+  const matrixCells = [
+    { row: 'Price rising',  col: 'Stock falling', label: 'Shortage risk',         color: '#ff7575', accent: '#3a1010' },
+    { row: 'Price rising',  col: 'Stock rising',  label: 'Pricing power / mixed', color: '#f0a84e', accent: '#2a1f00' },
+    { row: 'Price falling', col: 'Stock falling', label: 'Weak / unclear',        color: '#7a96b8', accent: '#0d1422' },
+    { row: 'Price falling', col: 'Stock rising',  label: 'Oversupply / easing',   color: '#4dffc3', accent: '#0a1a14' },
+  ];
+
+  // ── 3. Most Important Baskets to Watch ─────────────────────────────────
+  // Until stock-trend history exists, "most important" reduces to the
+  // sharpest absolute price moves (which is what computeSignal already
+  // surfaces). Cap at 5 rows per spec.
+  const top5 = useMemo(() => {
+    return cellRows
+      .filter(r => r.priceDeltaPct != null)
+      .sort((a, b) => Math.abs(b.priceDeltaPct) - Math.abs(a.priceDeltaPct))
+      .slice(0, 5);
+  }, [cellRows]);
+  function whyItMatters(r) {
+    if (r.signal === 'insufficient_history') {
+      const dirText = r.priceDeltaPct >= 2 ? 'price up strongly'
+                    : r.priceDeltaPct <= -2 ? 'price lower'
+                    : 'price roughly flat';
+      return `${r.subcategory}: ${dirText}; stock trend pending — watch for shortage/oversupply confirmation after the next TI Direct snapshot.`;
+    }
+    if (r.signal === 'shortage_risk') return `${r.subcategory}: price rising while stock falls — clean shortage signal.`;
+    if (r.signal === 'early_shortage_watch') return `${r.subcategory}: stock falling sharply with prices still flat — early shortage watch.`;
+    if (r.signal === 'oversupply_easing') return `${r.subcategory}: prices easing while stock builds — supply unwinding.`;
+    if (r.signal === 'pricing_power_mixed') return `${r.subcategory}: prices and stock both rising — pricing power, demand absorbing supply.`;
+    if (r.signal === 'weak_unclear') return `${r.subcategory}: both price and stock weak — demand softening.`;
+    return `${r.subcategory}: stable.`;
+  }
+  function signalBadge(s) {
+    switch (s) {
+      case 'shortage_risk':         return { label: 'Shortage risk',         color: '#ff7575' };
+      case 'early_shortage_watch':  return { label: 'Early shortage watch',  color: '#f0a84e' };
+      case 'oversupply_easing':     return { label: 'Oversupply / easing',   color: '#4dffc3' };
+      case 'pricing_power_mixed':   return { label: 'Pricing power / mixed', color: '#f0a84e' };
+      case 'weak_unclear':          return { label: 'Weak / unclear',        color: '#7a96b8' };
+      case 'stable':                return { label: 'Stable',                color: '#7a96b8' };
+      default:                      return { label: 'Insufficient history', color: '#7a96b8' };
+    }
+  }
+
+  // ── 4. Data Center Power watch ─────────────────────────────────────────
+  const dcpRows = cellRows.filter(r => r.group === 'Data Center Power' && r.priceDeltaPct != null);
+  const dcpAvg = dcpRows.length > 0 ? dcpRows.reduce((s, r) => s + r.priceDeltaPct, 0) / dcpRows.length : null;
+  const dcpTop = dcpRows.slice().sort((a, b) => Math.abs(b.priceDeltaPct) - Math.abs(a.priceDeltaPct))[0] || null;
+
+  // ── Loading guards ─────────────────────────────────────────────────────
   if (sig.state === 'waiting') {
-    return (
-      <>
-        <div style={sectionWrap}>
-          <div style={{ fontSize: '0.8rem', color: '#7a96b8' }}>Loading live prices…</div>
-        </div>
-        <TiWatchedPartsUniverse />
-      </>
-    );
+    return <div style={sectionWrap}><div style={{ fontSize: '0.8rem', color: '#7a96b8' }}>Loading live prices…</div></div>;
   }
   if (sig.state === 'no-live') {
-    return (
-      <>
-        <div style={sectionWrap}>
-          <div style={{ fontSize: '0.8rem', color: '#f0a84e' }}>Live prices unavailable. Try Refresh on the Prices tab.</div>
-        </div>
-        <TiWatchedPartsUniverse />
-      </>
-    );
+    return <div style={sectionWrap}><div style={{ fontSize: '0.8rem', color: '#f0a84e' }}>Live prices unavailable. Try Refresh on the Prices tab.</div></div>;
   }
-
-  const Tile = ({ name, value, sub, color }) => (
-    <div style={{ minWidth: 130 }}>
-      <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>{name}</div>
-      <div style={{ fontSize: '1.1rem', fontFamily: 'monospace', color: color || '#e0eaf8', lineHeight: 1.2, marginTop: 4 }}>{value}</div>
-      {sub && <div style={{ fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 1 }}>{sub}</div>}
-    </div>
-  );
-
-  const moverColor = (v, up) => up
-    ? (Math.abs(v) >= 5 ? '#4dffc3' : '#00c9a7')
-    : (Math.abs(v) >= 5 ? '#ff7575' : '#f05c5c');
-
-  const hasMovers = sig.topUp.length > 0 || sig.topDown.length > 0;
-  const hasAnomalies = sig.inflationFlags.length > 0 || sig.deflationFlags.length > 0 || sig.outliers.length > 0;
-  const showSourceTable = combinedEvidence?.status === 'ok' || combinedEvidence?.status === 'partial' || combinedEvidence?.status === 'nexar_only';
 
   return (
     <>
-      {/* ── Headline: tone + signal sentence ── */}
-      <div style={{ ...sectionWrap, paddingTop: 22, paddingBottom: 22 }}>
-        <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold' }}>
-          Live signal
-          {baselineMeta?.baselinePeriodLabel && <span style={{ color: '#4a6a8a', marginLeft: 8 }}>vs {baselineMeta.baselinePeriodLabel}</span>}
-        </div>
-        <div style={{ fontSize: '1.4rem', fontWeight: 'bold', color: sig.toneColor, fontFamily: 'monospace', marginTop: 8, lineHeight: 1.1 }}>
-          {sig.tone}
-        </div>
-        <div style={{ marginTop: 8, fontSize: '0.8rem', color: '#c4d4e8', lineHeight: 1.55, maxWidth: 880 }}>
-          {sig.interp}
-        </div>
-        {sig.partial && (
-          <div style={{ marginTop: 6, fontSize: '0.66rem', color: '#f0a84e' }}>Partial coverage — {sig.liveCount}/{sig.total} categories live.</div>
-        )}
-      </div>
-
-      {/* ── Headline tiles: Median, Average, Breadth ── */}
+      {/* ── 1. Shortage / Oversupply Readout ──────────────────────── */}
       <div style={sectionWrap}>
-        <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-          <Tile name="Median" value={fmt(sig.median)} color={sig.median >= 0 ? '#00c9a7' : '#f05c5c'} />
-          <Tile name="Average" value={fmt(sig.mean)} color={sig.mean >= 0 ? '#00c9a7' : '#f05c5c'} />
-          <Tile name="Up vs Total" value={`${sig.upCount} / ${sig.liveCount}`} sub={`${(sig.breadthUp * 100).toFixed(0)}% of basket`} />
-          {Math.abs(sig.strongestGroup.avg) >= 0.5 && (
-            <Tile name="Strongest group" value={sig.strongestGroup.g} sub={fmt(sig.strongestGroup.avg)} color={GC[sig.strongestGroup.g]} />
-          )}
-          {Math.abs(sig.weakestGroup.avg) >= 0.5 && sig.weakestGroup.g !== sig.strongestGroup.g && (
-            <Tile name="Weakest group" value={sig.weakestGroup.g} sub={fmt(sig.weakestGroup.avg)} color={GC[sig.weakestGroup.g]} />
-          )}
+        <div style={sectionTitle}>Shortage / Oversupply Readout</div>
+        <div style={{ ...card, marginBottom: 10 }}>
+          <div style={{ fontSize: '0.95rem', color: '#e0eaf8', lineHeight: 1.45, marginBottom: 10 }}>
+            {headlineSentence}
+          </div>
+          <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontFamily: 'monospace', fontSize: '0.75rem' }}>
+            <div><span style={{ color: '#ff7575', fontWeight: 'bold' }}>{counts.shortage}</span> <span style={{ color: '#7a96b8' }}>shortage-risk</span></div>
+            <div><span style={{ color: '#4dffc3', fontWeight: 'bold' }}>{counts.oversupply}</span> <span style={{ color: '#7a96b8' }}>oversupply / easing</span></div>
+            <div><span style={{ color: '#f0a84e', fontWeight: 'bold' }}>{counts.mixed}</span> <span style={{ color: '#7a96b8' }}>mixed / unclear</span></div>
+            <div><span style={{ color: '#7a96b8', fontWeight: 'bold' }}>{counts.insufficient}</span> <span style={{ color: '#7a96b8' }}>insufficient history</span></div>
+            <div><span style={{ color: '#c4d4e8', fontWeight: 'bold' }}>{cellRows.length}</span> <span style={{ color: '#7a96b8' }}>monitored categories</span></div>
+          </div>
         </div>
       </div>
 
-      {/* ── Top movers: only when there ARE movers ── */}
-      {hasMovers && (
-        <div style={sectionWrap}>
-          <div style={sectionTitle}>Top movers</div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 1fr) minmax(280px, 1fr)', gap: 32 }}>
-            <div>
-              <div style={{ fontSize: '0.66rem', color: '#7a96b8', marginBottom: 6 }}>▲ Up</div>
-              {sig.topUp.length === 0
-                ? <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace' }}>—</div>
-                : <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontFamily: 'monospace', fontSize: '0.78rem' }}>
-                    {sig.topUp.map(d => (
-                      <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, maxWidth: 360 }}>
-                        <span style={{ color: '#c4d4e8' }}>{d.l}</span>
-                        <span style={{ color: moverColor(d.qoqPct, true), fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
-                      </div>
-                    ))}
-                  </div>}
-            </div>
-            <div>
-              <div style={{ fontSize: '0.66rem', color: '#7a96b8', marginBottom: 6 }}>▼ Down</div>
-              {sig.topDown.length === 0
-                ? <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontFamily: 'monospace' }}>—</div>
-                : <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontFamily: 'monospace', fontSize: '0.78rem' }}>
-                    {sig.topDown.map(d => (
-                      <div key={d.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, maxWidth: 360 }}>
-                        <span style={{ color: '#c4d4e8' }}>{d.l}</span>
-                        <span style={{ color: moverColor(d.qoqPct, false), fontWeight: Math.abs(d.qoqPct) >= 5 ? 'bold' : 'normal' }}>{fmt(d.qoqPct)}</span>
-                      </div>
-                    ))}
-                  </div>}
-            </div>
+      {/* ── 2. Price + Stock Matrix ─────────────────────────────────── */}
+      <div style={sectionWrap}>
+        <div style={sectionTitle}>Price + Stock Matrix</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr 1fr', gap: 0, fontSize: '0.74rem', maxWidth: 720 }}>
+          <div></div>
+          <div style={{ padding: '6px 10px', textAlign: 'center', color: '#7a96b8', fontWeight: 'bold', borderBottom: '1px solid #1a2740' }}>Stock falling</div>
+          <div style={{ padding: '6px 10px', textAlign: 'center', color: '#7a96b8', fontWeight: 'bold', borderBottom: '1px solid #1a2740' }}>Stock rising</div>
+          {['Price rising', 'Price falling'].map(rowLabel => (
+            <React.Fragment key={rowLabel}>
+              <div style={{ padding: '14px 10px', color: '#7a96b8', fontWeight: 'bold', display: 'flex', alignItems: 'center', borderRight: '1px solid #1a2740' }}>{rowLabel}</div>
+              {['Stock falling', 'Stock rising'].map(colLabel => {
+                const cell = matrixCells.find(c => c.row === rowLabel && c.col === colLabel);
+                return (
+                  <div key={colLabel} style={{ background: cell.accent, border: '1px solid #1a2740', padding: '14px 10px', textAlign: 'center', color: cell.color, fontWeight: 'bold', fontFamily: 'monospace' }}>
+                    {cell.label}
+                  </div>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </div>
+        <div style={{ marginTop: 10, fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic', maxWidth: 720 }}>
+          Read the matrix to interpret each subcategory&rsquo;s shortage / oversupply state once stock trend data is available.
+        </div>
+      </div>
+
+      {/* ── 3. Most Important Baskets to Watch ──────────────────────── */}
+      <div style={sectionWrap}>
+        <div style={sectionTitle}>Most Important Baskets to Watch</div>
+        <div style={{ background: '#0c1426', border: '1px solid #1a2740', borderRadius: 6, overflow: 'hidden' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem', fontFamily: 'monospace' }}>
+            <thead>
+              <tr style={{ background: '#080c14' }}>
+                <th style={{ padding: '8px 12px', textAlign: 'left', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', borderBottom: '1px solid #1a2740' }}>Basket</th>
+                <th style={{ padding: '8px 12px', textAlign: 'right', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', borderBottom: '1px solid #1a2740' }}>Price move</th>
+                <th style={{ padding: '8px 12px', textAlign: 'right', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', borderBottom: '1px solid #1a2740' }}>Stock move</th>
+                <th style={{ padding: '8px 12px', textAlign: 'left', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', borderBottom: '1px solid #1a2740' }}>Signal</th>
+                <th style={{ padding: '8px 12px', textAlign: 'left', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', borderBottom: '1px solid #1a2740' }}>Why it matters</th>
+              </tr>
+            </thead>
+            <tbody>
+              {top5.length === 0 && (
+                <tr><td colSpan={5} style={{ padding: '14px 12px', color: '#7a96b8', textAlign: 'center' }}>No live price moves yet.</td></tr>
+              )}
+              {top5.map(r => {
+                const badge = signalBadge(r.signal);
+                const priceColor = r.priceDeltaPct >= 0 ? '#00c9a7' : '#f05c5c';
+                return (
+                  <tr key={r.id} style={{ borderBottom: '1px solid #0d1520' }}>
+                    <td style={{ padding: '8px 12px', color: '#e0eaf8' }}>{r.subcategory}</td>
+                    <td style={{ padding: '8px 12px', textAlign: 'right', color: priceColor, fontWeight: Math.abs(r.priceDeltaPct) >= 5 ? 'bold' : 'normal' }}>{fmtPct(r.priceDeltaPct)}</td>
+                    <td style={{ padding: '8px 12px', textAlign: 'right', color: '#7a96b8' }}>pending</td>
+                    <td style={{ padding: '8px 12px', color: badge.color }}>{badge.label}</td>
+                    <td style={{ padding: '8px 12px', color: '#a0b8d0' }}>{whyItMatters(r)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── 4. Data Center Power Watch ──────────────────────────────── */}
+      <div style={sectionWrap}>
+        <div style={sectionTitle}>Data Center Power Watch</div>
+        <div style={card}>
+          <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', fontSize: '0.74rem', fontFamily: 'monospace', marginBottom: 8 }}>
+            <div><span style={{ color: '#7a96b8' }}>Average price move: </span><span style={{ color: dcpAvg != null && dcpAvg >= 0 ? '#00c9a7' : '#f05c5c', fontWeight: 'bold' }}>{fmtPct(dcpAvg)}</span></div>
+            <div><span style={{ color: '#7a96b8' }}>Average stock move: </span><span style={{ color: '#7a96b8' }}>pending</span></div>
+            <div><span style={{ color: '#7a96b8' }}>Top affected: </span><span style={{ color: '#e0eaf8' }}>{dcpTop ? dcpTop.subcategory : '—'}</span></div>
+          </div>
+          <div style={{ fontSize: '0.78rem', color: '#c4d4e8', lineHeight: 1.5 }}>
+            {dcpRows.length === 0
+              ? 'No live Data Center Power data yet — waiting for Mouser channel tick.'
+              : dcpAvg != null && dcpAvg >= 0.5 && dcpTop
+                ? `Data Center Power is showing a ${fmtPct(dcpAvg)} average price move, led by ${dcpTop.subcategory} at ${fmtPct(dcpTop.priceDeltaPct)}. Stock-trend confirmation requires another TI Direct snapshot.`
+                : `Data Center Power price action is muted (${fmtPct(dcpAvg)} avg). Stock-trend confirmation requires another TI Direct snapshot.`}
           </div>
         </div>
-      )}
+      </div>
 
-      {/* ── Anomalies: only when there are any ── */}
-      {hasAnomalies && (
-        <div style={sectionWrap}>
-          <div style={sectionTitle}>Anomalies worth a look</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontFamily: 'monospace', fontSize: '0.74rem' }}>
-            {sig.inflationFlags.length > 0 && (
-              <div style={{ display: 'flex', gap: 12, color: '#4dffc3' }}>
-                <span style={{ minWidth: 22, color: '#4dffc3' }}>⚡</span>
-                <span style={{ minWidth: 180, color: '#c4d4e8' }}>Inflation ≥ +5%</span>
-                <span style={{ color: '#a0b8d0' }}>{sig.inflationFlags.map(d => `${d.l} ${fmt(d.qoqPct)}`).join(' · ')}</span>
-              </div>
-            )}
-            {sig.deflationFlags.length > 0 && (
-              <div style={{ display: 'flex', gap: 12, color: '#ff7575' }}>
-                <span style={{ minWidth: 22, color: '#ff7575' }}>⬇</span>
-                <span style={{ minWidth: 180, color: '#c4d4e8' }}>Deflation ≤ −5%</span>
-                <span style={{ color: '#a0b8d0' }}>{sig.deflationFlags.map(d => `${d.l} ${fmt(d.qoqPct)}`).join(' · ')}</span>
-              </div>
-            )}
-            {sig.outliers.length > 0 && (
-              <div style={{ display: 'flex', gap: 12, color: '#f0a84e' }}>
-                <span style={{ minWidth: 22, color: '#f0a84e' }}>◆</span>
-                <span style={{ minWidth: 180, color: '#c4d4e8' }}>Major outlier |Δ| ≥ 10%</span>
-                <span style={{ color: '#a0b8d0' }}>{sig.outliers.map(d => `${d.l} ${fmt(d.qoqPct)}`).join(' · ')}</span>
-              </div>
-            )}
-          </div>
+      {/* ── 5. Source Confidence ────────────────────────────────────── */}
+      <div style={sectionWrap}>
+        <div style={sectionTitle}>Source Confidence</div>
+        <div style={{ fontSize: '0.74rem', color: '#c4d4e8', lineHeight: 1.55, maxWidth: 760 }}>
+          Primary source: <span style={{ color: '#4dffc3', fontWeight: 'bold' }}>TI Direct full catalog</span>. Distributor APIs are used only for channel corroboration or fallback. Trend conclusions require multiple stored TI Direct snapshots.
         </div>
-      )}
+      </div>
 
-      {/* ── TI Direct API status card (Phase 20A) ── */}
-      {tiStatus && tiStatus.configured && (() => {
-        const productState = tiStatus.productInfoApi?.state;
-        const storeState = tiStatus.storeApi?.state;
-        const productColor = productState === 'ready' ? '#4dffc3' : productState === 'auth_failed' ? '#f0a84e' : '#7a96b8';
-        const storeColor = storeState === 'ready' ? '#4dffc3' : storeState === 'pending_approval' ? '#f0a84e' : storeState === 'auth_failed' ? '#f05c5c' : '#7a96b8';
-        const productLabel = productState === 'ready' ? 'active' : productState === 'auth_failed' ? 'auth failed' : productState === 'not_configured' ? 'not configured' : productState;
-        const storeLabel =
-          storeState === 'ready' ? 'active'
-          : storeState === 'pending_approval' ? 'pending approval'
-          : storeState === 'auth_failed' ? 'auth failed'
-          : storeState === 'disabled' ? 'disabled'
-          : storeState;
-        const refreshAt = tiStatus.lastSuccessfulRefresh
-          ? new Date(tiStatus.lastSuccessfulRefresh).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
-          : '—';
-        return (
-          <div style={sectionWrap}>
-            <div style={sectionTitle}>TI Direct API</div>
-            <div style={{ display: 'flex', gap: 28, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-              <div style={{ minWidth: 160 }}>
-                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Credentials</div>
-                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: tiStatus.tokenOk ? '#4dffc3' : '#f0a84e', marginTop: 4 }}>
-                  {tiStatus.tokenOk ? 'configured · token ok' : tiStatus.configured ? 'configured · token failed' : 'not configured'}
-                </div>
-              </div>
-              <div style={{ minWidth: 220 }}>
-                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Product Information API</div>
-                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: productColor, marginTop: 4 }}>{productLabel}</div>
-              </div>
-              <div style={{ minWidth: 220 }}>
-                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Store API</div>
-                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: storeColor, marginTop: 4 }}>{storeLabel}</div>
-              </div>
-              <div style={{ minWidth: 200 }}>
-                <div style={{ fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>Last token refresh</div>
-                <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', color: '#c4d4e8', marginTop: 4 }}>{refreshAt}</div>
-                {tiStatus.tokenFromCache && <div style={{ fontSize: '0.6rem', color: '#7a96b8', marginTop: 2 }}>cached</div>}
-              </div>
-            </div>
-            {storeState === 'pending_approval' && (
-              <div style={{ marginTop: 10, fontSize: '0.66rem', color: '#f0a84e', fontStyle: 'italic' }}>
-                TI Store API approval pending — Product Information API active.
-              </div>
-            )}
-          </div>
-        );
-      })()}
-
-      {/* ── TI Watched Parts Universe (Phase 20B) ── */}
-      {/* Always rendered — the static catalog is useful even before live
-          Product Information API fetches happen. The live data block only
-          populates after a successful X-Capture-Secret round trip. */}
-      <TiWatchedPartsUniverse />
-
-
-      {/* ── Source agreement table — only when both sources have data today ── */}
-      {showSourceTable && <SourceAgreementTable combined={combinedEvidence} trendMeta={trendMeta}/>}
-
-      {/* ── Slim footer: data freshness summary ── */}
+      {/* ── Slim footer ────────────────────────────────────────────── */}
       <div style={{ padding: '10px 16px', borderTop: '1px solid #0d1520', background: '#050810', fontSize: '0.62rem', color: '#7a96b8', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
-        <span>
-          Baseline: {baselineMeta?.baselinePeriodLabel || 'Q1-26 close'} captured {baselineMeta?.baselineDate || '2026-04-28'}
-          {baselineMeta?.baselineAgeDays != null && <span style={{ color: '#4a6a8a' }}> · {baselineMeta.baselineAgeDays}d ago</span>}
-        </span>
-        <span>
-          Sources: Mouser{combinedEvidence?.latestMouserSnapshotDate ? ` (${combinedEvidence.latestMouserSnapshotDate})` : ''}
-          {combinedEvidence?.latestNexarSnapshotDate ? ` · Nexar (${combinedEvidence.latestNexarSnapshotDate})` : ''}
-          {trendMeta?.status === 'ok' && <span style={{ color: '#00c9a7' }}> · trend signal ready</span>}
-        </span>
+        <span>Baseline: {baselineMeta?.baselinePeriodLabel || 'Q1-26 close'} captured {baselineMeta?.baselineDate || '2026-04-28'}</span>
+        <span>Stock trend status: <span style={{ color: trendHistoryReady ? '#4dffc3' : '#7a96b8' }}>{trendHistoryReady ? 'ready' : 'pending — needs ≥2 TI Direct snapshots'}</span></span>
       </div>
     </>
   );
@@ -4935,6 +4971,7 @@ function App(){
         combinedEvidence={combinedEvidence}
         trendMeta={trendMeta}
         tiStatus={tiStatus}
+        tiRollupsByCanonical={tiRollupsByCanonical}
       />}
 
       {/* Tooltip — applies on prices tab when hovering live cells.
