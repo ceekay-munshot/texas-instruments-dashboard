@@ -949,6 +949,20 @@ function fmtPriceUSD(n, currency) {
 function SupplyPanel({ tiRollupsByCanonical, tiTrendByCanonical, combinedEvidence, setUniverseFilter, setActiveTab }) {
   const B = '#1a2740';
 
+  // Full TI universe counts — fetched from /api/ti/universe/catalog/status.
+  // The rollups only cover mapped subcategories, so summing rollup opnCounts
+  // would understate coverage. The status endpoint reports the true total
+  // (e.g. 72k+ OPNs) and is the right source for the headline KPIs.
+  const [universeStatus, setUniverseStatus] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/ti/universe/catalog/status')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (!cancelled && d && d.success !== false) setUniverseStatus(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
   // canonical → first matching legacy CATS entry, used for friendly labels.
   const legacyToCanonical = combinedEvidence?.legacyToCanonical || {};
   const canonicalToLegacy = {};
@@ -1002,10 +1016,23 @@ function SupplyPanel({ tiRollupsByCanonical, tiTrendByCanonical, combinedEvidenc
     };
   }).sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label));
 
-  // Aggregate KPIs across the full universe rollup set.
-  const totalParts = rows.reduce((s, r) => s + (r.partsTracked || 0), 0);
-  const totalStocked = rows.reduce((s, r) => s + (r.stockedCount || 0), 0);
-  const totalOutOfStock = rows.reduce((s, r) => s + (r.outOfStockCount || 0), 0);
+  // Aggregate KPIs — prefer the full TI universe status (72k+ OPNs) over the
+  // subset of mapped rollup subcategories. The rollup sum understates the
+  // true universe size; the status endpoint reports D1's authoritative
+  // OPN counts, in-stock counts, and out-of-stock counts.
+  const universeOpnCount = Number(universeStatus?.opnCount ?? 0);
+  const universeStocked = Number(universeStatus?.inStockOpnCount ?? 0);
+  const universeOutOfStock = Number(universeStatus?.outOfStockOpnCount ?? 0);
+  const useUniverse = universeOpnCount > 0;
+  const totalParts = useUniverse
+    ? universeOpnCount
+    : rows.reduce((s, r) => s + (r.partsTracked || 0), 0);
+  const totalStocked = useUniverse
+    ? universeStocked
+    : rows.reduce((s, r) => s + (r.stockedCount || 0), 0);
+  const totalOutOfStock = useUniverse
+    ? universeOutOfStock
+    : rows.reduce((s, r) => s + (r.outOfStockCount || 0), 0);
   const inStockPct = totalParts > 0 ? (totalStocked / totalParts) * 100 : null;
   const outOfStockPct = totalParts > 0 ? (totalOutOfStock / totalParts) * 100 : null;
   const pressureRows = rows.filter(r => r.status === 'Tightening' || r.status === 'Watch');
