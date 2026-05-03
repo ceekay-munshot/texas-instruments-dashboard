@@ -3424,6 +3424,334 @@ app.post('/api/ti/universe/catalog/quota/repair', async (c) => {
   })
 })
 
+// ── Phase 24A — TI catalog analytics read endpoints ─────────────────────────
+// Five GET endpoints over the Phase 23C catalog tables. Read-only. NEVER call
+// TI, NEVER fetch /v2/store/products/catalog, NEVER mutate any row. Sanitized
+// shapes — pricing_json / future_inventory_json get parsed before return so
+// the client doesn't have to re-parse, and lifecycle_summary on the GPN row
+// likewise. Secrets and OAuth tokens are never read here.
+
+/** Local D1 surface narrow enough to type-check without dragging in workers
+ *  types. The runtime objects are the real Cloudflare ones. */
+type CatalogReadD1 = {
+  prepare(query: string): {
+    bind(...values: unknown[]): {
+      run(): Promise<unknown>
+      first<T = unknown>(): Promise<T | null>
+      all<T = unknown>(): Promise<{ results?: T[] }>
+    }
+    first<T = unknown>(): Promise<T | null>
+    all<T = unknown>(): Promise<{ results?: T[] }>
+  }
+}
+
+function tryParseJson<T = unknown>(raw: string | null | undefined): T | null {
+  if (raw == null) return null
+  try { return JSON.parse(raw) as T } catch { return null }
+}
+
+type OpnRow = {
+  ti_part_number: string
+  generic_part_number: string | null
+  description: string | null
+  quantity: number | null
+  limit_qty: number | null
+  pricing_json: string | null
+  normalized_unit_price: number | null
+  normalized_price_qty: number | null
+  currency: string | null
+  future_inventory_json: string | null
+  minimum_order_quantity: number | null
+  standard_pack_quantity: number | null
+  lifecycle: string | null
+  buy_now_url: string | null
+  latest_captured_at: string
+}
+
+type GpnRow = {
+  generic_part_number: string
+  opn_count: number
+  stocked_opn_count: number
+  total_quantity: number | null
+  min_normalized_unit_price: number | null
+  median_normalized_unit_price: number | null
+  cheapest_opn: string | null
+  highest_inventory_opn: string | null
+  lifecycle_summary: string | null
+  latest_captured_at: string
+}
+
+function publicOpnRow(r: OpnRow) {
+  return {
+    tiPartNumber: r.ti_part_number,
+    genericPartNumber: r.generic_part_number,
+    description: r.description,
+    quantity: r.quantity,
+    limit: r.limit_qty,
+    pricing: tryParseJson(r.pricing_json),
+    normalizedUnitPrice: r.normalized_unit_price,
+    normalizedPriceQty: r.normalized_price_qty,
+    currency: r.currency,
+    futureInventory: tryParseJson(r.future_inventory_json),
+    minimumOrderQuantity: r.minimum_order_quantity,
+    standardPackQuantity: r.standard_pack_quantity,
+    lifeCycle: r.lifecycle,
+    buyNowUrl: r.buy_now_url,
+    latestCapturedAt: r.latest_captured_at,
+  }
+}
+
+function publicGpnRow(r: GpnRow) {
+  return {
+    genericPartNumber: r.generic_part_number,
+    opnCount: r.opn_count,
+    stockedOpnCount: r.stocked_opn_count,
+    totalQuantity: r.total_quantity ?? 0,
+    minNormalizedUnitPrice: r.min_normalized_unit_price,
+    medianNormalizedUnitPrice: r.median_normalized_unit_price,
+    cheapestOpn: r.cheapest_opn,
+    highestInventoryOpn: r.highest_inventory_opn,
+    lifecycleSummary: tryParseJson<Record<string, number>>(r.lifecycle_summary),
+    latestCapturedAt: r.latest_captured_at,
+  }
+}
+
+// GET /api/ti/universe/catalog/overview — public, sanitized.
+// Single-snapshot universe summary derived from ti_catalog_latest_opn +
+// ti_catalog_snapshot_run + the quota helper. Cheap (~5 small SQL reads,
+// all index-backed). Safe for the UI to call on page load.
+app.get('/api/ti/universe/catalog/overview', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as unknown as CatalogReadD1
+  // Single grouped query for the count + price aggregates so D1 only
+  // walks the OPN table once. Median is approximated by the row at
+  // ROW_NUMBER() = floor(N/2) over the priced subset — that's exact
+  // for SQLite when N is even (lower-of-two-middle) and the customer
+  // doesn't need IEEE-precise medians here.
+  const [aggsRes, latestRunRes, medianRes, quota] = await Promise.all([
+    d1.prepare(
+      `SELECT
+         COUNT(*) AS opn_count,
+         SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0 THEN 1 ELSE 0 END) AS in_stock,
+         SUM(CASE WHEN quantity = 0 THEN 1 ELSE 0 END) AS out_of_stock,
+         SUM(CASE WHEN normalized_unit_price IS NOT NULL THEN 1 ELSE 0 END) AS priced_opns,
+         COALESCE(SUM(quantity), 0) AS total_quantity,
+         MIN(normalized_unit_price) AS min_price,
+         MAX(normalized_unit_price) AS max_price,
+         MAX(latest_captured_at) AS latest_captured_at
+       FROM ti_catalog_latest_opn`,
+    ).first<{
+      opn_count: number; in_stock: number; out_of_stock: number; priced_opns: number;
+      total_quantity: number; min_price: number | null; max_price: number | null;
+      latest_captured_at: string | null;
+    }>(),
+    d1.prepare(`SELECT COUNT(*) AS gpn_count FROM ti_catalog_latest_gpn`).first<{ gpn_count: number }>(),
+    d1.prepare(
+      `SELECT normalized_unit_price AS p
+         FROM ti_catalog_latest_opn
+         WHERE normalized_unit_price IS NOT NULL
+         ORDER BY normalized_unit_price ASC
+         LIMIT 1
+         OFFSET (SELECT (COUNT(*) / 2) FROM ti_catalog_latest_opn WHERE normalized_unit_price IS NOT NULL)`,
+    ).first<{ p: number | null }>(),
+    readQuotaStatus(env.TI_INVENTORY_HISTORY_DB as any),
+  ])
+  const aggs = aggsRes ?? {
+    opn_count: 0, in_stock: 0, out_of_stock: 0, priced_opns: 0,
+    total_quantity: 0, min_price: null, max_price: null, latest_captured_at: null,
+  }
+  const opnCount = Number(aggs.opn_count) || 0
+  const inStock = Number(aggs.in_stock) || 0
+  const outOfStock = Number(aggs.out_of_stock) || 0
+  return c.json({
+    success: true,
+    backend: 'd1',
+    opnCount,
+    gpnCount: Number(latestRunRes?.gpn_count ?? 0),
+    pricedOpnCount: Number(aggs.priced_opns) || 0,
+    inStockOpnCount: inStock,
+    outOfStockOpnCount: outOfStock,
+    inStockPct: opnCount > 0 ? Math.round((inStock / opnCount) * 10000) / 100 : 0,
+    outOfStockPct: opnCount > 0 ? Math.round((outOfStock / opnCount) * 10000) / 100 : 0,
+    totalQuantity: Number(aggs.total_quantity) || 0,
+    medianNormalizedUnitPrice: medianRes?.p ?? null,
+    minNormalizedUnitPrice: aggs.min_price,
+    maxNormalizedUnitPrice: aggs.max_price,
+    latestCapturedAt: aggs.latest_captured_at,
+    nextSafeCatalogRunAt: quota.nextSafeRunAt,
+    minutesUntilSafe: quota.minutesUntilSafe,
+  })
+})
+
+// GET /api/ti/universe/catalog/gpn-leaderboard — public, sanitized.
+// Sort options:
+//   inventory_desc (default) — highest total stock first
+//   price_desc / price_asc   — by min_normalized_unit_price (NULLs last)
+//   out_of_stock             — fully out-of-stock GPNs first (opn_count - stocked_opn_count DESC)
+//   variants_desc            — by opn_count DESC (which families have the most variants)
+const GPN_LEADERBOARD_SORTS: Record<string, string> = {
+  inventory_desc: 'ORDER BY COALESCE(total_quantity, 0) DESC',
+  price_desc:     'ORDER BY min_normalized_unit_price IS NULL, min_normalized_unit_price DESC',
+  price_asc:      'ORDER BY min_normalized_unit_price IS NULL, min_normalized_unit_price ASC',
+  out_of_stock:   'ORDER BY (opn_count - stocked_opn_count) DESC, opn_count DESC',
+  variants_desc:  'ORDER BY opn_count DESC',
+}
+app.get('/api/ti/universe/catalog/gpn-leaderboard', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as unknown as CatalogReadD1
+  const sortRaw = (c.req.query('sort') || 'inventory_desc').toLowerCase()
+  const orderBy = GPN_LEADERBOARD_SORTS[sortRaw] ?? GPN_LEADERBOARD_SORTS.inventory_desc
+  const limitRaw = parseInt(c.req.query('limit') || '50', 10) || 50
+  const limit = Math.max(1, Math.min(200, limitRaw))
+  const sql =
+    `SELECT generic_part_number, opn_count, stocked_opn_count, total_quantity,
+            min_normalized_unit_price, median_normalized_unit_price,
+            cheapest_opn, highest_inventory_opn, lifecycle_summary, latest_captured_at
+     FROM ti_catalog_latest_gpn
+     ${orderBy}
+     LIMIT ?`
+  const result = await d1.prepare(sql).bind(limit).all<GpnRow>()
+  return c.json({
+    success: true,
+    sort: sortRaw in GPN_LEADERBOARD_SORTS ? sortRaw : 'inventory_desc',
+    limit,
+    rows: (result.results ?? []).map(publicGpnRow),
+  })
+})
+
+// GET /api/ti/universe/catalog/search?q= — public, sanitized.
+// Substring search across ti_part_number, generic_part_number, description.
+// Returns ≤50 OPN rows. Empty / very short queries return no results so a
+// page-load auto-fire doesn't drag back the entire 72k-row table.
+app.get('/api/ti/universe/catalog/search', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as unknown as CatalogReadD1
+  const qRaw = (c.req.query('q') || '').trim()
+  if (qRaw.length < 2) {
+    return c.json({ success: true, query: qRaw, rows: [], note: 'query must be at least 2 characters' })
+  }
+  // Cap the query length so a runaway client can't push a multi-MB
+  // pattern into LIKE. 100 chars is comfortably more than any TI
+  // part-number or descriptive substring needs.
+  const q = qRaw.slice(0, 100)
+  const pattern = `%${q}%`
+  const result = await d1.prepare(
+    `SELECT ti_part_number, generic_part_number, description, quantity, limit_qty,
+            pricing_json, normalized_unit_price, normalized_price_qty, currency,
+            future_inventory_json, minimum_order_quantity, standard_pack_quantity,
+            lifecycle, buy_now_url, latest_captured_at
+     FROM ti_catalog_latest_opn
+     WHERE ti_part_number      LIKE ? COLLATE NOCASE
+        OR generic_part_number LIKE ? COLLATE NOCASE
+        OR description         LIKE ? COLLATE NOCASE
+     ORDER BY
+       CASE WHEN ti_part_number = ? COLLATE NOCASE THEN 0
+            WHEN ti_part_number LIKE ? COLLATE NOCASE THEN 1
+            ELSE 2 END,
+       quantity DESC NULLS LAST
+     LIMIT 50`,
+  ).bind(pattern, pattern, pattern, q, `${q}%`).all<OpnRow>()
+  return c.json({
+    success: true,
+    query: q,
+    rows: (result.results ?? []).map(publicOpnRow),
+  })
+})
+
+// GET /api/ti/universe/catalog/part/:opn — public, sanitized.
+// Exact-match OPN lookup. Returns 404 when the OPN isn't in the latest
+// catalog snapshot.
+app.get('/api/ti/universe/catalog/part/:opn', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as unknown as CatalogReadD1
+  const opnRaw = c.req.param('opn') || ''
+  const opn = decodeURIComponent(opnRaw).trim()
+  if (!opn) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'opn path param required.' }, 400)
+  }
+  const row = await d1.prepare(
+    `SELECT ti_part_number, generic_part_number, description, quantity, limit_qty,
+            pricing_json, normalized_unit_price, normalized_price_qty, currency,
+            future_inventory_json, minimum_order_quantity, standard_pack_quantity,
+            lifecycle, buy_now_url, latest_captured_at
+     FROM ti_catalog_latest_opn
+     WHERE ti_part_number = ?
+     LIMIT 1`,
+  ).bind(opn).first<OpnRow>()
+  if (!row) {
+    return c.json({ success: false, status: 'not_found', tiPartNumber: opn, message: 'OPN not present in the latest catalog snapshot.' }, 404)
+  }
+  return c.json({ success: true, part: publicOpnRow(row) })
+})
+
+// GET /api/ti/universe/catalog/family/:gpn — public, sanitized.
+// GPN aggregate row + every OPN variant under that family. Two reads,
+// both index-backed.
+app.get('/api/ti/universe/catalog/family/:gpn', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as unknown as CatalogReadD1
+  const gpnRaw = c.req.param('gpn') || ''
+  const gpn = decodeURIComponent(gpnRaw).trim()
+  if (!gpn) {
+    return c.json({ success: false, status: 'invalid_payload', message: 'gpn path param required.' }, 400)
+  }
+  const [aggRow, variantsResult] = await Promise.all([
+    d1.prepare(
+      `SELECT generic_part_number, opn_count, stocked_opn_count, total_quantity,
+              min_normalized_unit_price, median_normalized_unit_price,
+              cheapest_opn, highest_inventory_opn, lifecycle_summary, latest_captured_at
+       FROM ti_catalog_latest_gpn
+       WHERE generic_part_number = ?
+       LIMIT 1`,
+    ).bind(gpn).first<GpnRow>(),
+    d1.prepare(
+      `SELECT ti_part_number, generic_part_number, description, quantity, limit_qty,
+              pricing_json, normalized_unit_price, normalized_price_qty, currency,
+              future_inventory_json, minimum_order_quantity, standard_pack_quantity,
+              lifecycle, buy_now_url, latest_captured_at
+       FROM ti_catalog_latest_opn
+       WHERE generic_part_number = ?
+       ORDER BY quantity DESC NULLS LAST, ti_part_number ASC`,
+    ).bind(gpn).all<OpnRow>(),
+  ])
+  if (!aggRow) {
+    return c.json({ success: false, status: 'not_found', genericPartNumber: gpn, message: 'GPN not present in the latest catalog snapshot.' }, 404)
+  }
+  const variants = (variantsResult.results ?? []).map(publicOpnRow)
+  // Derive on-the-fly counters that are nice for the UI (the GPN row
+  // already carries stocked_opn_count, but the inverse + variant-level
+  // diagnostics save the client another pass).
+  const stocked = variants.filter(v => v.quantity != null && v.quantity > 0).length
+  const outOfStock = variants.filter(v => v.quantity === 0).length
+  const cheapest = variants.find(v => v.tiPartNumber === aggRow.cheapest_opn) ?? null
+  const highest = variants.find(v => v.tiPartNumber === aggRow.highest_inventory_opn) ?? null
+  return c.json({
+    success: true,
+    family: publicGpnRow(aggRow),
+    variantCount: variants.length,
+    stockedVariantCount: stocked,
+    outOfStockVariantCount: outOfStock,
+    cheapestVariant: cheapest,
+    highestInventoryVariant: highest,
+    variants,
+  })
+})
+
 // Phase 22.2 — POST /api/ti/inventory/staged/validate
 // Auth-gated batch validator for the staged 68 parts. Calls Product Info
 // + Store Inventory & Pricing for each candidate OPN in the requested
