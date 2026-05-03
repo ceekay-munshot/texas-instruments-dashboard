@@ -3399,6 +3399,432 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
   );
 }
 
+// ── Phase 24B — TI Universe (Full Catalog) panel ────────────────────────────
+// Customer-facing browser over the Phase 24A read-only D1 endpoints.
+// Never calls TI directly. Never mutates anything. Hides itself behind the
+// new "Universe" tab so the existing 64-part Inventory dashboard, Mouser,
+// and Nexar flows keep their current shape unchanged.
+function UniversePanel() {
+  const [overview, setOverview]                  = useState(null);
+  const [overviewError, setOverviewError]        = useState(null);
+  const [sort, setSort]                          = useState('inventory_desc');
+  const [leaderboard, setLeaderboard]            = useState([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+  const [searchQ, setSearchQ]                    = useState('');
+  const [searchResults, setSearchResults]        = useState([]);
+  const [searchLoading, setSearchLoading]        = useState(false);
+  const [searchNote, setSearchNote]              = useState(null);
+  const [selectedPart, setSelectedPart]          = useState(null);
+  const [selectedFamily, setSelectedFamily]      = useState(null);
+  const [drillLoading, setDrillLoading]          = useState(false);
+  const [drillError, setDrillError]              = useState(null);
+
+  // ── Fetchers ────────────────────────────────────────────────────────────
+  const fetchOverview = useCallback(async () => {
+    try {
+      const res = await fetch('/api/ti/universe/catalog/overview');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setOverview(json);
+      setOverviewError(null);
+    } catch (e) {
+      setOverviewError(e?.message || String(e));
+    }
+  }, []);
+
+  const fetchLeaderboard = useCallback(async (s) => {
+    setLeaderboardLoading(true);
+    try {
+      const res = await fetch(`/api/ti/universe/catalog/gpn-leaderboard?sort=${encodeURIComponent(s)}&limit=50`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setLeaderboard(Array.isArray(json?.rows) ? json.rows : []);
+    } catch {
+      setLeaderboard([]);
+    }
+    setLeaderboardLoading(false);
+  }, []);
+
+  const runSearch = useCallback(async (q) => {
+    const trimmed = (q || '').trim();
+    if (trimmed.length < 2) {
+      setSearchResults([]);
+      setSearchNote(trimmed.length === 0 ? null : 'Type at least 2 characters');
+      return;
+    }
+    setSearchLoading(true);
+    try {
+      const res = await fetch(`/api/ti/universe/catalog/search?q=${encodeURIComponent(trimmed)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const rows = Array.isArray(json?.rows) ? json.rows : [];
+      setSearchResults(rows);
+      setSearchNote(json?.note ?? (rows.length === 0 ? 'No matches' : null));
+    } catch (e) {
+      setSearchResults([]);
+      setSearchNote(`Search failed: ${e?.message || e}`);
+    }
+    setSearchLoading(false);
+  }, []);
+
+  const openPart = useCallback(async (opn) => {
+    if (!opn) return;
+    setSelectedFamily(null);
+    setDrillLoading(true);
+    setDrillError(null);
+    try {
+      const res = await fetch(`/api/ti/universe/catalog/part/${encodeURIComponent(opn)}`);
+      const json = await res.json();
+      if (!res.ok) {
+        setSelectedPart(null);
+        setDrillError(json?.message || `HTTP ${res.status}`);
+      } else {
+        setSelectedPart(json?.part || null);
+      }
+    } catch (e) {
+      setDrillError(e?.message || String(e));
+    }
+    setDrillLoading(false);
+  }, []);
+
+  const openFamily = useCallback(async (gpn) => {
+    if (!gpn) return;
+    setSelectedPart(null);
+    setDrillLoading(true);
+    setDrillError(null);
+    try {
+      const res = await fetch(`/api/ti/universe/catalog/family/${encodeURIComponent(gpn)}`);
+      const json = await res.json();
+      if (!res.ok) {
+        setSelectedFamily(null);
+        setDrillError(json?.message || `HTTP ${res.status}`);
+      } else {
+        setSelectedFamily(json || null);
+      }
+    } catch (e) {
+      setDrillError(e?.message || String(e));
+    }
+    setDrillLoading(false);
+  }, []);
+
+  // ── Effects ─────────────────────────────────────────────────────────────
+  useEffect(() => { fetchOverview(); }, [fetchOverview]);
+  useEffect(() => { fetchLeaderboard(sort); }, [sort, fetchLeaderboard]);
+  // Debounced search-on-type. 300ms is comfortably below "feels laggy" but
+  // far enough above keystroke speed that we don't burst the Worker.
+  useEffect(() => {
+    const handle = setTimeout(() => runSearch(searchQ), 300);
+    return () => clearTimeout(handle);
+  }, [searchQ, runSearch]);
+
+  // ── Helpers ─────────────────────────────────────────────────────────────
+  const fmtN = (n) => (n == null ? '—' : Number(n).toLocaleString());
+  const fmtPrice = (n) => (n == null ? '—' : `$${Number(n).toFixed(4)}`);
+  const fmtPct = (n) => (n == null ? '—' : `${Number(n).toFixed(2)}%`);
+  const fmtDate = (iso) => {
+    if (!iso) return '—';
+    try { return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); }
+    catch { return iso; }
+  };
+  const fmtLifecycle = (obj) => {
+    if (!obj || typeof obj !== 'object') return '—';
+    const entries = Object.entries(obj);
+    if (entries.length === 0) return '—';
+    return entries.map(([k, v]) => `${k}:${v}`).join(' · ');
+  };
+
+  // ── Card grid ───────────────────────────────────────────────────────────
+  const cards = overview ? [
+    { label: 'Total OPNs',        value: fmtN(overview.opnCount) },
+    { label: 'GPN families',      value: fmtN(overview.gpnCount) },
+    { label: 'Priced OPNs',       value: fmtN(overview.pricedOpnCount) },
+    { label: 'In stock',          value: `${fmtN(overview.inStockOpnCount)} (${fmtPct(overview.inStockPct)})`, accent: '#4dffc3' },
+    { label: 'Out of stock',      value: `${fmtN(overview.outOfStockOpnCount)} (${fmtPct(overview.outOfStockPct)})`, accent: '#f0a84e' },
+    { label: 'Total quantity',    value: fmtN(overview.totalQuantity) },
+    { label: 'Median price',      value: fmtPrice(overview.medianNormalizedUnitPrice) },
+    { label: 'Min / Max price',   value: `${fmtPrice(overview.minNormalizedUnitPrice)} / ${fmtPrice(overview.maxNormalizedUnitPrice)}` },
+    { label: 'Latest capture',    value: fmtDate(overview.latestCapturedAt) },
+    { label: 'Next safe refresh', value: overview.minutesUntilSafe > 0 ? `in ${overview.minutesUntilSafe} min` : 'safe now' },
+  ] : [];
+
+  const SORT_OPTIONS = [
+    { id: 'inventory_desc', label: 'Total inventory ↓' },
+    { id: 'variants_desc',  label: 'Variant count ↓' },
+    { id: 'price_asc',      label: 'Min price ↑' },
+    { id: 'price_desc',     label: 'Min price ↓' },
+    { id: 'out_of_stock',   label: 'Out of stock ↓' },
+  ];
+
+  const B = '#1a2740';
+  const cellPad = { padding: '6px 10px', borderBottom: `1px solid ${B}`, fontFamily: 'monospace' };
+  const headPad = { ...cellPad, color: '#7a96b8', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', position: 'sticky', top: 0, background: '#080c14' };
+
+  return (
+    <div style={{ padding: '14px 16px', color: '#c4d4e8', fontFamily: 'monospace', maxWidth: 1280, margin: '0 auto' }}>
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: '0.85rem', color: '#e0eaf8', fontWeight: 'bold', letterSpacing: '-0.01em' }}>TI Universe — full catalog</div>
+        <div style={{ fontSize: '0.62rem', color: '#7a96b8', marginTop: 3 }}>
+          Read-only browser over the latest TI catalog snapshot in D1. Never calls TI; never mutates anything.
+        </div>
+      </div>
+
+      {overviewError && (
+        <div style={{ background: '#2a1010', border: '1px solid #5a2020', borderRadius: 6, padding: '8px 12px', marginBottom: 12, fontSize: '0.65rem', color: '#ffb0b0' }}>
+          Overview unavailable: {overviewError}
+        </div>
+      )}
+
+      {/* ── Cards ─────────────────────────────────────────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8, marginBottom: 16 }}>
+        {cards.length === 0 && (
+          <div style={{ gridColumn: '1 / -1', padding: 16, color: '#4a6a8a', fontSize: '0.65rem' }}>Loading overview…</div>
+        )}
+        {cards.map(c => (
+          <div key={c.label} style={{ background: '#0c1426', border: `1px solid ${B}`, borderRadius: 6, padding: '10px 12px' }}>
+            <div style={{ fontSize: '0.55rem', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 4 }}>{c.label}</div>
+            <div style={{ fontSize: '0.95rem', color: c.accent || '#e0eaf8', fontWeight: 'bold' }}>{c.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Search ────────────────────────────────────────────────────── */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>Search</div>
+        <input
+          type="text"
+          value={searchQ}
+          onChange={(e) => setSearchQ(e.target.value)}
+          placeholder="Search OPN, GPN, or description"
+          style={{ width: '100%', maxWidth: 480, background: '#0c1426', border: `1px solid ${B}`, color: '#e0eaf8', padding: '8px 12px', borderRadius: 6, fontFamily: 'monospace', fontSize: '0.7rem', outline: 'none' }}
+        />
+        {(searchLoading || searchResults.length > 0 || searchNote) && (
+          <div style={{ marginTop: 8, background: '#0c1426', border: `1px solid ${B}`, borderRadius: 6, maxHeight: 260, overflowY: 'auto' }}>
+            {searchLoading && <div style={{ padding: '8px 12px', color: '#4a6a8a', fontSize: '0.65rem' }}>Searching…</div>}
+            {!searchLoading && searchResults.length === 0 && searchNote && (
+              <div style={{ padding: '8px 12px', color: '#7a96b8', fontSize: '0.65rem' }}>{searchNote}</div>
+            )}
+            {!searchLoading && searchResults.map(r => (
+              <div key={r.tiPartNumber} style={{ padding: '7px 12px', borderBottom: `1px solid ${B}`, fontSize: '0.65rem', display: 'flex', gap: 12, alignItems: 'center' }}>
+                <button onClick={() => openPart(r.tiPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0, fontWeight: 'bold' }}>{r.tiPartNumber}</button>
+                {r.genericPartNumber && (
+                  <button onClick={() => openFamily(r.genericPartNumber)} style={{ background: 'none', border: `1px solid ${B}`, color: '#7a96b8', cursor: 'pointer', fontFamily: 'monospace', padding: '2px 6px', fontSize: '0.55rem', borderRadius: 3 }}>family: {r.genericPartNumber}</button>
+                )}
+                <span style={{ color: '#7a96b8', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.description || ''}</span>
+                <span style={{ color: r.quantity > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(r.quantity)} qty</span>
+                <span style={{ color: '#c4d4e8' }}>{fmtPrice(r.normalizedUnitPrice)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── Leaderboard ───────────────────────────────────────────────── */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+          <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase' }}>GPN leaderboard (top 50)</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: '0.55rem', color: '#7a96b8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Sort</span>
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value)}
+              style={{ background: '#0c1426', border: `1px solid ${B}`, color: '#e0eaf8', padding: '5px 8px', borderRadius: 4, fontFamily: 'monospace', fontSize: '0.65rem' }}
+            >
+              {SORT_OPTIONS.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+            </select>
+          </div>
+        </div>
+        <div style={{ background: '#0c1426', border: `1px solid ${B}`, borderRadius: 6, overflow: 'auto', maxHeight: 480 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.62rem' }}>
+            <thead>
+              <tr>
+                <th style={{ ...headPad, textAlign: 'left' }}>GPN</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Variants</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Stocked</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Total qty</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Min price</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Median</th>
+                <th style={{ ...headPad, textAlign: 'left' }}>Cheapest OPN</th>
+                <th style={{ ...headPad, textAlign: 'left' }}>Highest-inv OPN</th>
+                <th style={{ ...headPad, textAlign: 'left' }}>Lifecycle</th>
+              </tr>
+            </thead>
+            <tbody>
+              {leaderboardLoading && (
+                <tr><td colSpan={9} style={{ ...cellPad, color: '#4a6a8a', textAlign: 'center' }}>Loading…</td></tr>
+              )}
+              {!leaderboardLoading && leaderboard.length === 0 && (
+                <tr><td colSpan={9} style={{ ...cellPad, color: '#7a96b8', textAlign: 'center' }}>No rows</td></tr>
+              )}
+              {!leaderboardLoading && leaderboard.map(r => (
+                <tr key={r.genericPartNumber}>
+                  <td style={cellPad}>
+                    <button onClick={() => openFamily(r.genericPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0, fontWeight: 'bold' }}>{r.genericPartNumber}</button>
+                  </td>
+                  <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(r.opnCount)}</td>
+                  <td style={{ ...cellPad, textAlign: 'right', color: r.stockedOpnCount > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(r.stockedOpnCount)}</td>
+                  <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(r.totalQuantity)}</td>
+                  <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.minNormalizedUnitPrice)}</td>
+                  <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.medianNormalizedUnitPrice)}</td>
+                  <td style={cellPad}>
+                    {r.cheapestOpn ? (
+                      <button onClick={() => openPart(r.cheapestOpn)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0 }}>{r.cheapestOpn}</button>
+                    ) : '—'}
+                  </td>
+                  <td style={cellPad}>
+                    {r.highestInventoryOpn ? (
+                      <button onClick={() => openPart(r.highestInventoryOpn)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0 }}>{r.highestInventoryOpn}</button>
+                    ) : '—'}
+                  </td>
+                  <td style={{ ...cellPad, color: '#7a96b8' }}>{fmtLifecycle(r.lifecycleSummary)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── Drill-down ────────────────────────────────────────────────── */}
+      {(selectedPart || selectedFamily || drillLoading || drillError) && (
+        <div style={{ background: '#0c1426', border: `1px solid ${B}`, borderRadius: 6, padding: '12px 14px', marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+              {selectedPart ? `Part detail · ${selectedPart.tiPartNumber}` :
+               selectedFamily ? `Family detail · ${selectedFamily.family?.genericPartNumber}` :
+               drillLoading ? 'Loading…' : 'Drill-down'}
+            </div>
+            <button onClick={() => { setSelectedPart(null); setSelectedFamily(null); setDrillError(null); }} style={{ background: 'none', border: `1px solid ${B}`, color: '#7a96b8', cursor: 'pointer', fontFamily: 'monospace', padding: '3px 8px', fontSize: '0.6rem', borderRadius: 4 }}>close</button>
+          </div>
+
+          {drillError && <div style={{ color: '#ffb0b0', fontSize: '0.65rem' }}>{drillError}</div>}
+          {drillLoading && !drillError && <div style={{ color: '#4a6a8a', fontSize: '0.65rem' }}>Fetching…</div>}
+
+          {selectedPart && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, fontSize: '0.65rem', lineHeight: 1.55 }}>
+              <div>
+                <div><span style={{ color: '#7a96b8' }}>OPN: </span><span style={{ color: '#e0eaf8', fontWeight: 'bold' }}>{selectedPart.tiPartNumber}</span></div>
+                <div><span style={{ color: '#7a96b8' }}>GPN: </span>
+                  {selectedPart.genericPartNumber ? (
+                    <button onClick={() => openFamily(selectedPart.genericPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0 }}>{selectedPart.genericPartNumber}</button>
+                  ) : '—'}
+                </div>
+                <div><span style={{ color: '#7a96b8' }}>Description: </span>{selectedPart.description || '—'}</div>
+                <div><span style={{ color: '#7a96b8' }}>Quantity: </span><span style={{ color: selectedPart.quantity > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(selectedPart.quantity)}</span></div>
+                <div><span style={{ color: '#7a96b8' }}>Normalized unit price: </span>{fmtPrice(selectedPart.normalizedUnitPrice)} ({selectedPart.currency || '—'} @ qty={fmtN(selectedPart.normalizedPriceQty)})</div>
+                <div><span style={{ color: '#7a96b8' }}>Lifecycle: </span>{selectedPart.lifeCycle || '—'}</div>
+                <div><span style={{ color: '#7a96b8' }}>Min order qty: </span>{fmtN(selectedPart.minimumOrderQuantity)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Pack qty: </span>{fmtN(selectedPart.standardPackQuantity)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Order limit: </span>{fmtN(selectedPart.limit)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Buy now: </span>
+                  {selectedPart.buyNowUrl ? (
+                    <a href={selectedPart.buyNowUrl} target="_blank" rel="noreferrer" style={{ color: '#3d8ef0' }}>open ↗</a>
+                  ) : '—'}
+                </div>
+                <div><span style={{ color: '#7a96b8' }}>Snapshot: </span>{fmtDate(selectedPart.latestCapturedAt)}</div>
+              </div>
+              <div>
+                <div style={{ color: '#7a96b8', fontWeight: 'bold', marginBottom: 4 }}>Price breaks</div>
+                {Array.isArray(selectedPart.pricing) && selectedPart.pricing.length > 0 ? (
+                  <div style={{ background: '#080c14', border: `1px solid ${B}`, borderRadius: 4, padding: '6px 8px', maxHeight: 140, overflowY: 'auto' }}>
+                    {selectedPart.pricing.flatMap((p, pi) =>
+                      (p?.priceBreaks || []).map((b, bi) => (
+                        <div key={`${pi}-${bi}`} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span style={{ color: '#7a96b8' }}>qty ≥ {fmtN(b.priceBreakQuantity ?? b.quantity)}</span>
+                          <span>{fmtPrice(b.price ?? b.unitPrice)} {b.currency || ''}</span>
+                        </div>
+                      )),
+                    )}
+                  </div>
+                ) : <div style={{ color: '#4a6a8a' }}>No breaks parsed.</div>}
+
+                <div style={{ color: '#7a96b8', fontWeight: 'bold', margin: '10px 0 4px' }}>Future inventory</div>
+                {Array.isArray(selectedPart.futureInventory) && selectedPart.futureInventory.length > 0 ? (
+                  <div style={{ background: '#080c14', border: `1px solid ${B}`, borderRadius: 4, padding: '6px 8px', maxHeight: 100, overflowY: 'auto' }}>
+                    {selectedPart.futureInventory.map((f, fi) => (
+                      <div key={fi} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span style={{ color: '#7a96b8' }}>{f?.dateAvailable || f?.date || `entry ${fi + 1}`}</span>
+                        <span>{fmtN(f?.quantity)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : <div style={{ color: '#4a6a8a' }}>No future inventory.</div>}
+              </div>
+            </div>
+          )}
+
+          {selectedFamily && selectedFamily.family && (
+            <div style={{ fontSize: '0.65rem', lineHeight: 1.55 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8, marginBottom: 12 }}>
+                <div><span style={{ color: '#7a96b8' }}>Variants: </span>{fmtN(selectedFamily.variantCount)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Stocked: </span><span style={{ color: '#4dffc3' }}>{fmtN(selectedFamily.stockedVariantCount)}</span></div>
+                <div><span style={{ color: '#7a96b8' }}>Out of stock: </span><span style={{ color: '#f0a84e' }}>{fmtN(selectedFamily.outOfStockVariantCount)}</span></div>
+                <div><span style={{ color: '#7a96b8' }}>Total qty: </span>{fmtN(selectedFamily.family.totalQuantity)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Min price: </span>{fmtPrice(selectedFamily.family.minNormalizedUnitPrice)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Median price: </span>{fmtPrice(selectedFamily.family.medianNormalizedUnitPrice)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Lifecycle: </span>{fmtLifecycle(selectedFamily.family.lifecycleSummary)}</div>
+                <div><span style={{ color: '#7a96b8' }}>Snapshot: </span>{fmtDate(selectedFamily.family.latestCapturedAt)}</div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 12 }}>
+                <div style={{ background: '#080c14', border: `1px solid ${B}`, borderRadius: 4, padding: '8px 10px' }}>
+                  <div style={{ color: '#7a96b8', fontWeight: 'bold', marginBottom: 4 }}>Cheapest variant</div>
+                  {selectedFamily.cheapestVariant ? (
+                    <>
+                      <div><button onClick={() => openPart(selectedFamily.cheapestVariant.tiPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0, fontWeight: 'bold' }}>{selectedFamily.cheapestVariant.tiPartNumber}</button></div>
+                      <div>{fmtPrice(selectedFamily.cheapestVariant.normalizedUnitPrice)} · qty {fmtN(selectedFamily.cheapestVariant.quantity)}</div>
+                    </>
+                  ) : '—'}
+                </div>
+                <div style={{ background: '#080c14', border: `1px solid ${B}`, borderRadius: 4, padding: '8px 10px' }}>
+                  <div style={{ color: '#7a96b8', fontWeight: 'bold', marginBottom: 4 }}>Highest-inventory variant</div>
+                  {selectedFamily.highestInventoryVariant ? (
+                    <>
+                      <div><button onClick={() => openPart(selectedFamily.highestInventoryVariant.tiPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0, fontWeight: 'bold' }}>{selectedFamily.highestInventoryVariant.tiPartNumber}</button></div>
+                      <div>{fmtPrice(selectedFamily.highestInventoryVariant.normalizedUnitPrice)} · qty {fmtN(selectedFamily.highestInventoryVariant.quantity)}</div>
+                    </>
+                  ) : '—'}
+                </div>
+              </div>
+
+              <div style={{ color: '#7a96b8', fontWeight: 'bold', marginBottom: 4 }}>All variants ({selectedFamily.variants?.length || 0})</div>
+              <div style={{ background: '#080c14', border: `1px solid ${B}`, borderRadius: 4, maxHeight: 280, overflowY: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.6rem' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ ...headPad, textAlign: 'left', background: '#080c14' }}>OPN</th>
+                      <th style={{ ...headPad, textAlign: 'right', background: '#080c14' }}>Quantity</th>
+                      <th style={{ ...headPad, textAlign: 'right', background: '#080c14' }}>Unit price</th>
+                      <th style={{ ...headPad, textAlign: 'left', background: '#080c14' }}>Lifecycle</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(selectedFamily.variants || []).map(v => (
+                      <tr key={v.tiPartNumber}>
+                        <td style={cellPad}>
+                          <button onClick={() => openPart(v.tiPartNumber)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0 }}>{v.tiPartNumber}</button>
+                        </td>
+                        <td style={{ ...cellPad, textAlign: 'right', color: v.quantity > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(v.quantity)}</td>
+                        <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(v.normalizedUnitPrice)}</td>
+                        <td style={cellPad}>{v.lifeCycle || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Notes ─────────────────────────────────────────────────────── */}
+      <div style={{ fontSize: '0.6rem', color: '#7a96b8', lineHeight: 1.55, paddingTop: 4, borderTop: `1px solid ${B}` }}>
+        <div>· Full catalog is refreshed manually due to TI catalog quota (1 call / 4h, 6 / day).</div>
+        <div>· Trend signals require at least two catalog snapshots — single-snapshot rows show current state only.</div>
+        <div>· Numbers come from <code style={{ color: '#c4d4e8' }}>/api/ti/universe/catalog/*</code>; no TI calls are made from this view.</div>
+      </div>
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 function App(){
   const [liveData,setLiveData]=useState(null);
@@ -3875,6 +4301,7 @@ function App(){
         {[
           {id:'prices', label:'Prices'},
           {id:'inventory', label:'Inventory'},
+          {id:'universe', label:'Universe'},
           {id:'insights', label:'Insights'},
         ].map(t=>{
           const on=activeTab===t.id;
@@ -3998,6 +4425,8 @@ function App(){
       </>}
 
       {activeTab==='inventory'&&<InventoryPanel/>}
+
+      {activeTab==='universe'&&<UniversePanel/>}
 
       {activeTab==='insights'&&<InsightsPanel
         liveData={liveData}
