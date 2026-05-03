@@ -4151,6 +4151,26 @@ function App(){
   const [fetchCount,setFetchCount]=useState(null);
   const [vis,setVis]=useState(new Set(Object.keys(GC)));
   const [tooltip,setTooltip]=useState(null);
+  // Phase 24C.4 — tooltip position state (initially "below cursor", flipped
+  // above when it would clip past the viewport bottom). Measured via a ref
+  // after render so the flip is exact regardless of how tall the tooltip
+  // grew (TI Direct + quality blocks make it variable).
+  const tooltipRef = useRef(null);
+  const [tooltipPos,setTooltipPos]=useState(null);
+  useEffect(() => {
+    if (!tooltip || !tooltipRef.current) { setTooltipPos(null); return; }
+    const rect = tooltipRef.current.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const GAP = 14, EDGE = 8;
+    let top = tooltip.y + GAP;
+    if (top + rect.height > vh - EDGE) {
+      // Not enough room below — flip above. Clamp to top edge so very
+      // tall tooltips at least start visible.
+      top = Math.max(EDGE, tooltip.y - GAP - rect.height);
+    }
+    const left = Math.max(EDGE, Math.min(tooltip.x + GAP, vw - rect.width - EDGE));
+    setTooltipPos({ top, left });
+  }, [tooltip?.x, tooltip?.y, tooltip?.catId]);
   // Phase 23C.5 — lazy init from localStorage so a hard-refresh during an
   // active Mouser cooldown keeps the refresh button disabled and prevents
   // a fresh /api/prices call from re-triggering the warn toast.
@@ -4893,9 +4913,18 @@ function App(){
         tiStatus={tiStatus}
       />}
 
-      {/* Tooltip — applies on prices tab when hovering live cells */}
+      {/* Tooltip — applies on prices tab when hovering live cells.
+          Phase 24C.4 — first render uses the cursor-anchored fallback
+          position (so the tooltip doesn't flicker on first frame); the
+          useEffect measures the rendered tooltip height + flips above
+          the cursor when it would clip the viewport bottom, then
+          re-renders with the corrected top. */}
       {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId)||tiRollupsByCanonical[combinedEvidence?.legacyToCanonical?.[tooltip.catId]])&&(
-        <div className="tt" style={{top:tooltip.y+14,left:Math.min(tooltip.x+14,window.innerWidth-360)}}>
+        <div
+          ref={tooltipRef}
+          className="tt"
+          style={tooltipPos ? { top: tooltipPos.top, left: tooltipPos.left } : { top: tooltip.y+14, left: Math.min(tooltip.x+14, window.innerWidth-360), visibility: 'hidden' }}
+        >
           <TT catId={tooltip.catId}/>
         </div>
       )}
