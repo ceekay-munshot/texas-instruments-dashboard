@@ -941,2217 +941,265 @@ function fmtPriceUSD(n, currency) {
   return cur === 'USD' ? `$${Number(n).toFixed(4)}` : `${Number(n).toFixed(4)} ${cur}`;
 }
 
-function InventoryPanel() {
-  // ── Public snapshot (customer-facing default) ─────────────────────────
-  // Loaded from /api/ti/inventory/latest on mount. Contains sanitized
-  // TiPartSignalPublic records — never any secrets, never raw pricing breaks.
-  const [snapshot, setSnapshot] = useState(null);
-  const [snapshotLoading, setSnapshotLoading] = useState(true);
-  const [snapshotError, setSnapshotError] = useState(null);
-  // Phase 21G — shortage / oversupply signal feed.
-  const [signalsResp, setSignalsResp] = useState(null);
-  // Phase 21H — per-part history expansion (lazy-loaded on click).
-  const [historyByPart, setHistoryByPart] = useState({});
-  const [expandedPart, setExpandedPart] = useState(null);
-  // Phase 21A — Inventory tab now has internal sub-tabs:
-  //   'snapshot' = Latest Snapshot (default)
-  //   'trends'   = Trends (per-part inventory + price history)
-  //   'signals'  = Shortage / Oversupply Signals
-  const [inventorySubTab, setInventorySubTab] = useState('snapshot');
-  // Trends tab — selected part for trend deep-dive.
-  const [trendPart, setTrendPart] = useState(null);
-  const [historySummary, setHistorySummary] = useState(null);
-  // Phase 21C — schedule/status feeds the customer-facing automation health
-  // strip at the top of the Inventory tab. Sanitized public response; no
-  // secrets ever flow through this channel.
-  const [scheduleStatus, setScheduleStatus] = useState(null);
-  // Phase 22.5 — watched-parts catalog gives us subcategory per OPN, which
-  // /inventory/latest doesn't surface. Used by the Category Heatmap so each
-  // basket can be split into the finer-grained sub-buckets.
-  const [watchedCatalog, setWatchedCatalog] = useState(null);
-  // Phase 22.5 — Signal Leaderboard active sub-tab.
-  const [leaderboardTab, setLeaderboardTab] = useState('shortage_pressure');
-  // Phase 23A — Trends sub-tab now supports four scopes. The existing
-  // part-scope picker (`trendPart`) keeps working untouched when scope ===
-  // 'part'; the aggregate scopes hit the new /api/ti/inventory/trends
-  // endpoint and cache by composite key so flipping back-and-forth doesn't
-  // re-fetch the same slice.
-  const [trendsScope, setTrendsScope] = useState('part');
-  const [trendsBasket, setTrendsBasket] = useState('');
-  const [trendsSubcategory, setTrendsSubcategory] = useState('');
-  const [trendsWindow, setTrendsWindow] = useState('30d');
-  const [trendsAggData, setTrendsAggData] = useState({}); // key → response
+// ── Supply tab — customer-facing supply pressure dashboard ─────────────────
+// Built from the full TI Direct rollups so the customer sees real coverage
+// instead of the legacy 64-part watched list. Click any category row to
+// drill into Universe with that subcategory pre-filtered. All operator and
+// internal-status sections live elsewhere; this view is customer-grade.
+function SupplyPanel({ tiRollupsByCanonical, tiTrendByCanonical, combinedEvidence, setUniverseFilter, setActiveTab }) {
+  const B = '#1a2740';
 
-  // ── Operator-tools state (collapsed by default) ───────────────────────
-  // Lets an operator paste the X-Capture-Secret to run a fresh capture or
-  // an ad-hoc part-signal lookup. Customers never need to interact with
-  // these controls.
-  const [opsOpen, setOpsOpen] = useState(false);
-  const [secret, setSecret] = useState('');
-  const [showSecret, setShowSecret] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-  const [adhocSignals, setAdhocSignals] = useState({}); // OPN -> TiPartSignal
-  const [adhocOrder, setAdhocOrder] = useState([]); // ordered OPNs added by operator
-  const [partInput, setPartInput] = useState('');
-  const [captureNote, setCaptureNote] = useState(null);
-
-  // Fetch the public snapshot + signals feed on mount.
-  useEffect(() => {
-    let cancelled = false;
-    Promise.allSettled([
-      fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null),
-      // Phase 21A — prefer the persisted-signal endpoint; fall through to
-      // the on-the-fly /signals endpoint if signals/latest isn't deployed
-      // yet (e.g. during the brief gap between push and Cloudflare build).
-      fetch('/api/ti/inventory/signals/latest').then(r => r.ok ? r.json() : null).catch(() => null),
-      fetch('/api/ti/inventory/signals').then(r => r.ok ? r.json() : null).catch(() => null),
-      fetch('/api/ti/inventory/history/summary').then(r => r.ok ? r.json() : null).catch(() => null),
-      // Phase 21C — automation-health card on the Inventory tab.
-      fetch('/api/ti/inventory/schedule/status').then(r => r.ok ? r.json() : null).catch(() => null),
-      // Phase 22.5 — sanitized watched-parts catalog (subcategory per OPN).
-      fetch('/api/ti/watched-parts/catalog').then(r => r.ok ? r.json() : null).catch(() => null),
-    ]).then(([snapRes, sigLatestRes, sigOnFlyRes, summaryRes, scheduleRes, catalogRes]) => {
-      if (cancelled) return;
-      setSnapshotLoading(false);
-      const j = snapRes.status === 'fulfilled' ? snapRes.value : null;
-      if (!j) {
-        setSnapshotError('Inventory snapshot endpoint did not respond.');
-      } else {
-        setSnapshot(j);
-        if (j.status === 'no_snapshot') setSnapshotError('No inventory snapshot has been captured yet.');
-        else if (j.status === 'snapshot_storage_not_configured') setSnapshotError('Snapshot storage is not configured on this deployment.');
-      }
-      const persisted = sigLatestRes.status === 'fulfilled' ? sigLatestRes.value : null;
-      const onFly = sigOnFlyRes.status === 'fulfilled' ? sigOnFlyRes.value : null;
-      setSignalsResp(persisted ?? onFly ?? null);
-      if (summaryRes.status === 'fulfilled' && summaryRes.value) setHistorySummary(summaryRes.value);
-      if (scheduleRes.status === 'fulfilled' && scheduleRes.value) setScheduleStatus(scheduleRes.value);
-      if (catalogRes.status === 'fulfilled' && catalogRes.value) setWatchedCatalog(catalogRes.value);
-    });
-    return () => { cancelled = true; };
-  }, []);
-
-  // Phase 23A — fetch + cache aggregate trends responses for non-part scopes.
-  // key = `${scope}|${basket}|${subcategory}|${window}` so the cache survives
-  // tab flips. We never auto-refresh after the initial fetch; the customer
-  // can change window/scope to re-trigger.
-  async function fetchTrendsAggregate(scope, basket, subcategory, window) {
-    if (scope === 'part') return;
-    const params = new URLSearchParams({ scope, window });
-    if (basket) params.set('basket', basket);
-    if (subcategory) params.set('subcategory', subcategory);
-    const key = `${scope}|${basket || ''}|${subcategory || ''}|${window}`;
-    if (trendsAggData[key]) return;
-    try {
-      const res = await fetch(`/api/ti/inventory/trends?${params.toString()}`);
-      const j = res.ok ? await res.json().catch(() => null) : null;
-      if (j && j.success !== false) {
-        setTrendsAggData(prev => ({ ...prev, [key]: j }));
-      } else {
-        setTrendsAggData(prev => ({ ...prev, [key]: { _error: j?.message || `Server returned ${res.status}` } }));
-      }
-    } catch (e) {
-      setTrendsAggData(prev => ({ ...prev, [key]: { _error: e?.message || 'Fetch failed' } }));
-    }
+  // canonical → first matching legacy CATS entry, used for friendly labels.
+  const legacyToCanonical = combinedEvidence?.legacyToCanonical || {};
+  const canonicalToLegacy = {};
+  Object.entries(legacyToCanonical).forEach(([legacy, canonical]) => {
+    if (!canonicalToLegacy[canonical]) canonicalToLegacy[canonical] = [];
+    canonicalToLegacy[canonical].push(legacy);
+  });
+  function canonicalLabel(canonical) {
+    const legacyIds = canonicalToLegacy[canonical] || [];
+    const cat = legacyIds.length ? CATS.find(c => c.id === legacyIds[0]) : null;
+    if (cat) return cat.l;
+    return canonical.split('_').slice(1).map(s => s ? s[0].toUpperCase() + s.slice(1) : '').join(' ').trim() || canonical;
+  }
+  function canonicalGroupLabel(canonical) {
+    const legacyIds = canonicalToLegacy[canonical] || [];
+    const cat = legacyIds.length ? CATS.find(c => c.id === legacyIds[0]) : null;
+    return cat?.g || '—';
   }
 
-  async function fetchPartHistory(partNumber) {
-    if (!partNumber) return;
-    if (historyByPart[partNumber]) return; // cached
-    try {
-      const res = await fetch(`/api/ti/inventory/history?partNumber=${encodeURIComponent(partNumber)}&days=30`);
-      const j = res.ok ? await res.json().catch(() => null) : null;
-      if (j && j.success) {
-        setHistoryByPart(prev => ({ ...prev, [partNumber]: j }));
-      } else {
-        setHistoryByPart(prev => ({ ...prev, [partNumber]: { rows: [], error: j?.message || `Server returned ${res.status}` } }));
-      }
-    } catch (e) {
-      setHistoryByPart(prev => ({ ...prev, [partNumber]: { rows: [], error: e?.message || 'Fetch failed' } }));
+  // Build per-subcategory rows from the rollup map.
+  const rollupEntries = Object.entries(tiRollupsByCanonical || {});
+  const rows = rollupEntries.map(([canonical, r]) => {
+    const trend = (tiTrendByCanonical || {})[canonical];
+    const trendUsable = !!trend?.hasEnoughHistory;
+    const stockDelta = trendUsable && Number.isFinite(trend.stockDeltaPct) ? trend.stockDeltaPct : null;
+    const priceDelta = trendUsable && Number.isFinite(trend.priceDeltaPct) ? trend.priceDeltaPct : null;
+    const stockedPct = Number.isFinite(r?.stockedPct) ? r.stockedPct : null;
+    let status = 'Stable';
+    let statusColor = '#7a96b8';
+    if (stockDelta != null && stockDelta <= -5) {
+      status = 'Tightening'; statusColor = '#f0a84e';
+    } else if (stockDelta != null && stockDelta >= 5) {
+      status = 'Easing'; statusColor = '#00c9a7';
+    } else if (stockedPct != null && stockedPct < 50) {
+      status = 'Watch'; statusColor = '#f0a84e';
     }
-  }
-
-  async function fetchOne(orderablePartNumber) {
-    if (!secret.trim()) {
-      setError('Capture secret required.');
-      return null;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      const url = `/api/ti/part-signal?partNumber=${encodeURIComponent(orderablePartNumber)}`;
-      const res = await fetch(url, { headers: { 'X-Capture-Secret': secret.trim() } });
-      const json = await res.json().catch(() => null);
-      if (!json) {
-        setError(`Server returned ${res.status} (no JSON).`);
-      } else if (json.status === 'unauthorized') {
-        setError('Unauthorized — check the capture secret.');
-      } else if (json.status === 'capture_secret_not_configured') {
-        setError('Capture secret is not configured on the server.');
-      }
-      return json;
-    } catch (e) {
-      setError(e?.message || 'Failed to reach server.');
-      return null;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // ── Universe capture (Phase 20D.1) ─────────────────────────────────────
-  // The Cloudflare Worker can't reliably do all 32 parts in one invocation
-  // (subrequest cap), so the operator UI loops the batched endpoint with
-  // offset=0,8,16,24 and surfaces progress per batch. The server already
-  // merges each batch into the persistent snapshot, so a partial run is
-  // never lost.
-  const [captureProgress, setCaptureProgress] = useState(null);
-
-  async function captureUniverse() {
-    if (!secret.trim()) {
-      setError('Capture secret required.');
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    setCaptureNote(null);
-    setCaptureProgress({ done: 0, total: 32, totalCaptured: 0, totalFailed: 0, totalStale: 0 });
-    let offset = 0;
-    const limit = 8;
-    let total = 32;
-    let totalCaptured = 0;
-    let totalFailed = 0;
-    let totalStale = 0;
-    let lastCapturedAt = null;
-    try {
-      while (offset < total) {
-        const url = `/api/ti/inventory/capture?offset=${offset}&limit=${limit}`;
-        const res = await fetch(url, { method: 'POST', headers: { 'X-Capture-Secret': secret.trim() } });
-        const json = await res.json().catch(() => null);
-        if (!json) {
-          setError(`Server returned ${res.status} (no JSON).`);
-          break;
-        }
-        if (json.status === 'unauthorized') {
-          setError('Unauthorized — check the capture secret.');
-          break;
-        }
-        if (json.status === 'capture_secret_not_configured') {
-          setError('Capture secret is not configured on the server.');
-          break;
-        }
-        if (!json.success) {
-          setError(`Batch failed at offset ${offset}: ${json.status || 'unknown'}`);
-          break;
-        }
-        total = typeof json.totalParts === 'number' ? json.totalParts : total;
-        totalCaptured += json.capturedThisBatch || 0;
-        totalFailed += json.failedThisBatch || 0;
-        totalStale += json.staleThisBatch || 0;
-        lastCapturedAt = json.capturedAt || lastCapturedAt;
-        const advanced = (json.offset ?? offset) + (json.attemptedThisBatch ?? limit);
-        offset = json.nextOffset == null ? total : json.nextOffset;
-        setCaptureProgress({
-          done: Math.min(advanced, total),
-          total,
-          totalCaptured,
-          totalFailed,
-          totalStale,
-        });
-        if (json.done) break;
-      }
-      // Re-pull the public snapshot so the table reflects the merged state.
-      const fresh = await fetch('/api/ti/inventory/latest').then(r => r.ok ? r.json() : null).catch(() => null);
-      if (fresh) setSnapshot(fresh);
-      setCaptureNote(
-        `Captured ${totalCaptured}/${total} parts${totalFailed > 0 ? ` · ${totalFailed} failed` : ''}${totalStale > 0 ? ` · ${totalStale} stale (kept last good)` : ''}${lastCapturedAt ? ` · ${new Date(lastCapturedAt).toLocaleString()}` : ''}`
-      );
-    } catch (e) {
-      setError(e?.message || 'Failed to reach server.');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function addPart() {
-    const opn = partInput.trim();
-    if (!opn) return;
-    if (adhocSignals[opn.toUpperCase()] || (snapshot?.parts || []).some(p => (p.partNumber || '').toUpperCase() === opn.toUpperCase())) {
-      setError(`${opn} is already in the table.`);
-      return;
-    }
-    const json = await fetchOne(opn);
-    if (json && (json.requestedPartNumber || json.success)) {
-      const upper = opn.toUpperCase();
-      setAdhocSignals(prev => ({ ...prev, [upper]: json }));
-      setAdhocOrder(prev => [...prev, upper]);
-      setPartInput('');
-    }
-  }
-
-  // ── Build display rows ────────────────────────────────────────────────
-  // Snapshot rows are the customer-facing source of truth for the universe
-  // KPI summary cards. Operator-added ad-hoc rows (full TiPartSignal shape)
-  // are appended to the table beneath the snapshot rows but do not influence
-  // the summary cards — those always describe the latest verified snapshot.
-  const snapshotParts = snapshot?.parts || [];
-  const adhocRows = adhocOrder.map(upper => adhocSignals[upper]).filter(Boolean);
-  const summary = snapshot?.summary || null;
-
-  // ── Filter / search / sort state (Phase 20D) ───────────────────────────
-  const [basketFilter, setBasketFilter] = useState('all');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [sortBy, setSortBy] = useState('basket'); // basket | quantityAvailable | leadTimeWeeks | lifecycleStatus
-  const [sortDir, setSortDir] = useState('asc'); // asc | desc
-
-  const distinctBaskets = useMemo(() => {
-    const set = new Set();
-    for (const p of snapshotParts) if (p.basket) set.add(p.basket);
-    return Array.from(set).sort();
-  }, [snapshotParts]);
-
-  const filteredSnapshotParts = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    let rows = snapshotParts;
-    if (basketFilter && basketFilter !== 'all') {
-      rows = rows.filter(p => p.basket === basketFilter);
-    }
-    if (q) {
-      rows = rows.filter(p => {
-        const gen = (p.genericPartNumber || '').toLowerCase();
-        const ord = (p.partNumber || '').toLowerCase();
-        const dn = (p.displayName || '').toLowerCase();
-        return gen.includes(q) || ord.includes(q) || dn.includes(q);
-      });
-    }
-    const dir = sortDir === 'desc' ? -1 : 1;
-    const cmp = (a, b) => {
-      switch (sortBy) {
-        case 'quantityAvailable': {
-          const av = a.quantityAvailable == null ? -Infinity : a.quantityAvailable;
-          const bv = b.quantityAvailable == null ? -Infinity : b.quantityAvailable;
-          return (av - bv) * dir;
-        }
-        case 'leadTimeWeeks': {
-          const av = a.leadTimeWeeks == null ? Infinity : a.leadTimeWeeks;
-          const bv = b.leadTimeWeeks == null ? Infinity : b.leadTimeWeeks;
-          return (av - bv) * dir;
-        }
-        case 'lifecycleStatus': {
-          const av = (a.lifecycleStatus || '').toUpperCase();
-          const bv = (b.lifecycleStatus || '').toUpperCase();
-          return av.localeCompare(bv) * dir;
-        }
-        case 'basket':
-        default: {
-          const av = (a.basket || '').toLowerCase();
-          const bv = (b.basket || '').toLowerCase();
-          if (av !== bv) return av.localeCompare(bv) * dir;
-          // Stable secondary sort by orderable PN.
-          return (a.partNumber || '').localeCompare(b.partNumber || '');
-        }
-      }
+    return {
+      canonical,
+      group: canonicalGroupLabel(canonical),
+      label: canonicalLabel(canonical),
+      partsTracked: Number(r?.opnCount || 0),
+      stockedCount: Number(r?.stockedOpnCount || 0),
+      outOfStockCount: Number(r?.outOfStockOpnCount || 0),
+      stockedPct,
+      stockDelta,
+      priceDelta,
+      status,
+      statusColor,
+      rollup: r,
+      trend: trend || null,
     };
-    return rows.slice().sort(cmp);
-  }, [snapshotParts, basketFilter, searchQuery, sortBy, sortDir]);
+  }).sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label));
 
-  const sectionWrap = { padding: '18px 16px', borderBottom: '1px solid #1a2740', background: '#050810' };
-  const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 4 };
-  const tinyLabel = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' };
+  // Aggregate KPIs across the full universe rollup set.
+  const totalParts = rows.reduce((s, r) => s + (r.partsTracked || 0), 0);
+  const totalStocked = rows.reduce((s, r) => s + (r.stockedCount || 0), 0);
+  const totalOutOfStock = rows.reduce((s, r) => s + (r.outOfStockCount || 0), 0);
+  const inStockPct = totalParts > 0 ? (totalStocked / totalParts) * 100 : null;
+  const outOfStockPct = totalParts > 0 ? (totalOutOfStock / totalParts) * 100 : null;
+  const pressureRows = rows.filter(r => r.status === 'Tightening' || r.status === 'Watch');
+  const tighteningRows = rows.filter(r => r.status === 'Tightening')
+    .sort((a, b) => (a.stockDelta ?? 0) - (b.stockDelta ?? 0));
 
-  const KpiCard = ({ label, value, sub, color }) => (
-    <div style={{ minWidth: 180, padding: '12px 16px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
-      <div style={tinyLabel}>{label}</div>
-      <div style={{ fontSize: '1.15rem', fontFamily: 'monospace', color: color || '#e0eaf8', marginTop: 4, lineHeight: 1.2 }}>{value}</div>
-      {sub && <div style={{ fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 2 }}>{sub}</div>}
-    </div>
+  // Headline copy in plain English.
+  let headline = 'Supply looks stable';
+  if (tighteningRows.length > 0) {
+    headline = `Supply tightening in ${tighteningRows[0].label}`;
+  } else if (pressureRows.length > 0) {
+    headline = pressureRows.length > rows.length / 3 ? 'Supply looks mixed' : 'Supply mostly stable';
+  }
+
+  // Trend-driven sections only render once at least one subcategory has
+  // enough history. Otherwise we surface a clean "trend data is building"
+  // message instead of a blank panel.
+  const trendsAvail = rows.filter(r => r.stockDelta != null);
+  const biggestDrops = [...trendsAvail].sort((a, b) => a.stockDelta - b.stockDelta).slice(0, 5).filter(r => r.stockDelta < 0);
+  const biggestBuilds = [...trendsAvail].sort((a, b) => b.stockDelta - a.stockDelta).slice(0, 5).filter(r => r.stockDelta > 0);
+  const importantMoves = trendsAvail.filter(r =>
+    (r.priceDelta != null && r.stockDelta != null) &&
+    ((r.priceDelta > 1 && r.stockDelta < -1) || (r.priceDelta < -1 && r.stockDelta > 1))
   );
 
-  // Phase 21C — multi-row info cards for the always-visible Inventory
-  // status strip. KpiCard is great for one big number; this is for
-  // structured key/value lines (Automation Health, History Depth, Pricing
-  // Source Status). Same dark surface so the strip reads as a coherent
-  // block above the sub-tab navigation.
-  const InfoCard = ({ title, accent, children }) => (
-    <div style={{ minWidth: 260, flex: '1 1 280px', maxWidth: 380, padding: '12px 16px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
-      <div style={{ ...tinyLabel, color: accent || tinyLabel.color, marginBottom: 8 }}>{title}</div>
-      {children}
-    </div>
-  );
-  const InfoRow = ({ label, value, valueColor }) => (
-    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: '2px 0', fontSize: '0.66rem', fontFamily: 'monospace' }}>
-      <span style={{ color: '#7a96b8' }}>{label}</span>
-      <span style={{ color: valueColor || '#e0eaf8', textAlign: 'right' }}>{value}</span>
-    </div>
-  );
+  function openCategory(row) {
+    setUniverseFilter({
+      canonicalSubcategory: row.canonical,
+      canonicalGroup: row.rollup?.canonicalGroup ?? null,
+      qualityLabel: row.rollup?.qualityLabel ?? null,
+      qualityWarning: row.rollup?.qualityWarning ?? null,
+      displayLabel: row.label,
+      sourceCellId: null,
+      usable: row.rollup?.usableForPricesLiveEvidence === true,
+    });
+    setActiveTab('universe');
+  }
 
-  const cellTH = { padding: '6px 8px', textAlign: 'left', borderBottom: '1px solid #1a2740', color: '#6b8aa8', fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.12em', fontWeight: 'bold', whiteSpace: 'nowrap' };
-  const cellTD = { padding: '6px 8px', borderBottom: '1px solid #0d1520', fontSize: '0.7rem', color: '#c4d4e8', verticalAlign: 'top' };
-  const cellMono = { ...cellTD, fontFamily: 'monospace' };
+  // Tiny presentational helpers (kept inside the component so this panel
+  // stays self-contained and easy to delete or rebuild later).
+  const sectionTitle = { fontSize: '0.58rem', color: '#6b8aa8', letterSpacing: '0.16em', textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 8 };
+  function KpiCard({ label, value, sub, color }) {
+    return (
+      <div style={{ border: `1px solid ${B}`, borderRadius: 6, padding: '12px 14px', background: '#0a0f18' }}>
+        <div style={{ fontSize: '0.55rem', color: '#6b8aa8', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 4 }}>{label}</div>
+        <div style={{ fontSize: '1.3rem', fontWeight: 'bold', color: color || '#e0eaf8', fontFamily: 'monospace' }}>{value}</div>
+        {sub && <div style={{ fontSize: '0.6rem', color: '#7a96b8', marginTop: 2 }}>{sub}</div>}
+      </div>
+    );
+  }
+  function ChangeRow({ row, deltaColor }) {
+    const v = row.stockDelta;
+    const sign = v > 0 ? '+' : '';
+    return (
+      <div onClick={() => openCategory(row)}
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 10px', borderBottom: '1px solid #0d1520', cursor: 'pointer', transition: 'background 0.12s' }}
+        onMouseEnter={e => e.currentTarget.style.background = 'rgba(61,142,240,0.08)'}
+        onMouseLeave={e => e.currentTarget.style.background = ''}
+        title="Click to see parts in this category"
+      >
+        <span style={{ color: '#e0eaf8', fontSize: '0.7rem' }}>{row.label}</span>
+        <span style={{ color: deltaColor, fontFamily: 'monospace', fontSize: '0.7rem', fontWeight: 'bold' }}>{sign}{v.toFixed(2)}%</span>
+      </div>
+    );
+  }
 
-  // ── Summary card values (Phase 20D — universe-level) ───────────────────
-  // Sourced from the API summary if present; otherwise computed from the
-  // local snapshot rows so the cards still populate when a stale or
-  // partial snapshot is on disk.
-  const total = summary?.totalParts ?? snapshotParts.length;
-  const inStock = summary?.inStockParts ?? snapshotParts.filter(p => p.signals?.supplyStatus === 'in_stock').length;
-  const outOfStock = summary?.outOfStockParts ?? snapshotParts.filter(p => p.signals?.supplyStatus === 'out_of_stock').length;
-  const activeCount = summary?.activeParts ?? null;
-  const longestLead = summary?.longestLeadTimePart;
-  const longestLabel = longestLead && longestLead.leadTimeWeeks != null
-    ? `${longestLead.leadTimeWeeks} wk`
-    : '—';
-  const longestSub = longestLead?.partNumber || (snapshotParts.length === 0 ? 'pending capture' : 'no lead time reported');
-  const basketsCovered = summary?.basketsCovered ?? distinctBaskets.length;
-  const medianLead = summary?.medianLeadTimeWeeks;
-  const medianLabel = typeof medianLead === 'number' && Number.isFinite(medianLead) ? `${medianLead} wk` : '—';
+  // Empty / not-yet-wired state.
+  if (rows.length === 0) {
+    return (
+      <div style={{ padding: '60px 20px', textAlign: 'center', color: '#7a96b8' }}>
+        <div style={{ fontSize: '1.05rem', color: '#e0eaf8', marginBottom: 10, fontWeight: 'bold' }}>Supply dashboard is being upgraded to full TI universe coverage.</div>
+        <div style={{ fontSize: '0.72rem' }}>Current full-universe pricing data is available in Prices and Universe.</div>
+      </div>
+    );
+  }
 
-  // Snapshot freshness label for the header.
-  const snapshotCapturedAt = snapshot?.capturedAt
-    ? new Date(snapshot.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
-    : null;
+  const headerCell = { padding: '8px 10px', textAlign: 'left', color: '#7a96b8', fontWeight: 'normal', fontSize: '0.55rem', letterSpacing: '0.1em', textTransform: 'uppercase' };
+  const headerCellRight = { ...headerCell, textAlign: 'right' };
+  const headerCellCenter = { ...headerCell, textAlign: 'center' };
+  const dataCell = { padding: '8px 10px', borderBottom: '1px solid #0d1520' };
 
   return (
-    <>
-      {/* ── Header ── */}
-      <div style={{ ...sectionWrap, paddingTop: 22, paddingBottom: 18 }}>
-        <div style={{ ...sectionTitle, marginBottom: 6 }}>TI Direct Supply Signal</div>
-        <div style={{ fontSize: '0.78rem', color: '#a0b8d0', lineHeight: 1.55, maxWidth: 920 }}>
-          Live TI direct inventory, pricing and future availability signals from Texas Instruments Store Inventory & Pricing API.
-        </div>
-        <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#7a96b8', maxWidth: 920, lineHeight: 1.5 }}>
-          Inventory data is refreshed from Texas Instruments Store Inventory & Pricing API and shown from the latest verified snapshot.
-          {snapshotCapturedAt && (
-            <span style={{ color: '#a0b8d0' }}> Latest snapshot captured {snapshotCapturedAt}.</span>
-          )}
-        </div>
+    <div style={{ padding: '20px 16px', color: '#c4d4e8' }}>
+      {/* Headline + subtitle */}
+      <div style={{ marginBottom: 18 }}>
+        <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#e0eaf8', letterSpacing: '-0.01em' }}>{headline}</div>
+        <div style={{ fontSize: '0.7rem', color: '#7a96b8', marginTop: 4 }}>Latest TI inventory data across the product universe.</div>
       </div>
 
-      {/* ── Phase 22.6 — Live conclusion banner + What changed since last
-              capture + signal-classification methodology. The four pieces
-              the customer reads top-to-bottom before they ever click a
-              sub-tab:
-                1. Headline (color-coded by current pressure state)
-                2. Subtext explaining the headline
-                3. Data-reliability sentence (captured / failed / stale /
-                   priced — derived from the same /inventory/latest +
-                   /signals/latest data the rest of the page uses, so
-                   numbers always match what's below)
-                4. Collapsed methodology rules so a curious customer can
-                   verify how the headline was reached without scrolling
-                   to the Signals sub-tab.
-
-              Followed by a separate "What changed since last capture?"
-              section that surfaces the single biggest mover per
-              category (inventory drop / build / price up / down) or a
-              clean "No material movement" empty state. Different from
-              the Signal Leaderboard on the Signals sub-tab — the
-              leaderboard is a ranked top-15 per category; this section
-              is a one-line answer per category.
-      */}
-      {(() => {
-        const sigSummary = signalsResp?.summary;
-        const sigList = signalsResp?.signals || [];
-        const totalParts = (summary?.totalParts ?? sigList.length) || 0;
-        const captured = summary?.capturedParts ?? snapshotParts.length;
-        const failedParts = summary?.failedParts ?? 0;
-        const staleParts = summary?.staleParts ?? 0;
-        const pricedParts = sigList.filter(s => s.latestNormalizedUnitPrice != null).length
-          || (snapshot?.parts || []).filter(p => p.normalizedUnitPrice != null).length;
-        const sp = sigSummary?.shortagePressure ?? 0;
-        const op = sigSummary?.oversupplyPressure ?? 0;
-        const it = sigSummary?.inventoryTightening ?? 0;
-        const se = sigSummary?.supplyEasing ?? 0;
-        const ip = sigSummary?.priceOnlyPressure ?? 0;
-        const totalPressure = sp + op + it + se + ip;
-        // Color-coded headline. Severity ordering: shortage > oversupply >
-        // tightening > easing > price-only > stable. Ties: highest count wins.
-        let headline, accent, headlineHint = null;
-        if (sp > 0) {
-          accent = '#f05c5c';
-          headline = `${sp} part${sp === 1 ? '' : 's'} under shortage pressure across the ${totalParts}-part TI watched universe.`;
-          headlineHint = 'Inventory is falling and price is rising for these parts — typical shortage signature.';
-        } else if (op > 0) {
-          accent = '#3d8ef0';
-          headline = `${op} part${op === 1 ? '' : 's'} under oversupply pressure across the ${totalParts}-part TI watched universe.`;
-          headlineHint = 'Inventory is rising and price is falling for these parts — typical oversupply signature.';
-        } else if (it > 0) {
-          accent = '#f0a84e';
-          headline = `${it} part${it === 1 ? '' : 's'} showing inventory tightening across the ${totalParts}-part TI watched universe.`;
-          headlineHint = 'Inventory falling but price has not yet moved.';
-        } else if (se > 0) {
-          accent = '#00c9a7';
-          headline = `${se} part${se === 1 ? '' : 's'} showing supply easing across the ${totalParts}-part TI watched universe.`;
-          headlineHint = 'Inventory rising but price has not yet moved.';
-        } else if (ip > 0) {
-          accent = '#ab6af0';
-          headline = `${ip} part${ip === 1 ? '' : 's'} showing price-only pressure across the ${totalParts}-part TI watched universe.`;
-          headlineHint = 'Price is rising while inventory has not moved.';
-        } else {
-          accent = '#4dffc3';
-          headline = `No supply pressure detected across the ${totalParts}-part TI watched universe.`;
-        }
-        const subtext = totalPressure === 0
-          ? `All ${captured}${totalParts ? `/${totalParts}` : ''} parts were captured successfully with direct TI Store pricing. Inventory and pricing are stable versus previous observations.`
-          : (headlineHint || 'See the Signal Leaderboard for the full ranked list.');
-        const reliability = `Latest run captured ${captured}/${totalParts} parts, ${failedParts} failed, ${staleParts} stale, and ${pricedParts}/${totalParts} direct TI prices.`;
-        // What-changed: top 1 per direction. inventoryPctDelta and
-        // pricePctDelta come from the persisted-signal latest-vs-previous
-        // pair (Phase 21A.3) so the answer is "what moved between the
-        // most-recent two captures" — exactly what the section title asks.
-        const invDrop  = sigList.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta < 0).sort((a, b) => a.inventoryPctDelta - b.inventoryPctDelta)[0] || null;
-        const invBuild = sigList.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta > 0).sort((a, b) => b.inventoryPctDelta - a.inventoryPctDelta)[0] || null;
-        const priceUp   = sigList.filter(s => s.pricePctDelta != null && s.pricePctDelta > 0).sort((a, b) => b.pricePctDelta - a.pricePctDelta)[0] || null;
-        const priceDown = sigList.filter(s => s.pricePctDelta != null && s.pricePctDelta < 0).sort((a, b) => a.pricePctDelta - b.pricePctDelta)[0] || null;
-        const noMovement = !invDrop && !invBuild && !priceUp && !priceDown;
-        const fmtPct = v => v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
-        const fmtPrice = v => v == null ? '—' : `$${Number(v).toFixed(4)}`;
-        const fmtQty = v => v == null ? '—' : Number(v).toLocaleString();
-        const ChangeTile = ({ title, sub, row, valueColor, deltaSide }) => (
-          <div style={{ padding: '10px 14px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
-            <div style={{ ...tinyLabel, marginBottom: 4 }}>{title}</div>
-            {row ? (
-              <>
-                <div style={{ fontSize: '0.78rem', color: '#e0eaf8', fontFamily: 'monospace' }}>
-                  {row.partNumber || row.orderablePartNumber}
-                </div>
-                {row.displayName && (
-                  <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontFamily: 'monospace', marginTop: 2 }}>
-                    {row.displayName}
-                  </div>
-                )}
-                <div style={{ marginTop: 6, fontSize: '0.85rem', color: valueColor, fontFamily: 'monospace' }}>
-                  {deltaSide === 'inventory'
-                    ? `${fmtPct(row.inventoryPctDelta)} (${fmtQty(row.previousQuantityAvailable)} → ${fmtQty(row.latestQuantityAvailable)})`
-                    : `${fmtPct(row.pricePctDelta)} (${fmtPrice(row.previousNormalizedUnitPrice)} → ${fmtPrice(row.latestNormalizedUnitPrice)})`}
-                </div>
-                {row.basket && (
-                  <div style={{ fontSize: '0.6rem', color: '#7a96b8', marginTop: 2 }}>{row.basket}</div>
-                )}
-              </>
-            ) : (
-              <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic', fontFamily: 'monospace' }}>
-                {sub || 'No movement in this direction.'}
-              </div>
-            )}
-          </div>
-        );
-        return (
-          <>
-            {/* Conclusion banner */}
-            <div style={{
-              ...sectionWrap, paddingTop: 18, paddingBottom: 16,
-              borderLeft: `4px solid ${accent}`,
-            }}>
-              <div style={{ ...sectionTitle, marginBottom: 6, color: accent }}>Live conclusion</div>
-              <div style={{
-                fontSize: '0.95rem', color: '#e0eaf8', fontWeight: 'bold',
-                lineHeight: 1.4, maxWidth: 920, fontFamily: 'monospace',
-              }}>
-                {headline}
-              </div>
-              <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#a0b8d0', maxWidth: 920, lineHeight: 1.5 }}>
-                {subtext}
-              </div>
-              <div style={{ marginTop: 6, fontSize: '0.66rem', color: '#7a96b8', fontFamily: 'monospace', maxWidth: 920 }}>
-                {reliability}
-              </div>
-              <details style={{ marginTop: 10 }}>
-                <summary style={{
-                  cursor: 'pointer', fontSize: '0.6rem', color: '#7a96b8',
-                  letterSpacing: '0.12em', textTransform: 'uppercase', fontWeight: 'bold',
-                }}>
-                  How signals are classified
-                </summary>
-                <div style={{
-                  marginTop: 6, padding: '8px 12px', background: '#080c14',
-                  border: '1px solid #1a2740', borderRadius: 4,
-                  fontSize: '0.66rem', color: '#a0b8d0', lineHeight: 1.7,
-                  fontFamily: 'monospace', maxWidth: 920,
-                }}>
-                  <div>• Inventory down + price up &nbsp;→&nbsp; <span style={{ color: '#f05c5c', fontWeight: 'bold' }}>shortage pressure</span></div>
-                  <div>• Inventory up + price down &nbsp;→&nbsp; <span style={{ color: '#3d8ef0', fontWeight: 'bold' }}>oversupply pressure</span></div>
-                  <div>• Inventory down + price flat/unavailable &nbsp;→&nbsp; <span style={{ color: '#f0a84e', fontWeight: 'bold' }}>inventory tightening</span></div>
-                  <div>• Inventory up + price flat/unavailable &nbsp;→&nbsp; <span style={{ color: '#00c9a7', fontWeight: 'bold' }}>supply easing</span></div>
-                  <div>• Price up + inventory flat &nbsp;→&nbsp; <span style={{ color: '#ab6af0', fontWeight: 'bold' }}>price-only pressure</span></div>
-                </div>
-              </details>
-            </div>
-
-            {/* What changed since last capture? */}
-            <div style={sectionWrap}>
-              <div style={{ ...sectionTitle, marginBottom: 8 }}>What changed since last capture?</div>
-              {noMovement ? (
-                <div style={{
-                  fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic',
-                  padding: '8px 12px', background: '#080c14',
-                  border: '1px solid #1a2740', borderRadius: 4,
-                  fontFamily: 'monospace', maxWidth: 920,
-                }}>
-                  No material inventory or pricing movement since the last capture.
-                </div>
-              ) : (
-                <div style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-                  gap: 10,
-                }}>
-                  <ChangeTile title="Largest inventory drop" row={invDrop} deltaSide="inventory" valueColor={'#f0a84e'} />
-                  <ChangeTile title="Largest inventory build" row={invBuild} deltaSide="inventory" valueColor={'#4dffc3'} />
-                  <ChangeTile title="Largest price increase" row={priceUp} deltaSide="price" valueColor={'#f05c5c'} />
-                  <ChangeTile title="Largest price decrease" row={priceDown} deltaSide="price" valueColor={'#4dffc3'} />
-                </div>
-              )}
-            </div>
-          </>
-        );
-      })()}
-
-      {/* ── Phase 21C — Always-visible status strip: Automation Health,
-              History Depth, Pricing Source Status. Pulled from
-              /schedule/status, /history/summary and /signals/latest
-              respectively. The customer sees the operational picture at a
-              glance regardless of which Inventory sub-tab they're on. ── */}
-      {(() => {
-        const sched = scheduleStatus;
-        const summary = historySummary;
-        const sigSummary = signalsResp?.summary;
-        const fmtTime = iso => iso ? new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
-        const captureStatus = sched?.lastExternalCaptureStatus || '—';
-        const captureStatusColor = captureStatus === 'ok' ? '#4dffc3'
-          : captureStatus === 'partial' ? '#f0a84e'
-          : captureStatus === 'error' || captureStatus === 'failed' ? '#f05c5c'
-          : captureStatus === 'in_progress' ? '#3d8ef0'
-          : '#7a96b8';
-        // Phase 22.6 — derive expected from the actual watched universe.
-        // Pre-22.4 this was offsetsConfigured*8 (the in-Cloudflare cron
-        // count × batch size), which only matched reality when the
-        // universe was 32 parts. With dynamic batching live we prefer
-        // /history/summary.totalTrackedParts → /inventory/latest.totalParts
-        // → schedule.capturedParts in that order, falling back to the
-        // cron-derived guess only when none of those exist yet.
-        const expectedParts =
-          (historySummary?.totalTrackedParts && historySummary.totalTrackedParts > 0
-            ? historySummary.totalTrackedParts
-            : (snapshot?.summary?.totalParts && snapshot.summary.totalParts > 0
-                ? snapshot.summary.totalParts
-                : (sched?.capturedParts && sched.capturedParts > 0
-                    ? sched.capturedParts
-                    : (sched?.offsetsConfigured && sched.offsetsConfigured > 0
-                        ? sched.offsetsConfigured * 8
-                        : 32))));
-        const expectedSignals = expectedParts;
-        const captured = sched?.capturedParts ?? null;
-        const persisted = sched?.signalsPersisted ?? null;
-        const sourceLabel = sched?.lastExternalCaptureSource === 'github_actions_daily' ? 'GitHub Actions daily'
-          : sched?.lastExternalCaptureSource === 'operator_ui' ? 'Operator UI (manual)'
-          : sched?.lastExternalCaptureSource ? sched.lastExternalCaptureSource
-          : '—';
-        // Pricing source breakdown — derive from /signals/latest summary
-        // (priceUnavailableCount is set by Phase 21A.3 onwards). Fall back
-        // to counting parts whose latestNormalizedUnitPrice is null.
-        // Phase 21D.2 — count direct-TI vs other vs unavailable using the
-        // pricingSource field on the snapshot (not the persisted-signal
-        // row, which doesn't carry pricingSource yet); falls back to the
-        // signals shape when snapshot.parts isn't loaded.
-        const sigList = signalsResp?.signals || [];
-        const snapshotParts21D2 = snapshot?.parts || [];
-        const directTiCount = snapshotParts21D2.length > 0
-          ? snapshotParts21D2.filter(p => p.pricingSource === 'direct_ti_store_price' && p.normalizedUnitPrice != null).length
-          : sigList.filter(s => s.latestNormalizedUnitPrice != null).length;
-        const priceUnavailableCount = snapshotParts21D2.length > 0
-          ? snapshotParts21D2.filter(p => p.pricingSource !== 'direct_ti_store_price' || p.normalizedUnitPrice == null).length
-          : (sigSummary?.priceUnavailableCount
-              ?? sigList.filter(s => s.latestNormalizedUnitPrice == null && s.pricePctDelta == null).length);
-        const dashboardPriceCount = 0; // Mouser blending intentionally not wired yet (Phase 21D.2 hard restriction).
-        const pricedCount = directTiCount + dashboardPriceCount;
-        // Sample a few normalized prices for the operator-friendly subtitle.
-        const samplePriced = snapshotParts21D2
-          .filter(p => p.pricingSource === 'direct_ti_store_price' && p.normalizedUnitPrice != null)
-          .slice(0, 3)
-          .map(p => `${p.partNumber} $${Number(p.normalizedUnitPrice).toFixed(4)}`)
-          .join(' · ');
-        return (
-          <div style={{ ...sectionWrap, paddingTop: 14, paddingBottom: 14 }}>
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-              <InfoCard title="Automation health · Data quality" accent={captureStatusColor}>
-                <InfoRow label="Status" value={captureStatus.toUpperCase()} valueColor={captureStatusColor} />
-                <InfoRow label="Source" value={sourceLabel} />
-                <InfoRow
-                  label="Parts captured"
-                  value={captured == null ? '—' : `${captured}/${expectedParts}`}
-                  valueColor={captured === expectedParts ? '#4dffc3' : captured == null ? '#7a96b8' : '#f0a84e'}
-                />
-                <InfoRow
-                  label="Signals persisted"
-                  value={persisted == null ? '—' : `${persisted}/${expectedSignals}`}
-                  valueColor={persisted === expectedSignals ? '#4dffc3' : persisted == null ? '#7a96b8' : '#f0a84e'}
-                />
-                {/* Phase 22.5 — Data Quality additions: failed/stale + 2+ obs.
-                    Phase 22.6 — read failed/stale from snapshot.summary
-                    (the /inventory/latest payload), not the local
-                    `summary` variable above which is /history/summary
-                    (which doesn't carry failedParts/staleParts). */}
-                <InfoRow
-                  label="Failed parts"
-                  value={snapshot?.summary?.failedParts != null ? String(snapshot.summary.failedParts) : '—'}
-                  valueColor={(snapshot?.summary?.failedParts ?? 0) > 0 ? '#f05c5c' : '#4dffc3'}
-                />
-                <InfoRow
-                  label="Stale parts"
-                  value={snapshot?.summary?.staleParts != null ? String(snapshot.summary.staleParts) : '—'}
-                  valueColor={(snapshot?.summary?.staleParts ?? 0) > 0 ? '#f0a84e' : '#7a96b8'}
-                />
-                <InfoRow
-                  label="Parts with 2+ obs"
-                  value={historySummary ? `${historySummary.partsWith2PlusObservations}/${historySummary.totalTrackedParts}` : '—'}
-                  valueColor={historySummary && historySummary.partsWith2PlusObservations === historySummary.totalTrackedParts ? '#4dffc3' : '#a0b8d0'}
-                />
-                <InfoRow label="Backend" value={(sched?.backend || '—').toUpperCase()} valueColor={sched?.backend === 'd1' ? '#4dffc3' : '#7a96b8'} />
-                <InfoRow label="Last capture" value={fmtTime(sched?.lastExternalCaptureAt || sched?.lastCaptureAt)} />
-                {/* Phase 22.5 — Task 3: scheduler-clarity. Uses the new
-                    activeSchedulerLabel from /schedule/status when available;
-                    falls back to the static "Daily 07:15 UTC" hint otherwise.
-                    The cron-list confusion is resolved at the source. */}
-                <InfoRow
-                  label="Schedule"
-                  value={sched?.activeScheduler === 'github_actions_dynamic'
-                    ? 'GitHub Actions · dynamic batching'
-                    : sched?.activeScheduler === 'cloudflare_cron'
-                      ? 'Cloudflare cron'
-                      : 'Daily 07:15 UTC'}
-                  valueColor={sched?.dynamicBatching ? '#4dffc3' : '#a0b8d0'}
-                />
-              </InfoCard>
-
-              <InfoCard title="History depth">
-                <InfoRow
-                  label="Total snapshots"
-                  value={summary?.totalSnapshots != null ? Number(summary.totalSnapshots).toLocaleString() : '—'}
-                  valueColor="#e0eaf8"
-                />
-                <InfoRow
-                  label="Parts with history"
-                  value={summary ? `${summary.partsWithHistory}/${summary.totalTrackedParts}` : '—'}
-                  valueColor={summary && summary.partsWithHistory === summary.totalTrackedParts ? '#4dffc3' : '#e0eaf8'}
-                />
-                <InfoRow
-                  label="With ≥3 observations"
-                  value={summary?.partsWith3PlusObservations != null ? `${summary.partsWith3PlusObservations}/${summary.totalTrackedParts}` : '—'}
-                />
-                <InfoRow label="Latest captured" value={fmtTime(summary?.latestCapturedAt)} />
-                <div style={{ marginTop: 6, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.45 }}>
-                  Signals become more useful as daily observations accumulate.
-                </div>
-              </InfoCard>
-
-              <InfoCard title="Pricing source status" accent={directTiCount > 0 ? '#4dffc3' : undefined}>
-                <InfoRow
-                  label="Direct TI Store price"
-                  value={`${directTiCount} parts`}
-                  valueColor={directTiCount > 0 ? '#4dffc3' : '#7a96b8'}
-                />
-                <InfoRow
-                  label="Existing dashboard / Mouser"
-                  value={`${dashboardPriceCount} parts`}
-                  valueColor="#7a96b8"
-                />
-                <InfoRow
-                  label="Price unavailable"
-                  value={`${priceUnavailableCount} parts`}
-                  valueColor={priceUnavailableCount > 0 ? '#f0a84e' : '#7a96b8'}
-                />
-                <InfoRow label="Source" value="Texas Instruments Store API" />
-                <InfoRow
-                  label="Confidence"
-                  value={directTiCount > 0 ? 'High (TI direct)' : '—'}
-                  valueColor={directTiCount > 0 ? '#4dffc3' : '#7a96b8'}
-                />
-                {samplePriced && (
-                  <div style={{ marginTop: 6, fontSize: '0.58rem', color: '#7a96b8', fontFamily: 'monospace' }}>
-                    {samplePriced}
-                  </div>
-                )}
-                <div style={{ marginTop: 6, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.45 }}>
-                  Pricing series only renders when TI Store returns price breaks. We never fabricate a price line.
-                </div>
-              </InfoCard>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* ── Sub-tab strip (Phase 21A): Latest Snapshot / Trends / Signals ── */}
-      <div style={{ display: 'flex', gap: 0, padding: '0 16px', background: '#080c14', borderBottom: '1px solid #1a2740' }}>
-        {[
-          { id: 'snapshot', label: 'Latest Snapshot' },
-          { id: 'trends', label: 'Trends' },
-          { id: 'signals', label: 'Shortage / Oversupply Signals' },
-        ].map(t => {
-          const on = inventorySubTab === t.id;
-          return (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setInventorySubTab(t.id)}
-              style={{
-                background: 'none',
-                border: 'none',
-                borderBottom: on ? '2px solid #3d8ef0' : '2px solid transparent',
-                padding: '10px 14px',
-                fontSize: '0.62rem',
-                letterSpacing: '0.14em',
-                textTransform: 'uppercase',
-                color: on ? '#e0eaf8' : '#6b8aa8',
-                cursor: 'pointer',
-                fontFamily: 'monospace',
-                fontWeight: on ? 'bold' : 'normal',
-              }}
-            >{t.label}</button>
-          );
-        })}
-        {historySummary && (
-          <span style={{ marginLeft: 'auto', alignSelf: 'center', fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace', paddingRight: 4 }}>
-            {historySummary.partsWithHistory}/{historySummary.totalTrackedParts} with history · {historySummary.totalSnapshots} snapshots · {historySummary.partsWith3PlusObservations} with ≥3 obs
-          </span>
-        )}
+      {/* KPI cards */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 24 }}>
+        <KpiCard label="Parts tracked" value={totalParts.toLocaleString()} />
+        <KpiCard label="In stock" value={inStockPct != null ? `${inStockPct.toFixed(1)}%` : '—'} color="#4dffc3" />
+        <KpiCard label="Out of stock" value={outOfStockPct != null ? `${outOfStockPct.toFixed(1)}%` : '—'} color="#f05c5c" />
+        <KpiCard label="Categories with pressure" value={pressureRows.length} sub={`of ${rows.length}`} color={pressureRows.length > 0 ? '#f0a84e' : '#4dffc3'} />
       </div>
 
-      {inventorySubTab === 'snapshot' && (<>
-
-      {/* ── Phase 22.5 — Executive Summary ──────────────────────────────
-           One-glance answer to "Is TI supply pressured? How does the
-           universe look right now?". Sits ABOVE the existing universe
-           cards and pulls signal counts from /signals/latest so the
-           customer sees the supply-side answer first. */}
-      {(() => {
-        const sigSummary = signalsResp?.summary;
-        const sigList = signalsResp?.signals || [];
-        const totalParts = summary?.totalParts ?? snapshotParts.length;
-        const capturedParts = summary?.capturedParts ?? snapshotParts.length;
-        const failedParts = summary?.failedParts ?? 0;
-        const inStockParts = inStock;
-        const outOfStockParts = outOfStock;
-        const pricedParts = sigList.filter(s => s.latestNormalizedUnitPrice != null).length
-          || (snapshot?.parts || []).filter(p => p.normalizedUnitPrice != null).length;
-        const shortagePressure = sigSummary?.shortagePressure ?? 0;
-        const oversupplyPressure = sigSummary?.oversupplyPressure ?? 0;
-        const inventoryTightening = sigSummary?.inventoryTightening ?? 0;
-        const supplyEasing = sigSummary?.supplyEasing ?? 0;
-        const meaningful = shortagePressure + oversupplyPressure + inventoryTightening + supplyEasing;
-        const headlineColor = shortagePressure > 0 ? '#f05c5c'
-          : oversupplyPressure > 0 ? '#3d8ef0'
-          : inventoryTightening > 0 ? '#f0a84e'
-          : supplyEasing > 0 ? '#00c9a7'
-          : '#7a96b8';
-        const headlineText = shortagePressure > 0
-          ? `${shortagePressure} part${shortagePressure === 1 ? '' : 's'} under shortage pressure`
-          : oversupplyPressure > 0
-            ? `${oversupplyPressure} part${oversupplyPressure === 1 ? '' : 's'} under oversupply pressure`
-            : meaningful > 0
-              ? `${meaningful} part${meaningful === 1 ? '' : 's'} with directional signal`
-              : 'No supply pressure detected';
-        const lastCapTxt = scheduleStatus?.lastExternalCaptureAt
-          ? new Date(scheduleStatus.lastExternalCaptureAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
-          : (snapshot?.capturedAt
-              ? new Date(snapshot.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
-              : '—');
-        return (
-          <div style={{ ...sectionWrap, paddingTop: 14, paddingBottom: 14 }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
-              <div style={{ ...sectionTitle, marginBottom: 0 }}>Executive summary</div>
-              <div style={{ fontSize: '0.78rem', color: headlineColor, fontWeight: 'bold', fontFamily: 'monospace' }}>
-                {headlineText}
-              </div>
-              <div style={{ marginLeft: 'auto', fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace' }}>
-                Last capture: {lastCapTxt}
-              </div>
-            </div>
-            <div style={{
-              display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10,
-              fontFamily: 'monospace',
-            }}>
-              {[
-                { label: 'Tracked parts',        value: totalParts,                  sub: 'watched universe',                                color: '#e0eaf8' },
-                { label: 'Captured',             value: `${capturedParts}/${totalParts}`, sub: failedParts > 0 ? `${failedParts} failed` : 'last run', color: capturedParts === totalParts ? '#4dffc3' : '#f0a84e' },
-                { label: 'Direct TI priced',     value: `${pricedParts}/${totalParts}`,    sub: 'TI Store API',                                color: pricedParts === totalParts ? '#4dffc3' : '#f0a84e' },
-                { label: 'In stock',             value: inStockParts,                sub: totalParts ? `${Math.round(inStockParts/Math.max(1,totalParts)*100)}%` : '',         color: '#4dffc3' },
-                { label: 'Out of stock',         value: outOfStockParts,             sub: totalParts ? `${Math.round(outOfStockParts/Math.max(1,totalParts)*100)}%` : '',      color: '#f0a84e' },
-                { label: 'Shortage pressure',    value: shortagePressure,            sub: 'inv ↓ + price ↑',                                 color: shortagePressure > 0 ? '#f05c5c' : '#7a96b8' },
-                { label: 'Oversupply pressure',  value: oversupplyPressure,          sub: 'inv ↑ + price ↓',                                 color: oversupplyPressure > 0 ? '#3d8ef0' : '#7a96b8' },
-                { label: 'Inventory tightening', value: inventoryTightening,         sub: 'inv ↓ price flat',                                color: inventoryTightening > 0 ? '#f0a84e' : '#7a96b8' },
-                { label: 'Supply easing',        value: supplyEasing,                sub: 'inv ↑ price flat',                                color: supplyEasing > 0 ? '#00c9a7' : '#7a96b8' },
-              ].map(k => (
-                <div key={k.label} style={{ padding: '10px 12px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
-                  <div style={{ ...tinyLabel, marginBottom: 2 }}>{k.label}</div>
-                  <div style={{ color: k.color, fontSize: '1.1rem', lineHeight: 1.1 }}>{k.value}</div>
-                  {k.sub && <div style={{ color: '#7a96b8', fontSize: '0.58rem', marginTop: 2 }}>{k.sub}</div>}
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* ── Universe summary cards (Phase 20D) ── */}
-      <div style={sectionWrap}>
-        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-          <KpiCard
-            label="Total watched parts"
-            value={total ?? '—'}
-            sub={summary && summary.capturedParts !== summary.totalParts
-              ? `${summary.capturedParts}/${summary.totalParts} captured${summary.failedParts > 0 ? ` · ${summary.failedParts} failed` : ''}`
-              : (snapshotParts.length > 0 ? `${snapshotParts.length} captured` : (snapshotLoading ? 'loading…' : 'pending capture'))}
-            color="#e0eaf8"
-          />
-          <KpiCard
-            label="In-stock parts"
-            value={inStock}
-            sub={total ? `${Math.round((inStock / Math.max(1, total)) * 100)}% of universe` : 'pending capture'}
-            color={inStock > 0 ? '#4dffc3' : '#c4d4e8'}
-          />
-          <KpiCard
-            label="Out-of-stock parts"
-            value={outOfStock}
-            sub={total ? `${Math.round((outOfStock / Math.max(1, total)) * 100)}% of universe` : 'pending capture'}
-            color={outOfStock > 0 ? '#f0a84e' : '#c4d4e8'}
-          />
-          <KpiCard
-            label="Longest lead time"
-            value={longestLabel}
-            sub={longestSub}
-            color={longestLead ? '#f0a84e' : '#c4d4e8'}
-          />
-          <KpiCard
-            label="Baskets covered"
-            value={basketsCovered}
-            sub={`median lead ${medianLabel}${activeCount != null ? ` · ${activeCount} active` : ''}`}
-            color="#c4d4e8"
-          />
-        </div>
-        {snapshotError && snapshotParts.length === 0 && (
-          <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#f0a84e' }}>
-            {snapshotError} The watched-parts inventory snapshot will appear here once an operator runs a capture.
-          </div>
-        )}
+      {/* Category supply table */}
+      <div style={sectionTitle}>Category supply</div>
+      <div style={{ overflowX: 'auto', marginBottom: 24, border: `1px solid ${B}`, borderRadius: 6 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'monospace', fontSize: '0.7rem' }}>
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${B}`, background: '#0a0f18' }}>
+              <th style={headerCell}>Group</th>
+              <th style={headerCell}>Subcategory</th>
+              <th style={headerCellRight}>Parts tracked</th>
+              <th style={headerCellRight}>In stock</th>
+              <th style={headerCellRight}>Out of stock</th>
+              <th style={headerCellCenter}>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.canonical}
+                onClick={() => openCategory(r)}
+                style={{ cursor: 'pointer', transition: 'background 0.12s' }}
+                onMouseEnter={e => e.currentTarget.style.background = 'rgba(61,142,240,0.08)'}
+                onMouseLeave={e => e.currentTarget.style.background = ''}
+                title="Click to see parts in this category"
+              >
+                <td style={{ ...dataCell, color: '#7a96b8' }}>{r.group}</td>
+                <td style={{ ...dataCell, color: '#e0eaf8' }}>{r.label}</td>
+                <td style={{ ...dataCell, textAlign: 'right' }}>{r.partsTracked.toLocaleString()}</td>
+                <td style={{ ...dataCell, textAlign: 'right', color: '#00c9a7' }}>{r.stockedPct != null ? `${r.stockedPct.toFixed(1)}%` : '—'}</td>
+                <td style={{ ...dataCell, textAlign: 'right', color: '#f05c5c' }}>{r.outOfStockCount.toLocaleString()}</td>
+                <td style={{ ...dataCell, textAlign: 'center', color: r.statusColor, fontWeight: 'bold' }}>{r.status}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
-      {/* ── Phase 22.5 — Category Heatmap ────────────────────────────────
-           Answers "Which TI category is tightening or easing?". Groups
-           the captured parts by basket × subcategory and rolls up
-           captured % / priced % / in-stock % / out-of-stock % / median
-           lead time / per-signal counts. Subcategory comes from
-           /watched-parts/catalog (joined by partNumber). Rendered as a
-           compact table because heatmap colour blocks added without
-           clear axes have hurt readability in past phases. */}
-      {(() => {
-        const parts = snapshot?.parts || [];
-        if (parts.length === 0) return null;
-        // Subcategory map from watched-parts catalog (Phase 22.5).
-        const subcatByOpn = new Map();
-        if (watchedCatalog?.parts) {
-          for (const p of watchedCatalog.parts) {
-            subcatByOpn.set(p.preferredOrderablePartNumber, p.subcategory ?? null);
-          }
-        }
-        // Signal type per part — used to count shortage/oversupply etc.
-        const sigByOpn = new Map();
-        for (const s of (signalsResp?.signals || [])) {
-          if (s.partNumber) sigByOpn.set(s.partNumber, s);
-        }
-        // Group by (basket, subcategory).
-        const groups = new Map();
-        for (const p of parts) {
-          const basket = p.basket || '—';
-          const subcat = subcatByOpn.get(p.partNumber) || '—';
-          const key = `${basket}${subcat}`;
-          if (!groups.has(key)) {
-            groups.set(key, {
-              basket, subcategory: subcat,
-              tracked: 0, captured: 0, priced: 0,
-              inStock: 0, outOfStock: 0,
-              leadTimes: [],
-              shortagePressure: 0, oversupplyPressure: 0,
-              inventoryTightening: 0, supplyEasing: 0,
-            });
-          }
-          const g = groups.get(key);
-          g.tracked += 1;
-          // Treat any row served by /inventory/latest as "captured" (the
-          // endpoint only returns captured parts).
-          g.captured += 1;
-          if (p.normalizedUnitPrice != null) g.priced += 1;
-          const supply = p.signals?.supplyStatus;
-          if (supply === 'in_stock') g.inStock += 1;
-          else if (supply === 'out_of_stock') g.outOfStock += 1;
-          if (p.leadTimeWeeks != null && Number.isFinite(p.leadTimeWeeks)) g.leadTimes.push(p.leadTimeWeeks);
-          const sig = sigByOpn.get(p.partNumber);
-          if (sig) {
-            switch (sig.signalType) {
-              case 'shortage_pressure':    g.shortagePressure += 1; break;
-              case 'oversupply_pressure':  g.oversupplyPressure += 1; break;
-              case 'inventory_tightening': g.inventoryTightening += 1; break;
-              case 'supply_easing':        g.supplyEasing += 1; break;
-            }
-          }
-        }
-        const rows = Array.from(groups.values()).map(g => {
-          const median = g.leadTimes.length === 0 ? null
-            : (() => {
-                const sorted = g.leadTimes.slice().sort((a,b)=>a-b);
-                const m = Math.floor(sorted.length/2);
-                return sorted.length % 2 === 1 ? sorted[m] : (sorted[m-1]+sorted[m])/2;
-              })();
-          return { ...g, medianLeadTime: median, pressureScore: g.shortagePressure*4 + g.inventoryTightening*2 + g.oversupplyPressure*1 };
-        });
-        // Sort: pressure first (descending shortage/tightening), then largest tracked.
-        rows.sort((a, b) => b.pressureScore - a.pressureScore || b.tracked - a.tracked || a.basket.localeCompare(b.basket) || a.subcategory.localeCompare(b.subcategory));
-        const pct = (n, d) => d > 0 ? `${Math.round(n/d*100)}%` : '—';
-        const colorPct = (p, hot, neutral) => p >= 0.5 ? hot : p > 0 ? neutral : '#7a96b8';
-        const totalPressure = rows.reduce((s, r) => s + r.shortagePressure + r.oversupplyPressure + r.inventoryTightening + r.supplyEasing, 0);
-        return (
-          <div style={sectionWrap}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 8 }}>
-              <div style={sectionTitle}>Category heatmap</div>
-              <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic' }}>
-                {totalPressure > 0
-                  ? `Sorted by pressure score · ${rows.length} categories`
-                  : `${rows.length} categories — no pressure detected yet, sort follows tracked-parts size`}
+      {/* Biggest changes (trend-driven) */}
+      {trendsAvail.length > 0 ? (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
+            <div>
+              <div style={sectionTitle}>Biggest stock drops</div>
+              <div style={{ border: `1px solid ${B}`, borderRadius: 6, overflow: 'hidden' }}>
+                {biggestDrops.length === 0
+                  ? <div style={{ padding: '10px 12px', color: '#7a96b8', fontSize: '0.7rem', fontStyle: 'italic' }}>No drops detected.</div>
+                  : biggestDrops.map(r => <ChangeRow key={r.canonical} row={r} deltaColor="#f05c5c" />)}
               </div>
             </div>
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ borderCollapse: 'collapse', minWidth: 1100, width: '100%', fontFamily: 'monospace', fontSize: '0.66rem' }}>
-                <thead>
-                  <tr>
-                    <th style={cellTH}>Basket</th>
-                    <th style={cellTH}>Subcategory</th>
-                    <th style={{ ...cellTH, textAlign: 'right' }}>Tracked</th>
-                    <th style={{ ...cellTH, textAlign: 'right' }}>Captured</th>
-                    <th style={{ ...cellTH, textAlign: 'right' }}>Priced</th>
-                    <th style={{ ...cellTH, textAlign: 'right' }}>In stock</th>
-                    <th style={{ ...cellTH, textAlign: 'right' }}>OoS</th>
-                    <th style={{ ...cellTH, textAlign: 'right' }}>Median lead</th>
-                    <th style={{ ...cellTH, textAlign: 'right', color: '#f05c5c' }}>Shortage</th>
-                    <th style={{ ...cellTH, textAlign: 'right', color: '#3d8ef0' }}>Oversupply</th>
-                    <th style={{ ...cellTH, textAlign: 'right', color: '#f0a84e' }}>Tightening</th>
-                    <th style={{ ...cellTH, textAlign: 'right', color: '#00c9a7' }}>Easing</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={i}>
-                      <td style={{ ...cellTD, color: '#a0b8d0' }}>{r.basket}</td>
-                      <td style={{ ...cellTD, color: r.subcategory === '—' ? '#7a96b8' : '#c4d4e8' }}>{r.subcategory}</td>
-                      <td style={{ ...cellMono, textAlign: 'right' }}>{r.tracked}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: r.captured === r.tracked ? '#4dffc3' : '#f0a84e' }}>{pct(r.captured, r.tracked)}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: r.priced === r.tracked ? '#4dffc3' : r.priced > 0 ? '#f0a84e' : '#7a96b8' }}>{pct(r.priced, r.tracked)}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: colorPct(r.inStock/Math.max(1,r.tracked), '#4dffc3', '#a0b8d0') }}>{pct(r.inStock, r.tracked)}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: colorPct(r.outOfStock/Math.max(1,r.tracked), '#f0a84e', '#a0b8d0') }}>{pct(r.outOfStock, r.tracked)}</td>
-                      <td style={{ ...cellMono, textAlign: 'right' }}>{r.medianLeadTime == null ? '—' : `${r.medianLeadTime} wk`}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: r.shortagePressure > 0 ? '#f05c5c' : '#7a96b8', fontWeight: r.shortagePressure > 0 ? 'bold' : 'normal' }}>{r.shortagePressure || '—'}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: r.oversupplyPressure > 0 ? '#3d8ef0' : '#7a96b8', fontWeight: r.oversupplyPressure > 0 ? 'bold' : 'normal' }}>{r.oversupplyPressure || '—'}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: r.inventoryTightening > 0 ? '#f0a84e' : '#7a96b8' }}>{r.inventoryTightening || '—'}</td>
-                      <td style={{ ...cellMono, textAlign: 'right', color: r.supplyEasing > 0 ? '#00c9a7' : '#7a96b8' }}>{r.supplyEasing || '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div>
+              <div style={sectionTitle}>Biggest stock builds</div>
+              <div style={{ border: `1px solid ${B}`, borderRadius: 6, overflow: 'hidden' }}>
+                {biggestBuilds.length === 0
+                  ? <div style={{ padding: '10px 12px', color: '#7a96b8', fontSize: '0.7rem', fontStyle: 'italic' }}>No builds detected.</div>
+                  : biggestBuilds.map(r => <ChangeRow key={r.canonical} row={r} deltaColor="#4dffc3" />)}
+              </div>
             </div>
           </div>
-        );
-      })()}
-      </>)}
 
-      {inventorySubTab === 'signals' && (<>
-      {/* ── Shortage / Oversupply Signals (Phase 21G / 21K) ── */}
-      {(() => {
-        const sigSummary = signalsResp?.summary;
-        const sigList = signalsResp?.signals || [];
-        const meaningful = sigList.filter(s => s.signalType !== 'insufficient_history' && s.signalType !== 'normal');
-        const insufficient = sigList.filter(s => s.signalType === 'insufficient_history').length;
-        // Phase 21K — history depth read-out so customers can see how close
-        // we are to having enough observations to leave insufficient_history.
-        // Phase 21A — both /signals (singular) and /signals/latest (plural)
-        // can drive this feed; tolerate either name.
-        const obsCounts = sigList.map(s => s.observationCount ?? s.observationsCount ?? 0);
-        const minObs = obsCounts.length > 0 ? Math.min(...obsCounts) : 0;
-        const maxObs = obsCounts.length > 0 ? Math.max(...obsCounts) : 0;
-        const sortedObs = [...obsCounts].sort((a, b) => a - b);
-        const medianObs = sortedObs.length > 0
-          ? (sortedObs.length % 2 === 0
-              ? (sortedObs[sortedObs.length / 2 - 1] + sortedObs[sortedObs.length / 2]) / 2
-              : sortedObs[(sortedObs.length - 1) / 2])
-          : 0;
-        const sigColor = t => t === 'shortage_pressure' ? '#f05c5c'
-          : t === 'oversupply_pressure' ? '#3d8ef0'
-          : t === 'inventory_tightening' ? '#f0a84e'
-          : t === 'supply_easing' ? '#00c9a7'
-          : t === 'price_only_pressure' ? '#ab6af0'
-          : t === 'normal' ? '#7a96b8'
-          : '#4a6a8a';
-        const sigLabel = t => t === 'shortage_pressure' ? 'Shortage pressure'
-          : t === 'oversupply_pressure' ? 'Oversupply pressure'
-          : t === 'inventory_tightening' ? 'Inventory tightening'
-          : t === 'supply_easing' ? 'Supply easing'
-          : t === 'price_only_pressure' ? 'Price-only pressure'
-          : t === 'normal' ? 'Normal'
-          : 'Insufficient history';
-        return (
-          <div style={sectionWrap}>
-            <div style={{ ...sectionTitle, marginBottom: 8 }}>Shortage / Oversupply Signals</div>
-            {/* Phase 21E — Signal Readiness card. Compact panel above the
-                KPIs that confirms the engine is wired and shows what
-                inputs it has. Numbers come from the same data sources
-                the rest of the strip uses; no new fetches. */}
-            {(() => {
-              const totalParts = sigList.length || (signalsResp?.summary?.total ?? 0);
-              const partsWithInvHistory = historySummary?.partsWithHistory ?? 0;
-              const partsWithDirectPrice = sigList.filter(s => s.latestNormalizedUnitPrice != null).length;
-              const partsWith2PlusPriced = sigList.filter(s =>
-                s.latestNormalizedUnitPrice != null && s.previousNormalizedUnitPrice != null,
-              ).length;
-              const meaningfulCount = (sigSummary?.shortagePressure ?? 0)
-                + (sigSummary?.oversupplyPressure ?? 0)
-                + (sigSummary?.inventoryTightening ?? 0)
-                + (sigSummary?.supplyEasing ?? 0)
-                + (sigSummary?.priceOnlyPressure ?? 0);
-              const engineActive = partsWithInvHistory > 0;
-              return (
-                <div style={{
-                  marginBottom: 12, padding: '10px 14px',
-                  background: '#080c14', border: '1px solid #1a2740', borderRadius: 4,
-                  display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '4px 18px',
-                  fontFamily: 'monospace', fontSize: '0.66rem',
-                }}>
-                  <div>
-                    <div style={{ ...tinyLabel, marginBottom: 2 }}>Signal readiness</div>
-                    <div style={{ color: engineActive ? '#4dffc3' : '#7a96b8', fontSize: '0.78rem' }}>
-                      {engineActive ? 'Engine active' : 'Engine inactive'}
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Inventory history</div>
-                    <div style={{ color: '#e0eaf8', marginTop: 2 }}>{partsWithInvHistory}/{totalParts}</div>
-                  </div>
-                  <div>
-                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Direct TI price history</div>
-                    <div style={{ color: partsWithDirectPrice > 0 ? '#4dffc3' : '#a0b8d0', marginTop: 2 }}>
-                      {partsWithDirectPrice}/{totalParts}
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>2+ priced observations</div>
-                    <div style={{ color: partsWith2PlusPriced > 0 ? '#4dffc3' : '#f0a84e', marginTop: 2 }}>
-                      {partsWith2PlusPriced}/{totalParts}
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Current result</div>
-                    <div style={{ color: meaningfulCount > 0 ? '#f0a84e' : '#a0b8d0', marginTop: 2 }}>
-                      {meaningfulCount > 0 ? `${meaningfulCount} active` : 'No pressure detected'}
-                    </div>
-                  </div>
-                </div>
-              );
-            })()}
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
-              <KpiCard
-                label="Shortage pressure"
-                value={sigSummary?.shortagePressure ?? 0}
-                sub={sigSummary?.shortagePressure ? 'inv falling, price rising' : 'none detected'}
-                color={sigSummary?.shortagePressure ? '#f05c5c' : '#c4d4e8'}
-              />
-              <KpiCard
-                label="Oversupply pressure"
-                value={sigSummary?.oversupplyPressure ?? 0}
-                sub={sigSummary?.oversupplyPressure ? 'inv rising, price falling' : 'none detected'}
-                color={sigSummary?.oversupplyPressure ? '#3d8ef0' : '#c4d4e8'}
-              />
-              <KpiCard
-                label="Inventory tightening"
-                value={sigSummary?.inventoryTightening ?? 0}
-                sub="inv falling, price flat"
-                color={sigSummary?.inventoryTightening ? '#f0a84e' : '#c4d4e8'}
-              />
-              <KpiCard
-                label="Supply easing"
-                value={sigSummary?.supplyEasing ?? 0}
-                sub="inv rising, price flat"
-                color={sigSummary?.supplyEasing ? '#00c9a7' : '#c4d4e8'}
-              />
-              <KpiCard
-                label="Insufficient history"
-                value={insufficient}
-                sub="<3 captures recorded"
-                color="#7a96b8"
-              />
-            </div>
-            {/* Phase 22.5 — Signal Leaderboard. 9 ranked tabs over the
-                same /signals/latest payload. Five filter by signalType
-                (shortage_pressure / oversupply_pressure / inventory_
-                tightening / supply_easing / price_only_pressure); four
-                sort by largest |delta| (inventory drops/builds, price
-                increases/decreases). Empty-state per tab is honest:
-                "No N detected." */}
-            {(() => {
-              const TABS = [
-                { id: 'shortage_pressure',    label: 'Shortage pressure',     color: '#f05c5c', kind: 'type' },
-                { id: 'oversupply_pressure',  label: 'Oversupply pressure',   color: '#3d8ef0', kind: 'type' },
-                { id: 'inventory_tightening', label: 'Inventory tightening',  color: '#f0a84e', kind: 'type' },
-                { id: 'supply_easing',        label: 'Supply easing',         color: '#00c9a7', kind: 'type' },
-                { id: 'price_only_pressure',  label: 'Price-only pressure',   color: '#ab6af0', kind: 'type' },
-                { id: 'inventory_drops',      label: 'Largest inventory drops',     color: '#f0a84e', kind: 'rank', sort: 'invDesc' },
-                { id: 'inventory_builds',     label: 'Largest inventory builds',    color: '#4dffc3', kind: 'rank', sort: 'invAsc' },
-                { id: 'price_increases',      label: 'Largest price increases',     color: '#f05c5c', kind: 'rank', sort: 'priceAsc' },
-                { id: 'price_decreases',      label: 'Largest price decreases',     color: '#4dffc3', kind: 'rank', sort: 'priceDesc' },
-              ];
-              const active = TABS.find(t => t.id === leaderboardTab) || TABS[0];
-              const fmtPct = v => v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
-              const fmtPrice = v => v == null ? '—' : `$${Number(v).toFixed(4)}`;
-              let rows = [];
-              if (active.kind === 'type') {
-                rows = sigList.filter(s => s.signalType === active.id);
-              } else {
-                // Rank tabs: sort all rows by abs delta direction. We take
-                // the per-row priceDelta / inventoryPctDelta from the
-                // persisted signal (latest-vs-previous; Phase 21A.3).
-                rows = sigList.slice();
-                if (active.sort === 'invDesc') {
-                  rows = rows.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta < 0)
-                    .sort((a, b) => a.inventoryPctDelta - b.inventoryPctDelta);
-                } else if (active.sort === 'invAsc') {
-                  rows = rows.filter(s => s.inventoryPctDelta != null && s.inventoryPctDelta > 0)
-                    .sort((a, b) => b.inventoryPctDelta - a.inventoryPctDelta);
-                } else if (active.sort === 'priceAsc') {
-                  rows = rows.filter(s => s.pricePctDelta != null && s.pricePctDelta > 0)
-                    .sort((a, b) => b.pricePctDelta - a.pricePctDelta);
-                } else if (active.sort === 'priceDesc') {
-                  rows = rows.filter(s => s.pricePctDelta != null && s.pricePctDelta < 0)
-                    .sort((a, b) => a.pricePctDelta - b.pricePctDelta);
-                }
-              }
-              const top = rows.slice(0, 15);
-              const totalUniverse = sigList.length;
-              const meaningfulTotal = sigList.filter(s => ['shortage_pressure','oversupply_pressure','inventory_tightening','supply_easing','price_only_pressure'].includes(s.signalType)).length;
-              return (
-                <div>
-                  {/* Tab strip */}
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 10, paddingBottom: 6, borderBottom: '1px solid #1a2740' }}>
-                    {TABS.map(t => {
-                      const on = t.id === active.id;
-                      const count = t.kind === 'type'
-                        ? sigList.filter(s => s.signalType === t.id).length
-                        : null;
-                      return (
-                        <button
-                          key={t.id}
-                          type="button"
-                          onClick={() => setLeaderboardTab(t.id)}
-                          style={{
-                            background: on ? '#0d1830' : 'none',
-                            border: '1px solid ' + (on ? t.color : '#1a2740'),
-                            borderRadius: 3,
-                            padding: '5px 10px',
-                            fontSize: '0.6rem',
-                            letterSpacing: '0.08em',
-                            textTransform: 'uppercase',
-                            color: on ? t.color : '#7a96b8',
-                            cursor: 'pointer',
-                            fontFamily: 'monospace',
-                            fontWeight: on ? 'bold' : 'normal',
-                          }}
-                        >{t.label}{count != null ? ` (${count})` : ''}</button>
-                      );
-                    })}
-                  </div>
-
-                  {top.length === 0 ? (
-                    <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic', lineHeight: 1.5, padding: '8px 0' }}>
-                      {meaningfulTotal === 0
-                        ? 'No pressure detected yet. Inventory and direct TI pricing are currently stable across the watched universe.'
-                        : `No ${active.label.toLowerCase()} in the current snapshot.`}
-                      {(() => {
-                        const priceUnavail = sigSummary?.priceUnavailableCount ?? 0;
-                        const firstPriced = sigList.filter(s => /Direct TI Store price captured; waiting for a second pricing observation/i.test(s.explanation || '')).length;
-                        if (totalUniverse > 0 && priceUnavail === totalUniverse) {
-                          return (
-                            <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
-                              Current TI Store API responses are returning inventory units but no normalized
-                              price breaks for this watched set. The dashboard therefore shows
-                              inventory-only monitoring until a pricing source is available.
-                            </div>
-                          );
-                        }
-                        if (firstPriced > 0) {
-                          return (
-                            <div style={{ marginTop: 8, color: '#a0b8d0', fontStyle: 'normal' }}>
-                              Direct TI Store prices are now captured for the watched universe.
-                              Price-trend classifications require two pricing-bearing captures.
-                              Currently {firstPriced} of {totalUniverse} rows are waiting for the next
-                              capture before shortage / oversupply pressure can be calculated.
-                            </div>
-                          );
-                        }
-                        return null;
-                      })()}
-                    </div>
-                  ) : (
-                    <div style={{ overflowX: 'auto' }}>
-                      <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: 900, fontFamily: 'monospace', fontSize: '0.66rem' }}>
-                        <thead>
-                          <tr>
-                            <th style={cellTH}>Part</th>
-                            <th style={cellTH}>Basket</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Inv now</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Inv prev</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Inv Δ%</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Price now</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Price prev</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Price Δ%</th>
-                            <th style={cellTH}>Signal</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {top.map((s, idx) => (
-                            <tr key={`lb-${active.id}-${s.partNumber || idx}`}>
-                              <td style={cellMono}>
-                                {s.partNumber || s.orderablePartNumber}
-                                {s.displayName && <span style={{ color: '#7a96b8', marginLeft: 6, fontSize: '0.6rem' }}>· {s.displayName}</span>}
-                              </td>
-                              <td style={{ ...cellTD, color: '#a0b8d0' }}>{s.basket || '—'}</td>
-                              <td style={{ ...cellMono, textAlign: 'right' }}>{s.latestQuantityAvailable != null ? Number(s.latestQuantityAvailable).toLocaleString() : '—'}</td>
-                              <td style={{ ...cellMono, textAlign: 'right', color: '#a0b8d0' }}>{s.previousQuantityAvailable != null ? Number(s.previousQuantityAvailable).toLocaleString() : '—'}</td>
-                              <td style={{ ...cellMono, textAlign: 'right', color: s.inventoryPctDelta == null ? '#7a96b8' : s.inventoryPctDelta < 0 ? '#f0a84e' : s.inventoryPctDelta > 0 ? '#4dffc3' : '#a0b8d0' }}>
-                                {fmtPct(s.inventoryPctDelta)}
-                              </td>
-                              <td style={{ ...cellMono, textAlign: 'right' }}>{fmtPrice(s.latestNormalizedUnitPrice)}</td>
-                              <td style={{ ...cellMono, textAlign: 'right', color: '#a0b8d0' }}>{fmtPrice(s.previousNormalizedUnitPrice)}</td>
-                              <td style={{ ...cellMono, textAlign: 'right', color: s.pricePctDelta == null ? '#7a96b8' : s.pricePctDelta > 0 ? '#f05c5c' : s.pricePctDelta < 0 ? '#4dffc3' : '#a0b8d0' }}>
-                                {fmtPct(s.pricePctDelta)}
-                              </td>
-                              <td style={{ ...cellTD, color: sigColor(s.signalType), fontWeight: active.kind === 'type' ? 'bold' : 'normal' }}>
-                                {sigLabel(s.signalType)}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-            <div style={{ marginTop: 10, fontSize: '0.7rem', color: '#a0b8d0', lineHeight: 1.5 }}>
-              Shortage / oversupply signals require at least 3 observations. Current history depth: {medianObs} observation{medianObs === 1 ? '' : 's'} per part
-              {minObs !== maxObs && (
-                <span style={{ color: '#7a96b8' }}> (range {minObs}–{maxObs})</span>
-              )}
-              {medianObs < 3 && (
-                <span style={{ color: '#7a96b8' }}> · {3 - Math.ceil(medianObs)} more daily capture{3 - Math.ceil(medianObs) === 1 ? '' : 's'} until classifications can fire</span>
-              )}.
-            </div>
-            <div style={{ marginTop: 4, fontSize: '0.6rem', color: '#7a96b8', fontStyle: 'italic' }}>
-              A daily scheduled capture runs at 04:00–04:45 UTC across four batches; manual captures from Operator tools also append to history. Capture failures are not counted as out-of-stock.
-            </div>
-            {/* Phase 21E — collapsed "Example signal logic" explainer.
-                Static rules table; explicitly labelled as illustrative
-                so the customer never confuses these examples with the
-                live signal table above. */}
-            <details style={{ marginTop: 14, padding: '8px 12px', background: '#0d1422', border: '1px solid #1a2740', borderRadius: 4 }}>
-              <summary style={{ cursor: 'pointer', fontSize: '0.62rem', color: '#a0b8d0', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold' }}>
-                Example signal logic
-              </summary>
-              <div style={{ marginTop: 10, fontSize: '0.66rem', color: '#c4d4e8', lineHeight: 1.6 }}>
-                <div style={{ marginBottom: 8, color: '#7a96b8', fontStyle: 'italic' }}>
-                  These examples are illustrative. The live signal table above uses direct TI captured data only.
-                </div>
-                <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: 'monospace', fontSize: '0.64rem' }}>
-                  <thead>
-                    <tr>
-                      <th style={cellTH}>Inventory</th>
-                      <th style={cellTH}>Price</th>
-                      <th style={cellTH}>Classification</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr>
-                      <td style={{ ...cellMono, color: '#f0a84e' }}>down ≥25% (7d)</td>
-                      <td style={{ ...cellMono, color: '#f05c5c' }}>up ≥5% (7d)</td>
-                      <td style={{ ...cellMono, color: '#f05c5c', fontWeight: 'bold' }}>shortage_pressure</td>
-                    </tr>
-                    <tr>
-                      <td style={{ ...cellMono, color: '#4dffc3' }}>up ≥50% (7d)</td>
-                      <td style={{ ...cellMono, color: '#4dffc3' }}>down ≥5% (7d)</td>
-                      <td style={{ ...cellMono, color: '#3d8ef0', fontWeight: 'bold' }}>oversupply_pressure</td>
-                    </tr>
-                    <tr>
-                      <td style={{ ...cellMono, color: '#f0a84e' }}>down ≥25% (7d)</td>
-                      <td style={{ ...cellMono, color: '#7a96b8' }}>flat or unavailable</td>
-                      <td style={{ ...cellMono, color: '#f0a84e', fontWeight: 'bold' }}>inventory_tightening</td>
-                    </tr>
-                    <tr>
-                      <td style={{ ...cellMono, color: '#4dffc3' }}>up ≥50% (7d)</td>
-                      <td style={{ ...cellMono, color: '#7a96b8' }}>flat or unavailable</td>
-                      <td style={{ ...cellMono, color: '#00c9a7', fontWeight: 'bold' }}>supply_easing</td>
-                    </tr>
-                    <tr>
-                      <td style={{ ...cellMono, color: '#7a96b8' }}>flat / up</td>
-                      <td style={{ ...cellMono, color: '#f05c5c' }}>up ≥5% (7d)</td>
-                      <td style={{ ...cellMono, color: '#ab6af0', fontWeight: 'bold' }}>price_only_pressure</td>
-                    </tr>
-                  </tbody>
-                </table>
-                <div style={{ marginTop: 10, fontSize: '0.6rem', color: '#7a96b8', lineHeight: 1.5 }}>
-                  Operators can verify these rules end-to-end against the production engine via
-                  <code style={{ marginLeft: 4, padding: '1px 4px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 2, color: '#a0b8d0' }}>
-                    GET /api/ti/inventory/signal-simulator
-                  </code>
-                  (auth-gated, read-only, no D1 write).
-                </div>
-              </div>
-            </details>
-          </div>
-        );
-      })()}
-      </>)}
-
-      {inventorySubTab === 'trends' && (
-        <div style={sectionWrap}>
-          <div style={{ ...sectionTitle, marginBottom: 8 }}>Trends</div>
-          <div style={{ fontSize: '0.7rem', color: '#a0b8d0', maxWidth: 920, marginBottom: 12 }}>
-            Drill into the watched universe at four scopes: the whole universe, a single basket,
-            a subcategory inside a basket, or one part. Inventory and direct TI Store price are
-            sourced from the captured D1 history. Pricing series only renders when the TI Store
-            API has returned price breaks — otherwise we say so explicitly rather than fabricating
-            a price line.
-          </div>
-
-          {/* Phase 23A — scope + window controls. The existing part picker
-              stays visible only when scope === 'part'; basket/subcategory
-              dropdowns appear when their scope is selected. Trigger fetch
-              for aggregate scopes on change. */}
-          {(() => {
-            const partsAll = (snapshot?.parts || []);
-            const catalogParts = (watchedCatalog?.parts || []);
-            const subcatByOpn = new Map(catalogParts.map(p => [p.preferredOrderablePartNumber, p.subcategory ?? null]));
-            const basketsAvailable = Array.from(new Set(partsAll.map(p => p.basket).filter(Boolean))).sort();
-            const subcategoriesAvailable = trendsBasket
-              ? Array.from(new Set(
-                  partsAll
-                    .filter(p => p.basket === trendsBasket)
-                    .map(p => subcatByOpn.get(p.partNumber))
-                    .filter(s => s != null && s !== ''),
-                )).sort()
-              : [];
-            const windowOptions = ['7d', '30d', '90d', 'all'];
-            const scopes = [
-              { id: 'universe', label: 'Universe' },
-              { id: 'basket', label: 'Basket' },
-              { id: 'subcategory', label: 'Subcategory' },
-              { id: 'part', label: 'Part' },
-            ];
-            // Auto-trigger aggregate fetch when scope/basket/subcategory/window
-            // resolves to a complete query. Defensive: subcategory needs basket.
-            if (trendsScope !== 'part') {
-              const ok =
-                (trendsScope === 'universe') ||
-                (trendsScope === 'basket' && trendsBasket) ||
-                (trendsScope === 'subcategory' && trendsBasket && trendsSubcategory);
-              if (ok) {
-                fetchTrendsAggregate(trendsScope, trendsBasket, trendsSubcategory, trendsWindow);
-              }
-            }
-            return (
-              <div style={{
-                marginBottom: 14, padding: '10px 12px',
-                background: '#0d1422', border: '1px solid #1a2740', borderRadius: 4,
-                display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap',
-              }}>
-                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                  {scopes.map(s => {
-                    const on = trendsScope === s.id;
-                    return (
-                      <button
-                        key={s.id}
-                        type="button"
-                        onClick={() => {
-                          setTrendsScope(s.id);
-                          // Reset narrower selectors when widening scope so
-                          // the dropdowns don't carry stale state.
-                          if (s.id === 'universe') { setTrendsBasket(''); setTrendsSubcategory(''); }
-                          if (s.id === 'basket') { setTrendsSubcategory(''); }
-                        }}
-                        style={{
-                          background: on ? '#0d1830' : 'none',
-                          border: '1px solid ' + (on ? '#3d8ef0' : '#1a2740'),
-                          borderRadius: 3,
-                          padding: '5px 12px',
-                          fontSize: '0.62rem',
-                          letterSpacing: '0.10em',
-                          textTransform: 'uppercase',
-                          color: on ? '#e0eaf8' : '#7a96b8',
-                          cursor: 'pointer',
-                          fontFamily: 'monospace',
-                          fontWeight: on ? 'bold' : 'normal',
-                        }}
-                      >{s.label}</button>
-                    );
-                  })}
-                </div>
-                {(trendsScope === 'basket' || trendsScope === 'subcategory') && (
-                  <select
-                    value={trendsBasket}
-                    onChange={e => { setTrendsBasket(e.target.value); setTrendsSubcategory(''); }}
-                    style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.7rem', borderRadius: 3, minWidth: 200 }}
-                  >
-                    <option value="">— pick basket —</option>
-                    {basketsAvailable.map(b => <option key={b} value={b}>{b}</option>)}
-                  </select>
-                )}
-                {trendsScope === 'subcategory' && (
-                  <select
-                    value={trendsSubcategory}
-                    onChange={e => setTrendsSubcategory(e.target.value)}
-                    disabled={!trendsBasket}
-                    style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.7rem', borderRadius: 3, minWidth: 200, opacity: trendsBasket ? 1 : 0.4 }}
-                  >
-                    <option value="">— pick subcategory —</option>
-                    {subcategoriesAvailable.map(s => <option key={s} value={s}>{s}</option>)}
-                  </select>
-                )}
-                <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-                  {windowOptions.map(w => {
-                    const on = trendsWindow === w;
-                    return (
-                      <button
-                        key={w}
-                        type="button"
-                        onClick={() => setTrendsWindow(w)}
-                        style={{
-                          background: on ? '#0d1830' : 'none',
-                          border: '1px solid ' + (on ? '#3d8ef0' : '#1a2740'),
-                          borderRadius: 3,
-                          padding: '4px 10px',
-                          fontSize: '0.6rem',
-                          letterSpacing: '0.10em',
-                          textTransform: 'uppercase',
-                          color: on ? '#e0eaf8' : '#7a96b8',
-                          cursor: 'pointer',
-                          fontFamily: 'monospace',
-                          fontWeight: on ? 'bold' : 'normal',
-                        }}
-                      >{w}</button>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Phase 23A — aggregate scope renderer. Bypassed when scope === 'part';
-              the original part-detail block below renders unchanged in that case. */}
-          {trendsScope !== 'part' && (() => {
-            const ok =
-              (trendsScope === 'universe') ||
-              (trendsScope === 'basket' && trendsBasket) ||
-              (trendsScope === 'subcategory' && trendsBasket && trendsSubcategory);
-            if (!ok) {
-              return (
-                <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
-                  {trendsScope === 'basket'
-                    ? 'Pick a basket to see its trend.'
-                    : 'Pick a basket and subcategory to see the subcategory trend.'}
-                </div>
-              );
-            }
-            const key = `${trendsScope}|${trendsBasket || ''}|${trendsSubcategory || ''}|${trendsWindow}`;
-            const data = trendsAggData[key];
-            if (!data) {
-              return <div style={{ fontSize: '0.7rem', color: '#7a96b8' }}>Loading {trendsScope} trend…</div>;
-            }
-            if (data._error) {
-              return <div style={{ fontSize: '0.7rem', color: '#f0a84e' }}>{data._error}</div>;
-            }
-            const fmtPct = v => v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
-            const fmtPrice = v => v == null ? '—' : `$${Number(v).toFixed(4)}`;
-            const fmtQty = v => v == null ? '—' : Number(v).toLocaleString();
-            const fmtTime = iso => iso ? new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
-            const meaningful = (data.shortagePressureCount || 0) + (data.oversupplyPressureCount || 0)
-              + (data.inventoryTighteningCount || 0) + (data.supplyEasingCount || 0);
-            const scopeLabel = data.scope === 'universe' ? 'The 64-part TI watched universe'
-              : data.scope === 'basket' ? `${data.basket}`
-              : `${data.basket} · ${data.subcategory}`;
-            const conclusion = meaningful === 0
-              ? `${scopeLabel} is stable: no shortage or oversupply pressure detected.`
-              : data.shortagePressureCount > 0
-                ? `${scopeLabel} shows ${data.shortagePressureCount} part${data.shortagePressureCount === 1 ? '' : 's'} under shortage pressure.`
-                : data.oversupplyPressureCount > 0
-                  ? `${scopeLabel} shows ${data.oversupplyPressureCount} part${data.oversupplyPressureCount === 1 ? '' : 's'} under oversupply pressure.`
-                  : `${scopeLabel} shows ${meaningful} part${meaningful === 1 ? '' : 's'} with directional signal.`;
-            const conclusionColor = data.shortagePressureCount > 0 ? '#f05c5c'
-              : data.oversupplyPressureCount > 0 ? '#3d8ef0'
-              : data.inventoryTighteningCount > 0 ? '#f0a84e'
-              : data.supplyEasingCount > 0 ? '#00c9a7'
-              : '#4dffc3';
-            const stockoutPct = data.stockoutRate == null ? null : Math.round(data.stockoutRate * 100);
-            const inStockPct = (data.capturedParts > 0 && data.inStockParts != null)
-              ? Math.round(data.inStockParts / data.capturedParts * 100) : null;
-            const KpiTile = ({ label, value, sub, color }) => (
-              <div style={{ padding: '10px 12px', background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
-                <div style={{ ...tinyLabel, marginBottom: 2 }}>{label}</div>
-                <div style={{ color: color || '#e0eaf8', fontSize: '1.05rem', fontFamily: 'monospace', lineHeight: 1.1 }}>{value}</div>
-                {sub && <div style={{ color: '#7a96b8', fontSize: '0.58rem', marginTop: 2, fontFamily: 'monospace' }}>{sub}</div>}
-              </div>
-            );
-            const MoverList = ({ title, rows, deltaSide, accent }) => (
-              <div>
-                <div style={{ ...tinyLabel, color: accent, marginBottom: 6 }}>{title}</div>
-                {(!rows || rows.length === 0) ? (
-                  <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic', fontFamily: 'monospace', padding: '6px 0' }}>
-                    No movement in this direction within {trendsWindow}.
-                  </div>
-                ) : (
-                  <table style={{ borderCollapse: 'collapse', width: '100%', fontFamily: 'monospace', fontSize: '0.62rem' }}>
-                    <tbody>
-                      {rows.map((r, i) => (
-                        <tr key={r.partNumber + '-' + i}>
-                          <td style={{ ...cellTD, padding: '3px 6px' }}>
-                            {r.partNumber}
-                            {r.displayName && <span style={{ color: '#7a96b8', marginLeft: 6, fontSize: '0.58rem' }}>· {r.displayName}</span>}
-                          </td>
-                          <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right', color: deltaSide === 'inventory'
-                              ? (r.inventoryPctDelta < 0 ? '#f0a84e' : '#4dffc3')
-                              : (r.pricePctDelta > 0 ? '#f05c5c' : '#4dffc3') }}>
-                            {deltaSide === 'inventory'
-                              ? `${fmtPct(r.inventoryPctDelta)} (${fmtQty(r.previousQuantityAvailable)} → ${fmtQty(r.latestQuantityAvailable)})`
-                              : `${fmtPct(r.pricePctDelta)} (${fmtPrice(r.previousNormalizedUnitPrice)} → ${fmtPrice(r.latestNormalizedUnitPrice)})`}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            );
-            return (
-              <div>
-                {/* Conclusion */}
-                <div style={{
-                  padding: '10px 14px', marginBottom: 12,
-                  background: '#080c14', border: '1px solid #1a2740', borderRadius: 4,
-                  borderLeft: `3px solid ${conclusionColor}`,
-                }}>
-                  <div style={{ fontSize: '0.78rem', color: '#e0eaf8', fontFamily: 'monospace', fontWeight: 'bold', lineHeight: 1.4 }}>
-                    {conclusion}
-                  </div>
-                  <div style={{ marginTop: 6, fontSize: '0.62rem', color: '#7a96b8', fontFamily: 'monospace' }}>
-                    Window: {data.window} ({data.windowDays}d) · backend: {data.backend}
-                  </div>
-                </div>
-
-                {/* Summary cards */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 16 }}>
-                  <KpiTile label="Tracked parts" value={data.trackedParts} sub={`captured ${data.capturedParts}/${data.trackedParts}`} />
-                  <KpiTile label="Direct TI priced" value={`${data.pricedParts}/${data.trackedParts}`} sub="TI Store API" color={data.pricedParts === data.trackedParts ? '#4dffc3' : '#f0a84e'} />
-                  <KpiTile label="In stock" value={data.inStockParts ?? '—'} sub={inStockPct == null ? '' : `${inStockPct}% of captured`} color="#4dffc3" />
-                  <KpiTile label="Stockout" value={data.outOfStockParts ?? '—'} sub={stockoutPct == null ? '' : `${stockoutPct}% of captured`} color={data.outOfStockParts > 0 ? '#f0a84e' : '#7a96b8'} />
-                  <KpiTile label="Median lead" value={data.medianLeadTimeWeeks == null ? '—' : `${data.medianLeadTimeWeeks} wk`} sub="latest per part" />
-                  <KpiTile label={`Median Δ inv (${data.window})`}
-                          value={fmtPct(data.medianInventoryPctChange)}
-                          sub="window first → latest"
-                          color={data.medianInventoryPctChange == null ? '#7a96b8' : data.medianInventoryPctChange < 0 ? '#f0a84e' : '#4dffc3'} />
-                  <KpiTile label={`Median Δ price (${data.window})`}
-                          value={fmtPct(data.medianPricePctChange)}
-                          sub="window first → latest"
-                          color={data.medianPricePctChange == null ? '#7a96b8' : data.medianPricePctChange > 0 ? '#f05c5c' : '#4dffc3'} />
-                  <KpiTile label="Shortage" value={data.shortagePressureCount} sub="inv ↓ + price ↑" color={data.shortagePressureCount > 0 ? '#f05c5c' : '#7a96b8'} />
-                  <KpiTile label="Oversupply" value={data.oversupplyPressureCount} sub="inv ↑ + price ↓" color={data.oversupplyPressureCount > 0 ? '#3d8ef0' : '#7a96b8'} />
-                </div>
-
-                {/* Time series — median qty + median price per 5-min bucket */}
-                <div style={{ marginBottom: 16 }}>
-                  <div style={tinyLabel}>Inventory & price trend · {data.timeSeries?.length || 0} capture buckets</div>
-                  {(!data.timeSeries || data.timeSeries.length === 0) ? (
-                    <div style={{ fontSize: '0.66rem', color: '#7a96b8', fontStyle: 'italic', fontFamily: 'monospace', padding: '6px 0' }}>
-                      No history rows in the selected window.
-                    </div>
-                  ) : (
-                    <div style={{ overflowX: 'auto' }}>
-                      <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem', width: '100%', minWidth: 500 }}>
-                        <thead>
-                          <tr>
-                            <th style={cellTH}>Capture bucket</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Parts captured</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Median qty</th>
-                            <th style={{ ...cellTH, textAlign: 'right' }}>Median TI price</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {data.timeSeries.slice().reverse().map((b, i) => (
-                            <tr key={b.bucketAt + '-' + i}>
-                              <td style={{ ...cellTD, padding: '3px 6px' }}>{fmtTime(b.bucketAt)}</td>
-                              <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right' }}>{b.partsCaptured}</td>
-                              <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right' }}>{fmtQty(b.medianQuantity)}</td>
-                              <td style={{ ...cellMono, padding: '3px 6px', textAlign: 'right' }}>{fmtPrice(b.medianNormalizedPrice)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-
-                {/* Top movers inside scope */}
-                <div style={tinyLabel}>Top movers in {trendsScope === 'universe' ? 'the universe' : trendsScope === 'basket' ? trendsBasket : `${trendsBasket} · ${trendsSubcategory}`}</div>
-                <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 14 }}>
-                  <MoverList title="Largest inventory drops"   rows={data.topMovers?.inventoryDrops}    deltaSide="inventory" accent="#f0a84e" />
-                  <MoverList title="Largest inventory builds"  rows={data.topMovers?.inventoryBuilds}   deltaSide="inventory" accent="#4dffc3" />
-                  <MoverList title="Largest price increases"   rows={data.topMovers?.priceIncreases}    deltaSide="price"     accent="#f05c5c" />
-                  <MoverList title="Largest price decreases"   rows={data.topMovers?.priceDecreases}    deltaSide="price"     accent="#4dffc3" />
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Phase 23A — original Part scope renderer (existing behaviour
-              preserved verbatim — runs only when trendsScope === 'part'). */}
-          {trendsScope === 'part' && (() => {
-            const partOptions = (snapshot?.parts || []).map(p => ({ partNumber: p.partNumber, basket: p.basket, displayName: p.displayName }));
-            const selected = trendPart || partOptions[0]?.partNumber || null;
-            const histResp = selected ? historyByPart[selected] : null;
-            // Lazy-load history when a part is selected.
-            if (selected && !histResp) {
-              fetchPartHistory(selected);
-            }
-            return (
-              <>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
-                  <div style={tinyLabel}>Part</div>
-                  <select
-                    value={selected || ''}
-                    onChange={e => setTrendPart(e.target.value)}
-                    style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 280 }}
-                  >
-                    {partOptions.map(p => (
-                      <option key={p.partNumber} value={p.partNumber}>
-                        {p.partNumber}{p.displayName ? ` — ${p.displayName}` : ''}{p.basket ? ` (${p.basket})` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                {!selected ? (
-                  <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>No watched parts loaded yet.</div>
-                ) : !histResp ? (
-                  <div style={{ fontSize: '0.7rem', color: '#7a96b8' }}>Loading history for {selected}…</div>
-                ) : histResp.error ? (
-                  <div style={{ fontSize: '0.7rem', color: '#f0a84e' }}>{histResp.error}</div>
-                ) : (histResp.rows || []).length === 0 ? (
-                  <div style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
-                    No history rows yet for {selected}. Run captures over multiple days to populate the trend.
-                  </div>
-                ) : (() => {
-                  const rows = histResp.rows || [];
-                  const anyPrice = rows.some(r => r.priceAvailable);
-                  // Phase 21C — Part Detail mini-trend. Latest vs immediately
-                  // previous capture, plus observation count and a clear
-                  // pricing-status badge. Compact summary above the existing
-                  // 30-day table; no chart yet.
-                  const latest = rows[rows.length - 1] ?? null;
-                  const previous = rows.length >= 2 ? rows[rows.length - 2] : null;
-                  const latestQty = latest?.quantityAvailable;
-                  const previousQty = previous?.quantityAvailable;
-                  const invDelta = (latestQty != null && previousQty != null) ? (latestQty - previousQty) : null;
-                  const invPctDelta = (latestQty != null && previousQty != null && previousQty !== 0)
-                    ? ((latestQty - previousQty) / Math.abs(previousQty)) * 100
-                    : (latestQty === 0 && previousQty === 0 ? 0 : null);
-                  const fmtQty = q => q == null ? '—' : Number(q).toLocaleString();
-                  const fmtDelta = d => d == null ? '—' : (d > 0 ? `+${Number(d).toLocaleString()}` : Number(d).toLocaleString());
-                  const fmtPct = p => p == null ? '' : ` (${p > 0 ? '+' : ''}${p.toFixed(1)}%)`;
-                  const deltaColor = invDelta == null ? '#7a96b8' : invDelta > 0 ? '#4dffc3' : invDelta < 0 ? '#f0a84e' : '#a0b8d0';
-                  // Phase 21D.2 — TI Store price latest vs previous. Either
-                  // can be null; if previous is null but latest is non-null
-                  // we show a "first priced capture" hint.
-                  const latestPrice = latest?.normalizedUnitPrice ?? null;
-                  const previousPrice = previous?.normalizedUnitPrice ?? null;
-                  const priceDelta = (latestPrice != null && previousPrice != null) ? (latestPrice - previousPrice) : null;
-                  const pricePctDelta = (latestPrice != null && previousPrice != null && previousPrice !== 0)
-                    ? ((latestPrice - previousPrice) / Math.abs(previousPrice)) * 100
-                    : (latestPrice === 0 && previousPrice === 0 ? 0 : null);
-                  const priceDeltaColor = priceDelta == null ? '#7a96b8' : priceDelta > 0 ? '#f05c5c' : priceDelta < 0 ? '#4dffc3' : '#a0b8d0';
-                  const fmtPriceVal = (p, cur) => p == null ? '—' : `${cur || latest?.currency || 'USD'} ${Number(p).toFixed(4)}`;
-                  const fmtPriceDelta = d => d == null ? '—' : (d > 0 ? `+${Number(d).toFixed(4)}` : Number(d).toFixed(4));
-                  const firstPricedHere = latestPrice != null && previousPrice == null;
+          {/* Important moves — price + supply overlay */}
+          {importantMoves.length > 0 && (
+            <>
+              <div style={sectionTitle}>Important moves</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
+                {importantMoves.map(r => {
+                  const phrase = r.priceDelta > 0 && r.stockDelta < 0
+                    ? 'Prices are rising while stock is falling.'
+                    : 'Stock is rising while prices are falling.';
                   return (
-                    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-                      <div style={{ minWidth: 360, flex: 1 }}>
-                        <div style={tinyLabel}>Part detail · {selected}</div>
-                        <div style={{
-                          marginTop: 6, marginBottom: 14, padding: '10px 14px',
-                          background: '#080c14', border: '1px solid #1a2740', borderRadius: 4,
-                          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '6px 14px',
-                          fontFamily: 'monospace', fontSize: '0.66rem',
-                        }}>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Latest inventory</div>
-                            <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>{fmtQty(latestQty)}</div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Previous inventory</div>
-                            <div style={{ color: '#a0b8d0', fontSize: '0.85rem', marginTop: 2 }}>{fmtQty(previousQty)}</div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Inventory Δ</div>
-                            <div style={{ color: deltaColor, fontSize: '0.85rem', marginTop: 2 }}>
-                              {fmtDelta(invDelta)}<span style={{ fontSize: '0.62rem', color: '#7a96b8' }}>{fmtPct(invPctDelta)}</span>
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Latest TI price</div>
-                            <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>
-                              {fmtPriceVal(latestPrice, latest?.currency)}
-                              {latestPrice != null && (
-                                <span style={{ color: '#7a96b8', fontSize: '0.6rem', marginLeft: 4 }}>
-                                  @ {Number(latest?.normalizedPriceQty || 1).toLocaleString()}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Previous TI price</div>
-                            <div style={{ color: '#a0b8d0', fontSize: '0.85rem', marginTop: 2 }}>
-                              {fmtPriceVal(previousPrice, previous?.currency)}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Price Δ</div>
-                            <div style={{ color: priceDeltaColor, fontSize: '0.85rem', marginTop: 2 }}>
-                              {fmtPriceDelta(priceDelta)}<span style={{ fontSize: '0.62rem', color: '#7a96b8' }}>{fmtPct(pricePctDelta)}</span>
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Observations</div>
-                            <div style={{ color: '#e0eaf8', fontSize: '0.85rem', marginTop: 2 }}>{rows.length}</div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Latest captured</div>
-                            <div style={{ color: '#a0b8d0', fontSize: '0.7rem', marginTop: 2 }}>
-                              {latest?.capturedAt ? new Date(latest.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—'}
-                            </div>
-                          </div>
-                          <div>
-                            <div style={{ color: '#7a96b8', fontSize: '0.58rem', textTransform: 'uppercase', letterSpacing: '0.12em' }}>Pricing source</div>
-                            <div style={{ color: latestPrice != null ? '#4dffc3' : '#f0a84e', fontSize: '0.7rem', marginTop: 2 }}>
-                              {latestPrice != null ? 'TI Direct (high)' : 'unavailable'}
-                            </div>
-                          </div>
-                        </div>
-                        {firstPricedHere && (
-                          <div style={{ marginTop: -8, marginBottom: 14, padding: '8px 12px', background: '#0d1422', border: '1px solid #1a2740', borderRadius: 4, fontSize: '0.66rem', color: '#a0b8d0', lineHeight: 1.5 }}>
-                            First direct TI price captured. Price-trend classification starts after the next priced capture.
-                          </div>
-                        )}
-                        <div style={tinyLabel}>30d inventory & price history · {rows.length} captures</div>
-                        <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem', width: '100%' }}>
-                          <thead>
-                            <tr>
-                              <th style={cellTH}>Captured</th>
-                              <th style={cellTH}>Quantity</th>
-                              <th style={cellTH}>Price</th>
-                              <th style={cellTH}>Lead</th>
-                              <th style={cellTH}>Lifecycle</th>
-                              <th style={cellTH}>Status</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {rows.slice().reverse().map((r, hi) => {
-                              const priceTxt = r.priceAvailable && r.normalizedUnitPrice != null
-                                ? `$${Number(r.normalizedUnitPrice).toFixed(4)}`
-                                : 'unavailable';
-                              return (
-                                <tr key={hi}>
-                                  <td style={{ ...cellTD, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                    {new Date(r.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
-                                  </td>
-                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                    {r.quantityAvailable == null ? '—' : Number(r.quantityAvailable).toLocaleString()}
-                                  </td>
-                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px', color: r.priceAvailable ? '#c4d4e8' : '#7a96b8' }}>
-                                    {priceTxt}
-                                  </td>
-                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                    {r.leadTimeWeeks == null ? '—' : `${r.leadTimeWeeks}w`}
-                                  </td>
-                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                    {r.lifecycleStatus || '—'}
-                                  </td>
-                                  <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px', color: r.captureStatus === 'failed' ? '#f05c5c' : '#a0b8d0' }}>
-                                    {r.captureStatus}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                        {!anyPrice && (
-                          <div style={{ marginTop: 8, fontSize: '0.66rem', color: '#f0a84e', fontStyle: 'italic' }}>
-                            Pricing unavailable from current TI Store API response for this part — inventory series only.
-                          </div>
-                        )}
+                    <div key={r.canonical} onClick={() => openCategory(r)}
+                      style={{ padding: '10px 14px', border: `1px solid ${B}`, borderRadius: 6, cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0a0f18', transition: 'background 0.12s' }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(61,142,240,0.08)'}
+                      onMouseLeave={e => e.currentTarget.style.background = '#0a0f18'}
+                      title="Click to see parts in this category"
+                    >
+                      <div>
+                        <div style={{ color: '#e0eaf8', fontSize: '0.74rem', fontWeight: 'bold' }}>{r.label}</div>
+                        <div style={{ color: '#7a96b8', fontSize: '0.62rem', marginTop: 2 }}>{phrase}</div>
+                      </div>
+                      <div style={{ display: 'flex', gap: 14, fontFamily: 'monospace', fontSize: '0.72rem' }}>
+                        <span style={{ color: r.priceDelta > 0 ? '#4dffc3' : '#f05c5c' }}>Price {r.priceDelta > 0 ? '+' : ''}{r.priceDelta.toFixed(2)}%</span>
+                        <span style={{ color: r.stockDelta > 0 ? '#4dffc3' : '#f05c5c' }}>Stock {r.stockDelta > 0 ? '+' : ''}{r.stockDelta.toFixed(2)}%</span>
                       </div>
                     </div>
                   );
-                })()}
-              </>
-            );
-          })()}
+                })}
+              </div>
+            </>
+          )}
+        </>
+      ) : (
+        <div style={{ padding: '14px 16px', border: `1px solid ${B}`, borderRadius: 6, color: '#7a96b8', fontSize: '0.72rem', fontStyle: 'italic', background: '#0a0f18' }}>
+          Trend data is being collected. Stock movement and price-supply patterns will appear once enough updates are stored.
         </div>
       )}
-
-      {inventorySubTab === 'snapshot' && (<>
-      {/* ── Filter / search / sort (Phase 20D) ── */}
-      <div style={sectionWrap}>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          <div style={tinyLabel}>Filter</div>
-          <select
-            value={basketFilter}
-            onChange={e => setBasketFilter(e.target.value)}
-            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3 }}
-          >
-            <option value="all">All baskets ({distinctBaskets.length})</option>
-            {distinctBaskets.map(b => <option key={b} value={b}>{b}</option>)}
-          </select>
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Search generic / orderable part"
-            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 240 }}
-          />
-          <span style={{ width: 10 }} />
-          <div style={tinyLabel}>Sort</div>
-          <select
-            value={sortBy}
-            onChange={e => setSortBy(e.target.value)}
-            style={{ background: '#080c14', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3 }}
-          >
-            <option value="basket">Basket</option>
-            <option value="quantityAvailable">Quantity available</option>
-            <option value="leadTimeWeeks">Lead time</option>
-            <option value="lifecycleStatus">Lifecycle</option>
-          </select>
-          <button
-            type="button"
-            onClick={() => setSortDir(d => d === 'asc' ? 'desc' : 'asc')}
-            style={{ background: 'transparent', border: '1px solid #1a2740', color: '#a0b8d0', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: 'pointer', fontFamily: 'monospace' }}
-          >
-            {sortDir === 'asc' ? '▲ asc' : '▼ desc'}
-          </button>
-          <span style={{ marginLeft: 'auto', fontSize: '0.66rem', color: '#7a96b8', fontFamily: 'monospace' }}>
-            {filteredSnapshotParts.length} of {snapshotParts.length} watched parts shown
-          </span>
-        </div>
-      </div>
-
-      {/* ── Live inventory table ── */}
-      <div style={sectionWrap}>
-        <div style={{ ...sectionTitle, marginBottom: 8 }}>Live Inventory Table</div>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ borderCollapse: 'collapse', minWidth: 1200, width: '100%' }}>
-            <thead>
-              <tr>
-                <th style={cellTH}>Basket</th>
-                <th style={cellTH}>Generic Part</th>
-                <th style={cellTH}>Orderable Part</th>
-                <th style={cellTH}>Description</th>
-                <th style={cellTH}>Quantity Available</th>
-                <th style={cellTH}>Pricing</th>
-                <th style={cellTH}>Order Limit</th>
-                <th style={cellTH}>Future Inventory</th>
-                <th style={cellTH}>Lead Time</th>
-                <th style={cellTH}>Lifecycle</th>
-                <th style={cellTH}>Okay to Order</th>
-                <th style={cellTH}>Last Fetched</th>
-                <th style={cellTH}>Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {snapshotParts.length === 0 && adhocRows.length === 0 && (
-                <tr>
-                  <td colSpan={13} style={{ ...cellTD, color: '#7a96b8', fontStyle: 'italic', textAlign: 'center', padding: '14px 8px' }}>
-                    {snapshotLoading ? 'Loading inventory snapshot…' : 'No verified snapshot yet — operator can run a capture below.'}
-                  </td>
-                </tr>
-              )}
-              {snapshotParts.length > 0 && filteredSnapshotParts.length === 0 && (
-                <tr>
-                  <td colSpan={13} style={{ ...cellTD, color: '#7a96b8', fontStyle: 'italic', textAlign: 'center', padding: '14px 8px' }}>
-                    No watched parts match the current filter.
-                  </td>
-                </tr>
-              )}
-              {filteredSnapshotParts.map((p, idx) => {
-                const fiCount = p.futureInventoryVisibility?.forecastCount || 0;
-                const fiTxt = fiCount > 0 && p.futureInventoryVisibility?.nextForecastDate
-                  ? `${Number(p.futureInventoryVisibility.nextForecastQuantity ?? 0).toLocaleString()} on ${p.futureInventoryVisibility.nextForecastDate}`
-                  : '—';
-                const qtyTxt = p.quantityAvailable == null ? '—' : Number(p.quantityAvailable).toLocaleString();
-                const ol = p.orderLimit == null ? '—' : Number(p.orderLimit).toLocaleString();
-                const lt = p.leadTimeWeeks == null ? '—' : `${p.leadTimeWeeks} wk`;
-                const ok = p.okayToOrder == null ? '—' : p.okayToOrder ? 'yes' : 'no';
-                // Phase 20D.1 — failed-now / stale classification.
-                const latest = p.latestCaptureStatus ?? p.captureStatus;
-                const isFailed = latest === 'failed';
-                const isStale = !!p.stale;
-                const lastGood = p.lastGoodFetchedAt
-                  ? new Date(p.lastGoodFetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
-                  : null;
-                const fetchedRaw = p.fetchedAt ? new Date(p.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
-                const fetched = isStale && lastGood ? `${lastGood} (stale)` : fetchedRaw;
-                const conf = p.signals?.sourceConfidence;
-                // Phase 21D.2 — when TI Store returned a price break, show
-                // the normalized unit price + qty + a "TI Direct" tag so
-                // the customer can see what's behind "Available" without
-                // expanding the per-part history. Falls back to the prior
-                // Available/Not posted/Pending labels when no break.
-                const pricingTxt = (p.pricingAvailability === 'available' && p.normalizedUnitPrice != null)
-                  ? (
-                      <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 4, flexWrap: 'wrap' }}>
-                        <span style={{ color: '#e0eaf8', fontWeight: 'bold' }}>
-                          {`${p.currency || 'USD'} ${Number(p.normalizedUnitPrice).toFixed(4)}`}
-                        </span>
-                        <span style={{ color: '#7a96b8', fontSize: '0.6rem' }}>
-                          {`@ ${Number(p.normalizedPriceQty || 1).toLocaleString()}`}
-                        </span>
-                        <span style={{ color: '#4dffc3', fontSize: '0.55rem', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                          TI Direct
-                        </span>
-                      </span>
-                    )
-                  : p.pricingAvailability === 'available' ? 'Available'
-                  : p.pricingAvailability === 'unavailable' ? 'Not posted'
-                  : p.pricingAvailability === 'pending_approval' ? 'Pending approval'
-                  : '—';
-                // When the latest capture failed and we have NO prior good
-                // values, every numeric cell renders as a single "Capture
-                // failed — retry" indicator anchored on the quantity column;
-                // other numeric cells stay '—'. When the row is stale we
-                // keep the prior values but tag the source column.
-                const sourceLabel = isFailed && !isStale
-                  ? <span style={{ color: '#f05c5c' }}>Capture failed — retry{p.failureStage ? ` · ${p.failureStage}` : ''}{p.httpStatus != null ? ` · HTTP ${p.httpStatus}` : ''}</span>
-                  : isStale
-                    ? <span style={{ color: '#f0a84e' }}>Capture failed — retry · showing last good{p.failureStage ? ` · ${p.failureStage}` : ''}</span>
-                    : <span>TI Product Info + Store I&P · {fmtSignalLabel(conf)}</span>;
-                const rowBg = isFailed && !isStale ? '#1a0d10' : isStale ? '#1a1408' : undefined;
-                const isExpanded = expandedPart === p.partNumber;
-                const histResp = isExpanded ? historyByPart[p.partNumber] : null;
-                const onToggleHistory = () => {
-                  if (isExpanded) { setExpandedPart(null); return; }
-                  setExpandedPart(p.partNumber);
-                  if (!historyByPart[p.partNumber]) fetchPartHistory(p.partNumber);
-                };
-                return (
-                  <React.Fragment key={`snap-${p.partNumber || ''}-${idx}`}>
-                  <tr style={rowBg ? { background: rowBg } : undefined}>
-                    <td style={{ ...cellTD, color: '#a0b8d0' }}>{p.basket || '—'}</td>
-                    <td style={cellMono}>{p.genericPartNumber || '—'}</td>
-                    <td style={cellMono}>
-                      <span
-                        onClick={onToggleHistory}
-                        style={{ cursor: 'pointer', borderBottom: '1px dotted #2c4a70' }}
-                        title="Click to view inventory history"
-                      >{p.partNumber || '—'}</span>
-                      {isStale && <sup style={{ color: '#f0a84e', marginLeft: 4, fontSize: '0.55rem' }}>stale</sup>}
-                      {isFailed && !isStale && <sup style={{ color: '#f05c5c', marginLeft: 4, fontSize: '0.55rem' }}>failed</sup>}
-                    </td>
-                    <td style={{ ...cellTD, maxWidth: 280 }}>{p.description || '—'}</td>
-                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[p.signals?.inventorySignal] || '#c4d4e8' }}>{qtyTxt}</td>
-                    <td style={cellMono}>{pricingTxt}</td>
-                    <td style={cellMono}>{ol}</td>
-                    <td style={cellMono}>{fiTxt}</td>
-                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[p.signals?.leadTimeSignal] || '#c4d4e8' }}>{lt}</td>
-                    <td style={cellMono}>{p.lifecycleStatus || '—'}</td>
-                    <td style={cellMono}>{ok}</td>
-                    <td style={{ ...cellMono, color: isStale ? '#f0a84e' : '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
-                    <td style={{ ...cellTD, color: isFailed ? '#f05c5c' : INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
-                      {sourceLabel}
-                    </td>
-                  </tr>
-                  {isExpanded && (
-                    <tr style={{ background: '#040711' }}>
-                      <td colSpan={13} style={{ padding: '10px 12px', borderBottom: '1px solid #1a2740' }}>
-                        {!histResp ? (
-                          <span style={{ fontSize: '0.7rem', color: '#7a96b8' }}>Loading history…</span>
-                        ) : histResp.error ? (
-                          <span style={{ fontSize: '0.7rem', color: '#f0a84e' }}>{histResp.error}</span>
-                        ) : (histResp.rows || []).length === 0 ? (
-                          <span style={{ fontSize: '0.7rem', color: '#7a96b8', fontStyle: 'italic' }}>
-                            No history rows yet for {p.partNumber}. Run captures over multiple days to populate the trend.
-                          </span>
-                        ) : (
-                          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-                            <div style={{ minWidth: 260 }}>
-                              <div style={tinyLabel}>30d inventory history · {histResp.rows.length} captures</div>
-                              <table style={{ borderCollapse: 'collapse', marginTop: 6, fontFamily: 'monospace', fontSize: '0.66rem' }}>
-                                <thead>
-                                  <tr>
-                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Captured</th>
-                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Qty</th>
-                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Lead</th>
-                                    <th style={{ ...cellTH, fontSize: '0.55rem' }}>Status</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {histResp.rows.slice(-15).reverse().map((r, hi) => (
-                                    <tr key={hi}>
-                                      <td style={{ ...cellTD, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                        {new Date(r.capturedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
-                                      </td>
-                                      <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                        {r.quantityAvailable == null ? '—' : Number(r.quantityAvailable).toLocaleString()}
-                                      </td>
-                                      <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px' }}>
-                                        {r.leadTimeWeeks == null ? '—' : `${r.leadTimeWeeks}w`}
-                                      </td>
-                                      <td style={{ ...cellMono, fontSize: '0.62rem', padding: '3px 6px', color: r.captureStatus === 'failed' ? '#f05c5c' : '#a0b8d0' }}>
-                                        {r.captureStatus}
-                                      </td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                            <div style={{ minWidth: 260 }}>
-                              <div style={tinyLabel}>Source</div>
-                              <div style={{ fontSize: '0.7rem', color: '#a0b8d0', fontFamily: 'monospace', marginTop: 4 }}>
-                                Backend: {histResp.backend}<br/>
-                                Inventory: TI Store I&P API<br/>
-                                Pricing: {(histResp.rows || []).some(r => r.priceAvailable) ? 'TI Store API' : 'unavailable'}
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  )}
-                  </React.Fragment>
-                );
-              })}
-              {adhocRows.map((s, idx) => {
-                const desc = s?.description || '—';
-                const qtyAvail = s?.quantityAvailable;
-                const qtyTxt = qtyAvail == null ? '—' : Number(qtyAvail).toLocaleString();
-                const pr = s?.pricing && s.pricing.length > 0 ? s.pricing.slice().sort((a, b) => a.unitPrice - b.unitPrice)[0] : null;
-                const prTxt = pr ? `${fmtPriceUSD(pr.unitPrice, pr.currency)} @ ${pr.breakQuantity}+` : '—';
-                const ol = s?.orderLimit == null ? '—' : Number(s.orderLimit).toLocaleString();
-                const fi = s?.futureInventory && s.futureInventory.length > 0
-                  ? `${Number(s.forecastQuantity).toLocaleString()} on ${s.forecastDate}`
-                  : '—';
-                const lt = s?.leadTimeWeeks == null ? '—' : `${s.leadTimeWeeks} wk`;
-                const lc = s?.lifecycleStatus || '—';
-                const ok = s?.okayToOrder == null ? '—' : s.okayToOrder ? 'yes' : 'no';
-                const fetched = s?.fetchedAt ? new Date(s.fetchedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—';
-                const conf = s?.signals?.sourceConfidence;
-                return (
-                  <tr key={`adhoc-${s?.requestedPartNumber || ''}-${idx}`}>
-                    <td style={{ ...cellTD, color: '#a0b8d0', fontStyle: 'italic' }}>operator</td>
-                    <td style={cellMono}>{s?.genericPartNumber || s?.requestedPartNumber || '—'}</td>
-                    <td style={cellMono}>{s?.resolvedPartNumber || s?.requestedPartNumber || '—'}</td>
-                    <td style={{ ...cellTD, maxWidth: 280 }}>{desc}</td>
-                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[s?.signals?.inventorySignal] || '#c4d4e8' }}>{qtyTxt}</td>
-                    <td style={cellMono}>{prTxt}</td>
-                    <td style={cellMono}>{ol}</td>
-                    <td style={cellMono}>{fi}</td>
-                    <td style={{ ...cellMono, color: INV_FLAG_COLOR[s?.signals?.leadTimeSignal] || '#c4d4e8' }}>{lt}</td>
-                    <td style={cellMono}>{lc}</td>
-                    <td style={cellMono}>{ok}</td>
-                    <td style={{ ...cellMono, color: '#7a96b8', fontSize: '0.62rem' }}>{fetched}</td>
-                    <td style={{ ...cellTD, color: INV_FLAG_COLOR[conf] || '#7a96b8', fontSize: '0.62rem' }}>
-                      TI Product Info + Store I&P · {fmtSignalLabel(conf)}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        <div style={{ marginTop: 10, fontSize: '0.62rem', color: '#7a96b8', fontStyle: 'italic', maxWidth: 920 }}>
-          Inventory and future availability are retrieved from the Texas Instruments Store Inventory & Pricing API. Future inventory is forecasted and not committed supply.
-        </div>
-      </div>
-      </>)}
-
-      {/* ── Operator tools (collapsed by default) — always visible across sub-tabs ── */}
-      <div style={sectionWrap}>
-        <button
-          type="button"
-          onClick={() => setOpsOpen(o => !o)}
-          style={{ background: 'transparent', border: 'none', color: '#7a96b8', fontSize: '0.62rem', letterSpacing: '0.14em', textTransform: 'uppercase', fontWeight: 'bold', cursor: 'pointer', padding: 0 }}
-        >
-          {opsOpen ? '▾ Operator tools' : '▸ Operator tools'}
-        </button>
-        {opsOpen && (
-          <div style={{ marginTop: 10, padding: 12, background: '#080c14', border: '1px solid #1a2740', borderRadius: 4 }}>
-            <div style={{ fontSize: '0.66rem', color: '#7a96b8', marginBottom: 8, lineHeight: 1.5 }}>
-              For TI operations only. The X-Capture-Secret never leaves this browser tab and is never persisted.
-              Customers do not need to interact with these controls.
-            </div>
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <input
-                type={showSecret ? 'text' : 'password'}
-                value={secret}
-                onChange={e => setSecret(e.target.value)}
-                placeholder="X-Capture-Secret"
-                autoComplete="off"
-                style={{ background: '#050810', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
-              />
-              <button
-                type="button"
-                onClick={() => setShowSecret(s => !s)}
-                style={{ background: 'transparent', border: '1px solid #1a2740', color: '#7a96b8', padding: '5px 8px', fontSize: '0.66rem', borderRadius: 3, cursor: 'pointer' }}
-              >{showSecret ? 'hide' : 'show'}</button>
-              <button
-                type="button"
-                onClick={captureUniverse}
-                disabled={busy || !secret.trim()}
-                style={{ background: busy ? '#1a2740' : '#0f2540', border: '1px solid #2c4a70', color: '#e0eaf8', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() ? 'not-allowed' : 'pointer' }}
-              >{busy ? 'Capturing…' : 'Capture watched universe'}</button>
-              {captureProgress && (
-                <span style={{ fontSize: '0.7rem', color: '#a0b8d0', fontFamily: 'monospace' }}>
-                  {captureProgress.done}/{captureProgress.total}
-                  {captureProgress.totalFailed > 0 && (
-                    <span style={{ color: '#f0a84e' }}> · {captureProgress.totalFailed} failed</span>
-                  )}
-                  {captureProgress.totalStale > 0 && (
-                    <span style={{ color: '#7a96b8' }}> · {captureProgress.totalStale} stale</span>
-                  )}
-                </span>
-              )}
-              <span style={{ width: 12 }} />
-              <input
-                type="text"
-                value={partInput}
-                onChange={e => setPartInput(e.target.value)}
-                placeholder="Ad-hoc OPN (e.g. INA226AIDGSR)"
-                style={{ background: '#050810', border: '1px solid #1a2740', color: '#e0eaf8', padding: '5px 8px', fontFamily: 'monospace', fontSize: '0.72rem', borderRadius: 3, minWidth: 220 }}
-              />
-              <button
-                type="button"
-                onClick={addPart}
-                disabled={busy || !secret.trim() || !partInput.trim()}
-                style={{ background: 'transparent', border: '1px solid #1a2740', color: '#a0b8d0', padding: '5px 12px', fontSize: '0.72rem', borderRadius: 3, cursor: busy || !secret.trim() || !partInput.trim() ? 'not-allowed' : 'pointer' }}
-              >Fetch live data</button>
-            </div>
-            {(error || captureNote) && (
-              <div style={{ marginTop: 8, fontSize: '0.7rem', color: error ? '#f05c5c' : '#4dffc3' }}>
-                {error || captureNote}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </>
+    </div>
   );
 }
+
 
 // ── Insights tab — compact, customer-facing (Phase 19B+) ─────────────────────
 // Shows only what answers the customer's question: are prices moving, by how
@@ -4879,7 +2927,7 @@ function App(){
       <div style={{display:'flex',gap:0,borderBottom:`1px solid ${B}`,background:'#050810',padding:'0 12px'}}>
         {[
           {id:'prices', label:'Prices'},
-          {id:'inventory', label:'Inventory'},
+          {id:'inventory', label:'Supply'},
           {id:'universe', label:'Universe'},
           {id:'insights', label:'Insights'},
         ].map(t=>{
@@ -5067,7 +3115,13 @@ function App(){
       </div>
       </>}
 
-      {activeTab==='inventory'&&<InventoryPanel/>}
+      {activeTab==='inventory'&&<SupplyPanel
+        tiRollupsByCanonical={tiRollupsByCanonical}
+        tiTrendByCanonical={tiTrendByCanonical}
+        combinedEvidence={combinedEvidence}
+        setUniverseFilter={setUniverseFilter}
+        setActiveTab={setActiveTab}
+      />}
 
       {activeTab==='universe'&&<UniversePanel
         initialFilter={universeFilter}
