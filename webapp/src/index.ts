@@ -71,6 +71,7 @@ import {
   captureTiCatalogSnapshot,
   ingestCatalogChunk,
   rebuildGpnFromOpn,
+  rebuildGpnEnrichment,
   readSnapshotCounts,
   readLatestSnapshotRun,
   insertSnapshotRunRow,
@@ -3113,6 +3114,14 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
 
   const errors: string[] = []
   const gpnRowsUpserted = await rebuildGpnFromOpn(env.TI_INVENTORY_HISTORY_DB as any, capturedAt, errors)
+  // Phase 24A.1 — chain the enrichment rebuild so future captures land
+  // with cheapest_opn / highest_inventory_opn / lifecycle_summary / median
+  // already populated. Pure SQL, four UPDATE-FROM-CTE statements; failures
+  // here roll into the same errors[] array but do not block finalize from
+  // returning, so the operator can also call /gpn/rebuild-enrichment
+  // standalone if the chain failed.
+  const enrichment = await rebuildGpnEnrichment(env.TI_INVENTORY_HISTORY_DB as any)
+  for (const e of enrichment.errors) errors.push(e)
   const counts = await readSnapshotCounts(env.TI_INVENTORY_HISTORY_DB as any)
   const summary = {
     totalOpns: counts.totalOpns,
@@ -3131,8 +3140,59 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
     capturedAt,
     source,
     gpnRowsUpserted,
+    enrichment: {
+      enrichedGpns: enrichment.enrichedGpns,
+      rowsUpdated: enrichment.rowsUpdated,
+      changesByField: enrichment.changesByField,
+      nullMedianCount: enrichment.nullMedianCount,
+      nullCheapestCount: enrichment.nullCheapestCount,
+      nullHighestInventoryCount: enrichment.nullHighestInventoryCount,
+      nullLifecycleSummaryCount: enrichment.nullLifecycleSummaryCount,
+    },
     ...summary,
-    note: 'GPN aggregates rebuilt from ti_catalog_latest_opn via in-SQL GROUP BY. cheapest_opn / highest_inventory_opn / lifecycle_summary / median price are NULL in v1 and may be filled by a follow-up secondary pass.',
+    note: 'Phase 24A.1 — GPN aggregates rebuilt from ti_catalog_latest_opn (in-SQL GROUP BY); cheapest_opn / highest_inventory_opn / lifecycle_summary / median_normalized_unit_price now backfilled via four UPDATE-FROM-CTE statements during finalize.',
+  })
+})
+
+// POST /api/ti/universe/catalog/gpn/rebuild-enrichment — auth-gated.
+//
+// Phase 24A.1 — backfill GPN aggregate enrichment fields
+// (cheapest_opn, highest_inventory_opn, lifecycle_summary,
+// median_normalized_unit_price) from existing ti_catalog_latest_opn
+// rows without re-fetching TI. Useful when a prior catalog snapshot
+// landed under the v1 finalize path that explicitly NULL'd these
+// columns. Idempotent — re-running on already-enriched rows simply
+// reasserts the same values and is cheap.
+app.post('/api/ti/universe/catalog/gpn/rebuild-enrichment', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot rebuild GPN enrichment.' }, 500)
+  }
+  const result = await rebuildGpnEnrichment(env.TI_INVENTORY_HISTORY_DB as any)
+  return c.json({
+    success: result.errors.length === 0,
+    totalGpns: result.totalGpns,
+    enrichedGpns: result.enrichedGpns,
+    rowsUpdated: result.rowsUpdated,
+    changesByField: result.changesByField,
+    nullMedianCount: result.nullMedianCount,
+    nullCheapestCount: result.nullCheapestCount,
+    nullHighestInventoryCount: result.nullHighestInventoryCount,
+    nullLifecycleSummaryCount: result.nullLifecycleSummaryCount,
+    sampleRows: result.sampleRows,
+    errors: result.errors,
+    note: 'Phase 24A.1 — pure SQL UPDATE-FROM-CTE rebuild. No TI calls. Idempotent.',
   })
 })
 

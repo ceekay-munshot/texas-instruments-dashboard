@@ -556,6 +556,265 @@ export async function rebuildGpnFromOpn(
   return upserted
 }
 
+// ── Phase 24A.1 — GPN enrichment rebuild ─────────────────────────────────────
+// Backfills the four GPN aggregate fields the v1 finalize path explicitly
+// left NULL (median_normalized_unit_price, cheapest_opn,
+// highest_inventory_opn, lifecycle_summary). Uses pure SQL — no TI calls,
+// no Worker memory pressure. Each field is one UPDATE-FROM-CTE statement,
+// so the whole rebuild is 4 D1 subrequests for the entire table.
+//
+// Tie-breakers (per Phase 24A.1 spec):
+//   cheapest_opn         : lowest normalized_unit_price; ties broken by HIGHEST quantity.
+//   highest_inventory_opn: highest quantity; ties broken by LOWEST normalized_unit_price.
+//   lifecycle_summary    : compact JSON object {lifecycle: count}; only non-null lifecycles count.
+//   median_normalized_unit_price : true median of non-null prices via the
+//                                  classic window-function trick (average
+//                                  of the middle 1 row when N is odd, the
+//                                  middle 2 rows when N is even).
+
+export type GpnEnrichmentResult = {
+  totalGpns: number
+  enrichedGpns: number
+  rowsUpdated: number
+  changesByField: {
+    median: number
+    cheapest: number
+    highestInventory: number
+    lifecycleSummary: number
+  }
+  nullMedianCount: number
+  nullCheapestCount: number
+  nullHighestInventoryCount: number
+  nullLifecycleSummaryCount: number
+  sampleRows: Array<{
+    genericPartNumber: string
+    medianNormalizedUnitPrice: number | null
+    cheapestOpn: string | null
+    highestInventoryOpn: string | null
+    lifecycleSummary: unknown
+  }>
+  errors: string[]
+}
+
+function metaChanges(res: unknown): number {
+  const r = res as { meta?: { changes?: number }; changes?: number } | null
+  if (!r) return 0
+  if (typeof r.meta?.changes === 'number') return r.meta.changes
+  if (typeof r.changes === 'number') return r.changes
+  return 0
+}
+
+export async function rebuildGpnEnrichment(d1: CatalogD1): Promise<GpnEnrichmentResult> {
+  const errors: string[] = []
+  const changes = { median: 0, cheapest: 0, highestInventory: 0, lifecycleSummary: 0 }
+
+  // 1. cheapest_opn — lowest price, tie -> highest quantity.
+  try {
+    const res = await d1.prepare(
+      `WITH cheapest AS (
+         SELECT generic_part_number, ti_part_number AS opn
+         FROM (
+           SELECT generic_part_number, ti_part_number,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY generic_part_number
+                    ORDER BY normalized_unit_price ASC,
+                             COALESCE(quantity, -1) DESC,
+                             ti_part_number ASC
+                  ) AS rn
+           FROM ti_catalog_latest_opn
+           WHERE normalized_unit_price IS NOT NULL
+             AND generic_part_number IS NOT NULL
+         )
+         WHERE rn = 1
+       )
+       UPDATE ti_catalog_latest_gpn
+       SET cheapest_opn = cheapest.opn
+       FROM cheapest
+       WHERE ti_catalog_latest_gpn.generic_part_number = cheapest.generic_part_number`,
+    ).run()
+    changes.cheapest = metaChanges(res)
+  } catch (e: any) {
+    errors.push(`gpn_enrich_cheapest:${(e?.message || 'failed').slice(0, 120)}`)
+  }
+
+  // 2. highest_inventory_opn — highest quantity, tie -> lowest price.
+  try {
+    const res = await d1.prepare(
+      `WITH highest AS (
+         SELECT generic_part_number, ti_part_number AS opn
+         FROM (
+           SELECT generic_part_number, ti_part_number,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY generic_part_number
+                    ORDER BY quantity DESC,
+                             COALESCE(normalized_unit_price, 1e18) ASC,
+                             ti_part_number ASC
+                  ) AS rn
+           FROM ti_catalog_latest_opn
+           WHERE quantity IS NOT NULL
+             AND generic_part_number IS NOT NULL
+         )
+         WHERE rn = 1
+       )
+       UPDATE ti_catalog_latest_gpn
+       SET highest_inventory_opn = highest.opn
+       FROM highest
+       WHERE ti_catalog_latest_gpn.generic_part_number = highest.generic_part_number`,
+    ).run()
+    changes.highestInventory = metaChanges(res)
+  } catch (e: any) {
+    errors.push(`gpn_enrich_highest:${(e?.message || 'failed').slice(0, 120)}`)
+  }
+
+  // 3. lifecycle_summary — JSON object {lifecycle: count}. Cloudflare D1
+  //    bundles the SQLite json1 extension so json_group_object works.
+  try {
+    const res = await d1.prepare(
+      `WITH lifecycle_counts AS (
+         SELECT generic_part_number,
+                json_group_object(lifecycle, cnt) AS summary_json
+         FROM (
+           SELECT generic_part_number, lifecycle, COUNT(*) AS cnt
+           FROM ti_catalog_latest_opn
+           WHERE lifecycle IS NOT NULL
+             AND TRIM(lifecycle) != ''
+             AND generic_part_number IS NOT NULL
+           GROUP BY generic_part_number, lifecycle
+         )
+         GROUP BY generic_part_number
+       )
+       UPDATE ti_catalog_latest_gpn
+       SET lifecycle_summary = lifecycle_counts.summary_json
+       FROM lifecycle_counts
+       WHERE ti_catalog_latest_gpn.generic_part_number = lifecycle_counts.generic_part_number`,
+    ).run()
+    changes.lifecycleSummary = metaChanges(res)
+  } catch (e: any) {
+    errors.push(`gpn_enrich_lifecycle:${(e?.message || 'failed').slice(0, 120)}`)
+  }
+
+  // 4. median_normalized_unit_price — true median via window function.
+  //    For odd N pick the middle row; for even N average the two middle
+  //    rows. AVG of one row equals the row itself, so the same expression
+  //    handles both cases.
+  try {
+    const res = await d1.prepare(
+      `WITH ranked AS (
+         SELECT generic_part_number, normalized_unit_price,
+                ROW_NUMBER() OVER (
+                  PARTITION BY generic_part_number
+                  ORDER BY normalized_unit_price
+                ) AS rn,
+                COUNT(*) OVER (PARTITION BY generic_part_number) AS cnt
+         FROM ti_catalog_latest_opn
+         WHERE normalized_unit_price IS NOT NULL
+           AND generic_part_number IS NOT NULL
+       ),
+       medians AS (
+         SELECT generic_part_number,
+                AVG(normalized_unit_price) AS median_norm
+         FROM ranked
+         WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
+         GROUP BY generic_part_number
+       )
+       UPDATE ti_catalog_latest_gpn
+       SET median_normalized_unit_price = medians.median_norm
+       FROM medians
+       WHERE ti_catalog_latest_gpn.generic_part_number = medians.generic_part_number`,
+    ).run()
+    changes.median = metaChanges(res)
+  } catch (e: any) {
+    errors.push(`gpn_enrich_median:${(e?.message || 'failed').slice(0, 120)}`)
+  }
+
+  // ── Diagnostics: counts + a small sample. One small SELECT each.
+  let totalGpns = 0
+  let nullMedianCount = 0
+  let nullCheapestCount = 0
+  let nullHighestInventoryCount = 0
+  let nullLifecycleSummaryCount = 0
+  let enrichedGpns = 0
+  type SampleRow = {
+    generic_part_number: string
+    median_normalized_unit_price: number | null
+    cheapest_opn: string | null
+    highest_inventory_opn: string | null
+    lifecycle_summary: string | null
+  }
+  let sampleRowsRaw: SampleRow[] = []
+  try {
+    const counts = await d1.prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN median_normalized_unit_price IS NULL THEN 1 ELSE 0 END) AS null_median,
+         SUM(CASE WHEN cheapest_opn IS NULL THEN 1 ELSE 0 END) AS null_cheapest,
+         SUM(CASE WHEN highest_inventory_opn IS NULL THEN 1 ELSE 0 END) AS null_highest,
+         SUM(CASE WHEN lifecycle_summary IS NULL THEN 1 ELSE 0 END) AS null_lifecycle,
+         SUM(CASE WHEN median_normalized_unit_price IS NOT NULL
+                   AND cheapest_opn IS NOT NULL
+                   AND highest_inventory_opn IS NOT NULL
+                   AND lifecycle_summary IS NOT NULL
+                  THEN 1 ELSE 0 END) AS enriched
+       FROM ti_catalog_latest_gpn`,
+    ).first<{
+      total: number; null_median: number; null_cheapest: number;
+      null_highest: number; null_lifecycle: number; enriched: number;
+    }>()
+    if (counts) {
+      totalGpns = Number(counts.total) || 0
+      nullMedianCount = Number(counts.null_median) || 0
+      nullCheapestCount = Number(counts.null_cheapest) || 0
+      nullHighestInventoryCount = Number(counts.null_highest) || 0
+      nullLifecycleSummaryCount = Number(counts.null_lifecycle) || 0
+      enrichedGpns = Number(counts.enriched) || 0
+    }
+    const sample = await d1.prepare(
+      `SELECT generic_part_number,
+              median_normalized_unit_price,
+              cheapest_opn, highest_inventory_opn, lifecycle_summary
+         FROM ti_catalog_latest_gpn
+         WHERE median_normalized_unit_price IS NOT NULL
+           AND cheapest_opn IS NOT NULL
+           AND highest_inventory_opn IS NOT NULL
+           AND lifecycle_summary IS NOT NULL
+         ORDER BY total_quantity DESC NULLS LAST
+         LIMIT 5`,
+    ).all<SampleRow>()
+    sampleRowsRaw = sample.results ?? []
+  } catch (e: any) {
+    errors.push(`gpn_enrich_diag:${(e?.message || 'failed').slice(0, 120)}`)
+  }
+
+  const sampleRows = sampleRowsRaw.map(r => {
+    let lifecycleParsed: unknown = r.lifecycle_summary
+    if (typeof r.lifecycle_summary === 'string') {
+      try { lifecycleParsed = JSON.parse(r.lifecycle_summary) } catch { /* leave as string */ }
+    }
+    return {
+      genericPartNumber: r.generic_part_number,
+      medianNormalizedUnitPrice: r.median_normalized_unit_price,
+      cheapestOpn: r.cheapest_opn,
+      highestInventoryOpn: r.highest_inventory_opn,
+      lifecycleSummary: lifecycleParsed,
+    }
+  })
+
+  const rowsUpdated = changes.median + changes.cheapest + changes.highestInventory + changes.lifecycleSummary
+
+  return {
+    totalGpns,
+    enrichedGpns,
+    rowsUpdated,
+    changesByField: changes,
+    nullMedianCount,
+    nullCheapestCount,
+    nullHighestInventoryCount,
+    nullLifecycleSummaryCount,
+    sampleRows,
+    errors,
+  }
+}
+
 export type SnapshotRunSummary = {
   totalOpns: number
   totalGpns: number
