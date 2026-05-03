@@ -416,10 +416,45 @@ async function fetchAllPrices(apiKey: string) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 // NOTE: CF Workers are stateless — each edge PoP is a separate instance.
 // In-memory cache (_cache) only persists within one instance's lifetime.
-// We use CF's HTTP Cache API for cross-instance caching instead.
+// We use CF's HTTP Cache API for cross-instance caching instead, and a
+// durable KV snapshot for the merged "latest good" row so a cold edge or
+// new browser never paints a blank QTD row.
 
 const CACHE_KEY = 'https://ti-price-dashboard-cache/prices'
 const CACHE_TTL_SECONDS = 6 * 60 * 60  // 6 hours
+
+// KV key holding the latest good merged price snapshot. Persists across
+// edges and browsers; partial fetches always merge into this snapshot
+// before being returned to clients.
+const PRICE_SNAPSHOT_KV_KEY = 'source-snapshots/texas_instruments/mouser_direct/latest_merged_prices.json'
+
+type PersistedPriceSnapshot = {
+  data: Record<string, any>
+  fetchedAt: string
+  fetchedCount: number
+  totalCount: number
+}
+
+async function readPersistedPriceSnapshot(kv?: SnapshotKV): Promise<PersistedPriceSnapshot | null> {
+  if (!kv) return null
+  try {
+    const raw = await kv.get(PRICE_SNAPSHOT_KV_KEY)
+    if (!raw) return null
+    return JSON.parse(raw) as PersistedPriceSnapshot
+  } catch (e) {
+    console.warn('[prices-snapshot] KV read failed', e)
+    return null
+  }
+}
+
+async function writePersistedPriceSnapshot(kv: SnapshotKV | undefined, snapshot: PersistedPriceSnapshot): Promise<void> {
+  if (!kv) return
+  try {
+    await kv.put(PRICE_SNAPSHOT_KV_KEY, JSON.stringify(snapshot))
+  } catch (e) {
+    console.warn('[prices-snapshot] KV write failed', e)
+  }
+}
 
 app.get('/api/prices', async (c) => {
   const force = c.req.query('refresh') === 'true'
@@ -435,18 +470,53 @@ app.get('/api/prices', async (c) => {
   }
 
   const apiKey = c.env.MOUSER_API_KEY
-  if (!apiKey) return c.json({ error: 'MOUSER_API_KEY not configured' }, 500)
+  // Read the persisted KV snapshot eagerly — used both as the merge base
+  // and as the fallback when the upstream call yields no new data.
+  const persistedSnapshot = await readPersistedPriceSnapshot(c.env.SOURCE_SNAPSHOTS_KV)
+
+  if (!apiKey) {
+    // No upstream key configured — surface whatever durable snapshot we have.
+    if (persistedSnapshot && Object.keys(persistedSnapshot.data).length > 0) {
+      return c.json({
+        source: 'persisted',
+        fetchedAt: persistedSnapshot.fetchedAt,
+        fetchedCount: Object.keys(persistedSnapshot.data).length,
+        totalCount: persistedSnapshot.totalCount,
+        rateLimited: false,
+        data: persistedSnapshot.data,
+        ...getBaselineMeta(),
+      })
+    }
+    return c.json({ error: 'MOUSER_API_KEY not configured' }, 500)
+  }
 
   const { results, rateLimited, rateLimitedAt, retryAfterMs, fetchedCount, totalCount, failedCategories } =
     await fetchAllPrices(apiKey)
 
   const now = new Date().toISOString()
-  const payload = { _results: results, _cachedAt: now, _fetchedCount: fetchedCount, _totalCount: totalCount, _nextRefreshMs: CACHE_TTL_SECONDS * 1000 }
 
-  // Only cache successful (or partial-but-not-rate-limited) fetches.
-  // Rate-limited responses are intentionally not cached so the next refresh
-  // gets a fresh attempt instead of being trapped on stale partial data.
-  if (!rateLimited && fetchedCount > 0) {
+  // Server-side merge — partial responses keep prior categories. The merged
+  // snapshot becomes the authoritative "latest good" row everyone sees.
+  const persistedData = persistedSnapshot?.data ?? {}
+  const mergedData: Record<string, any> = { ...persistedData, ...results }
+  const mergedCount = Object.keys(mergedData).length
+  const liveContributed = fetchedCount
+
+  // Persist merged snapshot only when this round contributed at least one
+  // category. Avoids overwriting good KV state with empty fetches.
+  if (liveContributed > 0) {
+    await writePersistedPriceSnapshot(c.env.SOURCE_SNAPSHOTS_KV, {
+      data: mergedData,
+      fetchedAt: now,
+      fetchedCount: mergedCount,
+      totalCount,
+    })
+  }
+
+  // Cache merged response in CF edge cache. Rate-limited responses are
+  // intentionally not cached so the next refresh gets a fresh attempt.
+  if (!rateLimited && liveContributed > 0) {
+    const payload = { _results: mergedData, _cachedAt: now, _fetchedCount: mergedCount, _totalCount: totalCount, _nextRefreshMs: CACHE_TTL_SECONDS * 1000 }
     const cache = caches.default
     const cacheResponse = new Response(JSON.stringify(payload), {
       headers: {
@@ -457,10 +527,17 @@ app.get('/api/prices', async (c) => {
     await cache.put(CACHE_KEY, cacheResponse)
   }
 
+  // If the live fetch contributed nothing AND we have a persisted snapshot,
+  // surface the persisted row so the UI never goes blank.
+  const effectiveFetchedAt = liveContributed > 0
+    ? now
+    : (persistedSnapshot?.fetchedAt || now)
+
   return c.json({
-    source: 'live',
-    fetchedAt: now,
-    fetchedCount,
+    source: liveContributed > 0 ? 'live' : (mergedCount > 0 ? 'persisted' : 'live'),
+    fetchedAt: effectiveFetchedAt,
+    fetchedCount: mergedCount,
+    liveFetchedCount: liveContributed,
     totalCount,
     rateLimited,
     rateLimitedAt,
@@ -468,7 +545,7 @@ app.get('/api/prices', async (c) => {
     retryAfterSeconds: rateLimited ? Math.ceil(retryAfterMs / 1000) : 0,
     retryAt: rateLimited ? new Date(Date.now() + retryAfterMs).toISOString() : null,
     failedCategories: failedCategories.length > 0 ? failedCategories : undefined,
-    data: results,
+    data: mergedData,
     ...getBaselineMeta(),
   })
 })
