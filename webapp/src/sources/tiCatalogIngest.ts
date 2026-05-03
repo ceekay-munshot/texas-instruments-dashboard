@@ -217,13 +217,15 @@ function median(xs: number[]): number | null {
   return sorted.length % 2 === 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2
 }
 
-// D1 batching: SQLite supports ~999 bound params per statement. For the
-// OPN table we bind 16 columns per row → 999/16 = 62 max rows per
-// multi-row INSERT. Use 50 to leave headroom. Then send 4 statements
-// per .batch() call (200 rows per D1 subrequest), keeping subrequest
-// count under ~400 even for 72k OPNs (well under the 1000 paid-tier cap).
-const OPN_ROWS_PER_STATEMENT = 50
-const STATEMENTS_PER_BATCH = 4
+// Phase 23C.3 — D1 micro-batching. Cloudflare D1's effective bound-parameter
+// cap per prepared statement is ~100 (the D1 v3 client raises "too many SQL
+// variables at offset N" once a statement exceeds it, even though SQLite's
+// own SQLITE_MAX_VARIABLE_NUMBER is 999). Phase 23C's first chunked pass
+// used 50 rows × 16 cols = 800 binds per OPN statement, which always fails
+// against the live D1. Cap conservatively and run multiple small INSERT OR
+// REPLACE statements per chunk instead of one giant multi-row INSERT.
+const MAX_D1_BIND_PARAMS = 90
+const MAX_ROWS_PER_STATEMENT_CAP = 5
 
 const UPSERT_OPN_COLS = [
   'ti_part_number', 'generic_part_number', 'description', 'quantity', 'limit_qty',
@@ -245,12 +247,52 @@ function buildMultiRowInsertSql(table: string, cols: string[], rowCount: number)
   return `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES ${tuples}`
 }
 
-async function upsertOpnRows(d1: CatalogD1, rows: ParsedOpn[], capturedAt: string, source: string, errors: string[]): Promise<number> {
+/** Phase 23C.3 — derive the safe rows-per-statement count from a column
+ *  list. Caller passes the actual UPSERT_*_COLS so the math always matches
+ *  reality. Floor of (90 / paramsPerRow), clamped to [1, 5]. */
+export function computeRowsPerStatement(paramsPerRow: number): number {
+  if (!Number.isFinite(paramsPerRow) || paramsPerRow <= 0) return 1
+  const raw = Math.floor(MAX_D1_BIND_PARAMS / paramsPerRow)
+  return Math.max(1, Math.min(MAX_ROWS_PER_STATEMENT_CAP, raw))
+}
+
+/** Phase 23C.3 — sub-batch error shape returned in chunk diagnostics. Never
+ *  exposes raw product payload, OAuth tokens, the capture secret, or D1
+ *  bind values. The sanitizedError is the first 160 chars of err.message. */
+export type SubBatchError = {
+  table: 'ti_catalog_latest_opn' | 'ti_catalog_latest_gpn'
+  subBatchStart: number
+  subBatchEnd: number
+  rowsInSubBatch: number
+  sanitizedError: string
+}
+
+function sanitizeErrorMessage(e: unknown, fallback: string): string {
+  if (e && typeof e === 'object' && 'message' in e && typeof (e as any).message === 'string') {
+    return (e as any).message.slice(0, 160)
+  }
+  if (typeof e === 'string') return e.slice(0, 160)
+  return fallback
+}
+
+/** Phase 23C.3 — micro-batched OPN upsert. Returns the number of rows
+ *  successfully written and a sub-batch error list. paramsPerRow and
+ *  rowsPerStatement are returned to the caller via the wrapping diagnostic. */
+async function upsertOpnRows(
+  d1: CatalogD1,
+  rows: ParsedOpn[],
+  capturedAt: string,
+  source: string,
+  subBatchErrors: SubBatchError[],
+): Promise<{ upserted: number; sqlStatementsExecuted: number; rowsPerStatement: number }> {
+  const paramsPerRow = UPSERT_OPN_COLS.length
+  const rowsPerStatement = computeRowsPerStatement(paramsPerRow)
   let upserted = 0
-  // Chunk into per-statement groups, then per-batch groups.
-  const stmts: CatalogD1Statement[] = []
-  for (let i = 0; i < rows.length; i += OPN_ROWS_PER_STATEMENT) {
-    const chunk = rows.slice(i, i + OPN_ROWS_PER_STATEMENT)
+  let sqlStatementsExecuted = 0
+  for (let i = 0; i < rows.length; i += rowsPerStatement) {
+    const subBatchStart = i
+    const subBatchEnd = Math.min(i + rowsPerStatement, rows.length)
+    const chunk = rows.slice(subBatchStart, subBatchEnd)
     const sql = buildMultiRowInsertSql('ti_catalog_latest_opn', UPSERT_OPN_COLS, chunk.length)
     const binds: unknown[] = []
     for (const r of chunk) {
@@ -273,36 +315,37 @@ async function upsertOpnRows(d1: CatalogD1, rows: ParsedOpn[], capturedAt: strin
         source,
       )
     }
-    stmts.push(d1.prepare(sql).bind(...binds))
-    if (stmts.length >= STATEMENTS_PER_BATCH) {
-      try {
-        await d1.batch(stmts.splice(0, stmts.length))
-        upserted += STATEMENTS_PER_BATCH * OPN_ROWS_PER_STATEMENT
-      } catch (e: any) {
-        const msg = typeof e?.message === 'string' ? e.message : 'd1 opn batch failed'
-        errors.push(`d1_opn:${msg.slice(0, 100)}`)
-      }
-    }
-  }
-  if (stmts.length > 0) {
     try {
-      await d1.batch(stmts.splice(0, stmts.length))
-      upserted += STATEMENTS_PER_BATCH * OPN_ROWS_PER_STATEMENT
-    } catch (e: any) {
-      const msg = typeof e?.message === 'string' ? e.message : 'd1 opn batch (tail) failed'
-      errors.push(`d1_opn_tail:${msg.slice(0, 100)}`)
+      await d1.prepare(sql).bind(...binds).run()
+      upserted += chunk.length
+      sqlStatementsExecuted += 1
+    } catch (e) {
+      subBatchErrors.push({
+        table: 'ti_catalog_latest_opn',
+        subBatchStart,
+        subBatchEnd,
+        rowsInSubBatch: chunk.length,
+        sanitizedError: sanitizeErrorMessage(e, 'd1 opn micro-batch failed'),
+      })
     }
   }
-  return Math.min(upserted, rows.length)
+  return { upserted, sqlStatementsExecuted, rowsPerStatement }
 }
 
-async function upsertGpnRows(d1: CatalogD1, aggregates: GpnAggregate[], capturedAt: string, errors: string[]): Promise<number> {
+async function upsertGpnRows(
+  d1: CatalogD1,
+  aggregates: GpnAggregate[],
+  capturedAt: string,
+  subBatchErrors: SubBatchError[],
+): Promise<{ upserted: number; sqlStatementsExecuted: number; rowsPerStatement: number }> {
+  const paramsPerRow = UPSERT_GPN_COLS.length
+  const rowsPerStatement = computeRowsPerStatement(paramsPerRow)
   let upserted = 0
-  const stmts: CatalogD1Statement[] = []
-  // GPN table has 10 columns → 999/10 = ~99 rows per statement; use 75.
-  const ROWS_PER_STMT = 75
-  for (let i = 0; i < aggregates.length; i += ROWS_PER_STMT) {
-    const chunk = aggregates.slice(i, i + ROWS_PER_STMT)
+  let sqlStatementsExecuted = 0
+  for (let i = 0; i < aggregates.length; i += rowsPerStatement) {
+    const subBatchStart = i
+    const subBatchEnd = Math.min(i + rowsPerStatement, aggregates.length)
+    const chunk = aggregates.slice(subBatchStart, subBatchEnd)
     const sql = buildMultiRowInsertSql('ti_catalog_latest_gpn', UPSERT_GPN_COLS, chunk.length)
     const binds: unknown[] = []
     for (const a of chunk) {
@@ -322,27 +365,21 @@ async function upsertGpnRows(d1: CatalogD1, aggregates: GpnAggregate[], captured
         capturedAt,
       )
     }
-    stmts.push(d1.prepare(sql).bind(...binds))
-    if (stmts.length >= STATEMENTS_PER_BATCH) {
-      try {
-        await d1.batch(stmts.splice(0, stmts.length))
-        upserted += STATEMENTS_PER_BATCH * ROWS_PER_STMT
-      } catch (e: any) {
-        const msg = typeof e?.message === 'string' ? e.message : 'd1 gpn batch failed'
-        errors.push(`d1_gpn:${msg.slice(0, 100)}`)
-      }
-    }
-  }
-  if (stmts.length > 0) {
     try {
-      await d1.batch(stmts.splice(0, stmts.length))
-      upserted += STATEMENTS_PER_BATCH * ROWS_PER_STMT
-    } catch (e: any) {
-      const msg = typeof e?.message === 'string' ? e.message : 'd1 gpn batch (tail) failed'
-      errors.push(`d1_gpn_tail:${msg.slice(0, 100)}`)
+      await d1.prepare(sql).bind(...binds).run()
+      upserted += chunk.length
+      sqlStatementsExecuted += 1
+    } catch (e) {
+      subBatchErrors.push({
+        table: 'ti_catalog_latest_gpn',
+        subBatchStart,
+        subBatchEnd,
+        rowsInSubBatch: chunk.length,
+        sanitizedError: sanitizeErrorMessage(e, 'd1 gpn micro-batch failed'),
+      })
     }
   }
-  return Math.min(upserted, aggregates.length)
+  return { upserted, sqlStatementsExecuted, rowsPerStatement }
 }
 
 async function insertSnapshotRunSummary(
@@ -393,6 +430,16 @@ export type IngestChunkResult = {
   pricedOpns: number
   inStockOpns: number
   outOfStockOpns: number
+  /** Phase 23C.3 — D1 micro-batching diagnostics. paramsPerRow is the
+   *  number of bound params each row contributes (= UPSERT_OPN_COLS.length);
+   *  rowsPerStatement is what the writer derived from MAX_D1_BIND_PARAMS;
+   *  sqlStatementsExecuted is the actual count of INSERT OR REPLACE
+   *  statements run for this chunk. subBatchErrors is the structured
+   *  per-failed-statement list (never includes raw product payload). */
+  paramsPerRow: number
+  rowsPerStatement: number
+  sqlStatementsExecuted: number
+  subBatchErrors: SubBatchError[]
   errors: string[]
 }
 
@@ -406,6 +453,8 @@ export async function ingestCatalogChunk(
     products: unknown[]
   },
 ): Promise<IngestChunkResult> {
+  const paramsPerRow = UPSERT_OPN_COLS.length
+  const rowsPerStatement = computeRowsPerStatement(paramsPerRow)
   const result: IngestChunkResult = {
     success: false,
     runId: args.runId,
@@ -417,6 +466,10 @@ export async function ingestCatalogChunk(
     pricedOpns: 0,
     inStockOpns: 0,
     outOfStockOpns: 0,
+    paramsPerRow,
+    rowsPerStatement,
+    sqlStatementsExecuted: 0,
+    subBatchErrors: [],
     errors: [],
   }
   if (!Array.isArray(args.products) || args.products.length === 0) {
@@ -434,8 +487,18 @@ export async function ingestCatalogChunk(
       else if (parsed.quantity === 0) result.outOfStockOpns += 1
     }
   }
-  result.opnRowsUpserted = await upsertOpnRows(d1, opnRows, args.capturedAt, 'ti_store_v2_catalog_chunked', result.errors)
-  result.success = result.errors.length === 0
+  const upsert = await upsertOpnRows(d1, opnRows, args.capturedAt, 'ti_store_v2_catalog_chunked', result.subBatchErrors)
+  result.opnRowsUpserted = upsert.upserted
+  result.sqlStatementsExecuted = upsert.sqlStatementsExecuted
+  // Mirror sub-batch errors into the legacy `errors[]` (sanitized) so
+  // existing GH Actions log parsing keeps working.
+  for (const sb of result.subBatchErrors) {
+    result.errors.push(`d1_opn[${sb.subBatchStart}-${sb.subBatchEnd}]:${sb.sanitizedError}`)
+  }
+  // success requires every parsed row to have landed AND zero sub-batch
+  // failures. Previous criterion (errors.length === 0) silently succeeded
+  // when an empty errors array hid a partial write.
+  result.success = result.subBatchErrors.length === 0 && result.opnRowsUpserted === opnRows.length
   return result
 }
 
@@ -741,8 +804,21 @@ export async function captureTiCatalogSnapshot(
   result.outOfStockOpns = outOfStockOpns
   result.parsedOk = true
   // ── D1 upserts ────────────────────────────────────────────────────────
-  result.d1RowsUpserted = await upsertOpnRows(env.TI_INVENTORY_HISTORY_DB!, opnRows, result.capturedAt, result.source, result.errors)
-  result.gpnRowsUpserted = await upsertGpnRows(env.TI_INVENTORY_HISTORY_DB!, Array.from(gpnAggregates.values()), result.capturedAt, result.errors)
+  // Phase 23C.3 — helper signatures now return structured diagnostics +
+  // a SubBatchError list. Bridge them back into the legacy errors[]
+  // string array so the existing /capture endpoint shape is preserved.
+  const opnSubBatchErrors: SubBatchError[] = []
+  const opnUpsert = await upsertOpnRows(env.TI_INVENTORY_HISTORY_DB!, opnRows, result.capturedAt, result.source, opnSubBatchErrors)
+  result.d1RowsUpserted = opnUpsert.upserted
+  for (const sb of opnSubBatchErrors) {
+    result.errors.push(`d1_opn[${sb.subBatchStart}-${sb.subBatchEnd}]:${sb.sanitizedError}`)
+  }
+  const gpnSubBatchErrors: SubBatchError[] = []
+  const gpnUpsert = await upsertGpnRows(env.TI_INVENTORY_HISTORY_DB!, Array.from(gpnAggregates.values()), result.capturedAt, gpnSubBatchErrors)
+  result.gpnRowsUpserted = gpnUpsert.upserted
+  for (const sb of gpnSubBatchErrors) {
+    result.errors.push(`d1_gpn[${sb.subBatchStart}-${sb.subBatchEnd}]:${sb.sanitizedError}`)
+  }
   // ── Snapshot-run summary row ───────────────────────────────────────────
   await insertSnapshotRunSummary(env.TI_INVENTORY_HISTORY_DB!, result)
   result.success = result.errors.length === 0
