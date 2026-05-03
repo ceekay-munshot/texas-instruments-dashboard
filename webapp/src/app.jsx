@@ -3632,7 +3632,7 @@ function UniversePanel({ initialFilter, onClearFilter }) {
     { id: 'inventory_desc', label: 'Total inventory ↓' },
     { id: 'variants_desc',  label: 'Variant count ↓' },
     { id: 'price_asc',      label: 'Min price ↑' },
-    { id: 'price_desc',     label: 'Min price ↓' },
+    { id: 'max_price_desc', label: 'Max price ↓' },
     { id: 'out_of_stock',   label: 'Out of stock ↓' },
   ];
 
@@ -3960,6 +3960,7 @@ function UniversePanel({ initialFilter, onClearFilter }) {
                 <th style={{ ...headPad, textAlign: 'right' }}>Total qty</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Min price</th>
                 <th style={{ ...headPad, textAlign: 'right' }}>Median</th>
+                <th style={{ ...headPad, textAlign: 'right' }}>Max price</th>
                 <th style={{ ...headPad, textAlign: 'left' }}>Cheapest OPN</th>
                 <th style={{ ...headPad, textAlign: 'left' }}>Highest-inv OPN</th>
                 <th style={{ ...headPad, textAlign: 'left' }}>Lifecycle</th>
@@ -3967,10 +3968,10 @@ function UniversePanel({ initialFilter, onClearFilter }) {
             </thead>
             <tbody>
               {leaderboardLoading && (
-                <tr><td colSpan={9} style={{ ...cellPad, color: '#4a6a8a', textAlign: 'center' }}>Loading…</td></tr>
+                <tr><td colSpan={10} style={{ ...cellPad, color: '#4a6a8a', textAlign: 'center' }}>Loading…</td></tr>
               )}
               {!leaderboardLoading && leaderboard.length === 0 && (
-                <tr><td colSpan={9} style={{ ...cellPad, color: '#7a96b8', textAlign: 'center' }}>No rows</td></tr>
+                <tr><td colSpan={10} style={{ ...cellPad, color: '#7a96b8', textAlign: 'center' }}>No rows</td></tr>
               )}
               {!leaderboardLoading && leaderboard.map(r => (
                 <tr key={r.genericPartNumber}>
@@ -3982,6 +3983,7 @@ function UniversePanel({ initialFilter, onClearFilter }) {
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(r.totalQuantity)}</td>
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.minNormalizedUnitPrice)}</td>
                   <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.medianNormalizedUnitPrice)}</td>
+                  <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(r.maxNormalizedUnitPrice)}</td>
                   <td style={cellPad}>
                     {r.cheapestOpn ? (
                       <button onClick={() => openPart(r.cheapestOpn)} style={{ background: 'none', border: 'none', color: '#3d8ef0', cursor: 'pointer', fontFamily: 'monospace', padding: 0 }}>{r.cheapestOpn}</button>

@@ -4153,6 +4153,11 @@ type GpnRow = {
   total_quantity: number | null
   min_normalized_unit_price: number | null
   median_normalized_unit_price: number | null
+  // Phase 24E.1 — MAX(normalized_unit_price) per GPN. Not stored on the
+  // ti_catalog_latest_gpn table; computed via subquery in the leaderboard
+  // endpoint and may be undefined on rows from /family/:gpn (the GPN aggregate
+  // row alone doesn't carry it). Treat absent === null === unknown.
+  max_normalized_unit_price?: number | null
   cheapest_opn: string | null
   highest_inventory_opn: string | null
   lifecycle_summary: string | null
@@ -4187,6 +4192,10 @@ function publicGpnRow(r: GpnRow) {
     totalQuantity: r.total_quantity ?? 0,
     minNormalizedUnitPrice: r.min_normalized_unit_price,
     medianNormalizedUnitPrice: r.median_normalized_unit_price,
+    // Phase 24E.1 — only present on /gpn-leaderboard (computed via JOIN);
+    // /family/:gpn omits it, leave null so the UI can fall back to median or
+    // explicitly mark "—".
+    maxNormalizedUnitPrice: r.max_normalized_unit_price ?? null,
     cheapestOpn: r.cheapest_opn,
     highestInventoryOpn: r.highest_inventory_opn,
     lifecycleSummary: tryParseJson<Record<string, number>>(r.lifecycle_summary),
@@ -4267,15 +4276,26 @@ app.get('/api/ti/universe/catalog/overview', async (c) => {
 // GET /api/ti/universe/catalog/gpn-leaderboard — public, sanitized.
 // Sort options:
 //   inventory_desc (default) — highest total stock first
-//   price_desc / price_asc   — by min_normalized_unit_price (NULLs last)
+//   price_asc                — cheapest entry-point first (min_normalized_unit_price ASC, NULLs last)
+//   max_price_desc           — most expensive variant first (true MAX(normalized_unit_price) per
+//                              GPN via subquery, NULLs last). Phase 24E.1 — replaces the prior
+//                              `price_desc` (which actually sorted by min DESC, not max)
+//                              so the dropdown can honestly label two distinct views as
+//                              "Min price" and "Max price".
 //   out_of_stock             — fully out-of-stock GPNs first (opn_count - stocked_opn_count DESC)
 //   variants_desc            — by opn_count DESC (which families have the most variants)
 const GPN_LEADERBOARD_SORTS: Record<string, string> = {
   inventory_desc: 'ORDER BY COALESCE(total_quantity, 0) DESC',
-  price_desc:     'ORDER BY min_normalized_unit_price IS NULL, min_normalized_unit_price DESC',
   price_asc:      'ORDER BY min_normalized_unit_price IS NULL, min_normalized_unit_price ASC',
+  max_price_desc: 'ORDER BY max_normalized_unit_price IS NULL, max_normalized_unit_price DESC',
   out_of_stock:   'ORDER BY (opn_count - stocked_opn_count) DESC, opn_count DESC',
   variants_desc:  'ORDER BY opn_count DESC',
+}
+// Phase 24E.1 — keep `price_desc` as a quiet alias for `max_price_desc` so any
+// pre-existing bookmarks / external callers that still pass `?sort=price_desc`
+// keep working with the new (and more honest) max-price semantics.
+const GPN_LEADERBOARD_SORT_ALIASES: Record<string, string> = {
+  price_desc: 'max_price_desc',
 }
 app.get('/api/ti/universe/catalog/gpn-leaderboard', async (c) => {
   const env = c.env
@@ -4283,18 +4303,33 @@ app.get('/api/ti/universe/catalog/gpn-leaderboard', async (c) => {
     return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; catalog tables unavailable.' }, 503)
   }
   const d1 = env.TI_INVENTORY_HISTORY_DB as unknown as CatalogReadD1
-  const sortRaw = (c.req.query('sort') || 'inventory_desc').toLowerCase()
+  const sortInput = (c.req.query('sort') || 'inventory_desc').toLowerCase()
+  const sortRaw = GPN_LEADERBOARD_SORT_ALIASES[sortInput] ?? sortInput
   const orderBy = GPN_LEADERBOARD_SORTS[sortRaw] ?? GPN_LEADERBOARD_SORTS.inventory_desc
   const limitRaw = parseInt(c.req.query('limit') || '50', 10) || 50
   const limit = Math.max(1, Math.min(200, limitRaw))
+  // Phase 24E.1 — JOIN ti_catalog_latest_opn to surface the true MAX
+  // normalized unit price per GPN. The subquery is one hash-aggregate
+  // pass over the OPN table (~72k rows in production), then a hash join
+  // against ti_catalog_latest_gpn (~26k rows). Comfortably inside D1's
+  // per-statement CPU budget for a SELECT.
   const sql =
-    `SELECT generic_part_number, opn_count, stocked_opn_count, total_quantity,
-            min_normalized_unit_price, median_normalized_unit_price,
-            cheapest_opn, highest_inventory_opn, lifecycle_summary, latest_captured_at
-     FROM ti_catalog_latest_gpn
+    `SELECT gpn.generic_part_number, gpn.opn_count, gpn.stocked_opn_count, gpn.total_quantity,
+            gpn.min_normalized_unit_price, gpn.median_normalized_unit_price,
+            opn_max.max_normalized_unit_price,
+            gpn.cheapest_opn, gpn.highest_inventory_opn, gpn.lifecycle_summary, gpn.latest_captured_at
+     FROM ti_catalog_latest_gpn gpn
+     LEFT JOIN (
+       SELECT generic_part_number,
+              MAX(normalized_unit_price) AS max_normalized_unit_price
+         FROM ti_catalog_latest_opn
+        WHERE normalized_unit_price IS NOT NULL
+          AND generic_part_number IS NOT NULL
+        GROUP BY generic_part_number
+     ) opn_max ON opn_max.generic_part_number = gpn.generic_part_number
      ${orderBy}
      LIMIT ?`
-  const result = await d1.prepare(sql).bind(limit).all<GpnRow>()
+  const result = await d1.prepare(sql).bind(limit).all<GpnRow & { max_normalized_unit_price: number | null }>()
   return c.json({
     success: true,
     sort: sortRaw in GPN_LEADERBOARD_SORTS ? sortRaw : 'inventory_desc',
