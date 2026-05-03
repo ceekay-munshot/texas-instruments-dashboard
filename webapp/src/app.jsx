@@ -3073,7 +3073,6 @@ function App(){
                 }
                 return { v: null, fromTrend: false };
               }
-              window.__qtdValueFor = qtdValueFor; // exposed for testing
               const qtdHasAnyValue = visCats.some(c => qtdValueFor(c.id).v != null);
               if (!qtdHasAnyValue) {
                 const message = loading
