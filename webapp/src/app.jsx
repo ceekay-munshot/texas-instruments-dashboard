@@ -97,6 +97,25 @@ function writePersistedRateLimit(retryAt) {
   } catch {}
 }
 
+// Persist the latest successful live snapshot so a hard reload paints from
+// disk instead of going blank while /api/prices runs. Refresh always merges
+// new data into the existing state — partial responses keep prior values.
+const LIVE_DATA_LS_KEY = 'tip-live-data-v1';
+function readPersistedLiveData() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(LIVE_DATA_LS_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+function writePersistedLiveData(snapshot) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(LIVE_DATA_LS_KEY, JSON.stringify(snapshot));
+  } catch {}
+}
+
 
 function ToastShell({ toast, onDismiss }) {
   const border = toast.type==='error' ? '#4a1010' : toast.type==='warn' ? '#3a2800' : toast.type==='success' ? '#0a2a1a' : '#1a2740';
@@ -4346,11 +4365,15 @@ function UniversePanel({ initialFilter, onClearFilter }) {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 function App(){
-  const [liveData,setLiveData]=useState(null);
+  // Hydrate from the last successful snapshot first so the live row never
+  // starts blank while /api/prices runs in the background.
+  const persistedSnapshot = readPersistedLiveData();
+  const [liveData,setLiveData]=useState(persistedSnapshot?.data || null);
+  const liveDataRef = useRef(persistedSnapshot?.data || null);
   const [loading,setLoading]=useState(false);
-  const [fetchedAt,setFetchedAt]=useState(null);
-  const [src,setSrc]=useState('');
-  const [fetchCount,setFetchCount]=useState(null);
+  const [fetchedAt,setFetchedAt]=useState(persistedSnapshot?.fetchedAt || null);
+  const [src,setSrc]=useState(persistedSnapshot?.src || '');
+  const [fetchCount,setFetchCount]=useState(persistedSnapshot?.fetchCount || null);
   const [vis,setVis]=useState(new Set(Object.keys(GC)));
   const [tooltip,setTooltip]=useState(null);
   // Phase 24C.4 — tooltip position state (initially "below cursor", flipped
@@ -4450,10 +4473,29 @@ function App(){
       const json = await res.json();
       if (json.error) throw new Error(json.error);
 
-      setLiveData(json.data);
-      setFetchedAt(json.fetchedAt || json.cachedAt);
-      setSrc(json.source);
-      setFetchCount({ got: json.fetchedCount, total: json.totalCount });
+      // Merge new categories into existing data — never blank out values
+      // for categories the response omitted. Partial responses keep prior
+      // values for the missing categories.
+      const incoming = (json && typeof json.data === 'object' && json.data) || {};
+      const incomingKeys = Object.keys(incoming);
+      const newSrc = json.source;
+      const merged = { ...(liveDataRef.current || {}), ...incoming };
+      liveDataRef.current = merged;
+      setLiveData(merged);
+      // Only advance the "updated" timestamp when the response actually
+      // contributed data — keeps the displayed update time honest.
+      if (incomingKeys.length > 0) {
+        setFetchedAt(json.fetchedAt || json.cachedAt);
+        setSrc(newSrc);
+        setFetchCount({ got: json.fetchedCount, total: json.totalCount });
+        // Persist the latest good snapshot so a future reload paints from disk.
+        writePersistedLiveData({
+          data: merged,
+          fetchedAt: json.fetchedAt || json.cachedAt,
+          fetchCount: { got: json.fetchedCount, total: json.totalCount },
+          src: newSrc,
+        });
+      }
       if (json.baselineDate) {
         setBaselineMeta({
           baselineDate: json.baselineDate,
@@ -4879,7 +4921,7 @@ function App(){
         <span><span style={{color:'#00c9a7'}}>■</span> Price increase</span>
         <span><span style={{color:'#f05c5c'}}>■</span> Price decrease</span>
         <span style={{color:'#4a6a8a'}}>· Quarterly rows show QoQ price movement</span>
-        <span style={{color:'#4a6a8a'}}>· Live row shows the latest update</span>
+        <span style={{color:'#4a6a8a'}}>· QTD row shows the latest update</span>
       </div>
 
       {/* ── Data sources (collapsed) ── */}
@@ -4926,7 +4968,7 @@ function App(){
             <tr>
               <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                 <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ LIVE {fetchedAt?`· updated ${new Date(fetchedAt).toLocaleString()}`:'· Click Refresh to get the latest data'}</span>
+                  <span>▼ Latest data {fetchedAt?`· updated ${new Date(fetchedAt).toLocaleString()}`:'· Click Refresh to get latest data'}</span>
                   {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· update pending</span>}
                 </div>
               </td>
@@ -4938,9 +4980,9 @@ function App(){
                 {loading
                   ? <span style={{display:'flex',alignItems:'center',gap:6}}>
                       <span style={{width:6,height:6,border:'1.5px solid #4a6480',borderTopColor:'#ffd700',borderRadius:'50%',display:'inline-block',animation:'spin 0.7s linear infinite'}}/>
-                      Loading…
+                      QTD
                     </span>
-                  : '★ Live'}
+                  : '★ QTD'}
               </td>
               {visCats.map((c,i)=>{
                 const iF=i===0||visCats[i-1].g!==c.g;
@@ -5065,7 +5107,7 @@ function App(){
 
       {/* Slim global footer */}
       <div style={{padding:'8px 16px 14px',borderTop:`1px solid #0d1520`,fontSize:'0.53rem',color:'#1a2740',display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:4,marginTop:4}}>
-        <span>USD · {HP.length} quarters of history + live</span>
+        <span>USD · {HP.length} quarters of history + latest data</span>
         <span>TI Product Price Intelligence</span>
       </div>
     </div>
