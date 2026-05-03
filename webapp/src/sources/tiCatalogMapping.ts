@@ -135,18 +135,18 @@ export const CANONICAL_MAPPING_RULES: MappingRule[] = [
   // ── Power Management (after data-center / GaN to avoid clobber) ─────────
   rule('power_battery_mgmt', gpnPrefix(['BQ24', 'BQ25', 'BQ27', 'BQ40', 'BQ34', 'BQ76']), 'power_management', 'power_battery_mgmt', 'high'),
   rule('power_acdc_switching', gpnPrefix(['UCC28', 'UCC25']),        'power_management',  'power_acdc_switching', 'high'),
-  // Phase 24C.1 — load switches (TPS22*) bucket under supervisor/reset
-  // since the canonical taxonomy doesn't have a dedicated load-switch
-  // subcategory; medium confidence flags this for the operator.
-  rule('power_load_switch_tps22', gpnPrefix(['TPS22']),              'power_management',  'power_supervisor_reset', 'medium'),
+  // Phase 24C.3 — removed `power_load_switch_tps22` (TPS22* → supervisor/
+  // reset). Production TPS22967DSGR (a load switch) was surfacing as the
+  // highestInventoryOpn under power_supervisor_reset, misrepresenting the
+  // category. Load switches aren't supervisors; with no dedicated
+  // load-switch subcategory in the canonical taxonomy, leave them
+  // unmapped rather than contaminate a customer-facing rollup.
   rule('power_supervisor_reset', gpnPrefix(['TPS3', 'TPS779', 'TLV803', 'TLV810']), 'power_management', 'power_supervisor_reset', 'medium'),
   // Phase 24C.1 — TPS7A* LDOs explicitly (TPS779 already covered by
   // existing list; TPS7A* is a wider TI LDO family seen in unmapped
   // samples).
   rule('power_ldo_tps7a', gpnPrefix(['TPS7A']),                      'power_management',  'power_ldo',              'high'),
   rule('power_ldo',     gpnPrefix(['TLV7', 'TLV8', 'TLV9', 'TPS779', 'LP590', 'TLV767', 'TPS73', 'TPS74']), 'power_management', 'power_ldo', 'high'),
-  // Phase 24C.1 — motor drivers (DRV8/3/5) bucket under DC-DC switching
-  // since the taxonomy doesn't have a dedicated motor-driver bucket.
   // Phase 24C.2 — removed `power_led_driver` (LM3*/TPS9*/TLC59*) because
   // the LM3* prefix matched LM358 op-amps and other unrelated parts;
   // also removed analog_voltage_ref, analog_temp_sensor, interface_logic_switch,
@@ -154,10 +154,16 @@ export const CANONICAL_MAPPING_RULES: MappingRule[] = [
   // production verification (interface_can opnCount=12842, low=12458;
   // amp_opamps highest-inv=TMP113AIYBGR; isolation_digital
   // highest-inv=TLV61046 boost converter) showed they were placing
-  // unrelated parts into customer-facing categories. Better to leave
-  // them unmapped and surface that honestly than to ship contaminated
-  // rollups. Operator can re-add narrower rules later.
-  rule('power_motor_driver', gpnPrefix(['DRV8', 'DRV3', 'DRV5']),    'power_management',  'power_dcdc_switching',   'medium'),
+  // unrelated parts into customer-facing categories.
+  //
+  // Phase 24C.3 — removed `power_motor_driver` (DRV8/DRV3/DRV5 → DC-DC
+  // switching). DRV5* are Hall-effect sensors/latches, not switching
+  // regulators; production DRV5013FAEDBZRQ1 was surfacing as the
+  // highestInventoryOpn under power_dcdc_switching. With no dedicated
+  // motor-driver / sensor subcategory in the canonical taxonomy, leave
+  // these unmapped rather than contaminate a customer-facing rollup.
+  // Operator can re-add narrower rules later (e.g. DRV8* only, scoped
+  // to a future motor-driver bucket).
   // Catch-all DC-DC AFTER the more specific TPS546 / TPS25xx rules above.
   rule('power_dcdc_switching', gpnPrefix(['TPS54', 'TPS55', 'TPS56', 'TPS57', 'TPS61', 'TPS62', 'TPS63', 'LMR1', 'LMR2', 'LMR3', 'LM5145', 'LM5146']), 'power_management', 'power_dcdc_switching', 'high'),
 
