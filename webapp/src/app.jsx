@@ -5073,6 +5073,7 @@ function App(){
                 const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':isRLCell?'⚡':'—',col:isRLCell?'#3a2800':'#2a4060',bold:false};
                 return(
                   <td key={c.id}
+                    className={handleClick?'tdc':undefined}
                     onMouseEnter={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
                     onMouseMove={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
                     onMouseLeave={hasTooltip?()=>setTooltip(null):undefined}
