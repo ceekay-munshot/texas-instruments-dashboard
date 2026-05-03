@@ -3404,7 +3404,7 @@ function InsightsPanel({ liveData, baselineMeta, combinedEvidence, trendMeta, ti
 // Never calls TI directly. Never mutates anything. Hides itself behind the
 // new "Universe" tab so the existing 64-part Inventory dashboard, Mouser,
 // and Nexar flows keep their current shape unchanged.
-function UniversePanel() {
+function UniversePanel({ initialFilter, onClearFilter }) {
   const [overview, setOverview]                  = useState(null);
   const [overviewError, setOverviewError]        = useState(null);
   const [sort, setSort]                          = useState('inventory_desc');
@@ -3418,6 +3418,49 @@ function UniversePanel() {
   const [selectedFamily, setSelectedFamily]      = useState(null);
   const [drillLoading, setDrillLoading]          = useState(false);
   const [drillError, setDrillError]              = useState(null);
+  // Phase 24D — subcategory filter that's set whenever the user
+  // clicks a Prices Live cell with a TI rollup. Drives the
+  // "Filtered by Prices cell" banner + the rollup-detail panel
+  // (rollup summary, GPN families table, OPN rows table).
+  const [filter, setFilter]                      = useState(initialFilter || null);
+  const [detail, setDetail]                      = useState(null);
+  const [detailLoading, setDetailLoading]        = useState(false);
+  const [detailError, setDetailError]            = useState(null);
+  // When the parent App swaps in a new filter (e.g. user clicks a
+  // different Prices cell), mirror it locally and re-fetch detail.
+  useEffect(() => { setFilter(initialFilter || null); }, [initialFilter?.canonicalSubcategory]);
+  useEffect(() => {
+    if (!filter?.canonicalSubcategory) {
+      setDetail(null); setDetailError(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setDetailLoading(true);
+      setDetailError(null);
+      try {
+        const res = await fetch(`/api/ti/universe/catalog/rollups/detail?subcategory=${encodeURIComponent(filter.canonicalSubcategory)}&gpnLimit=50&opnLimit=100`);
+        const json = await res.json();
+        if (cancelled) return;
+        if (!res.ok || !json?.success) {
+          setDetail(null);
+          setDetailError(json?.message || `HTTP ${res.status}`);
+        } else {
+          setDetail(json);
+        }
+      } catch (e) {
+        if (!cancelled) setDetailError(e?.message || String(e));
+      }
+      if (!cancelled) setDetailLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [filter?.canonicalSubcategory]);
+  const clearFilter = useCallback(() => {
+    setFilter(null);
+    setDetail(null);
+    setDetailError(null);
+    if (typeof onClearFilter === 'function') onClearFilter();
+  }, [onClearFilter]);
   // Phase 24B.1 — second-by-second tick for the locked-refresh card so the
   // countdown stays accurate without refetching /overview every second.
   // Only ticks while the cooldown window is active; the effect tears the
@@ -3611,6 +3654,179 @@ function UniversePanel() {
           Overview unavailable: {overviewError}
         </div>
       )}
+
+      {/* Phase 24D — filter banner + detail panel. Shown only when the
+          user arrived from a Prices Live cell click. The regular cards
+          / search / leaderboard remain rendered below so the operator
+          can drop the filter and continue exploring. */}
+      {filter && (() => {
+        const ql = filter.qualityLabel || 'unknown';
+        const banner = ql === 'high'   ? { bg:'#0a1a14', bd:'#1f4a36', fg:'#4dffc3', icon:'✅' }
+                     : ql === 'medium' ? { bg:'#0a1a14', bd:'#1f4a36', fg:'#00c9a7', icon:'✅' }
+                     : ql === 'low'    ? { bg:'#1a1000', bd:'#5a3a00', fg:'#f0a84e', icon:'⚠' }
+                     : ql === 'mixed'  ? { bg:'#1a1000', bd:'#5a3a00', fg:'#f0a84e', icon:'⚠' }
+                     :                   { bg:'#0c1426', bd:'#1a2740', fg:'#7a96b8', icon:'·' };
+        const fmtN = (n) => (n == null ? '—' : Number(n).toLocaleString());
+        const fmtPrice = (n) => (n == null ? '—' : `$${Number(n).toFixed(4)}`);
+        const fmtDate = (iso) => { if (!iso) return '—'; try { return new Date(iso).toISOString().slice(0,10); } catch { return iso; } };
+        const fmtLifecycle = (obj) => {
+          if (!obj || typeof obj !== 'object') return '—';
+          const entries = Object.entries(obj);
+          if (entries.length === 0) return '—';
+          return entries.map(([k, v]) => `${k}:${v}`).join(' · ');
+        };
+        const r = detail?.rollup;
+        const cellPad = { padding: '6px 10px', borderBottom: '1px solid #1a2740', fontFamily: 'monospace' };
+        const headPad = { ...cellPad, color: '#7a96b8', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.08em', fontSize: '0.55rem', position: 'sticky', top: 0, background: '#080c14' };
+        return (
+          <>
+            <div style={{ background: banner.bg, border: `1px solid ${banner.bd}`, borderRadius: 6, padding: '10px 14px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, fontSize: '0.7rem' }}>
+              <span style={{ fontSize: '1.05rem' }} aria-hidden>{banner.icon}</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ color: banner.fg, fontWeight: 'bold', letterSpacing: '0.06em', textTransform: 'uppercase', fontSize: '0.6rem', marginBottom: 2 }}>
+                  Filtered by Prices cell
+                </div>
+                <div style={{ color: '#c4d4e8' }}>
+                  Viewing TI Direct evidence for{' '}
+                  <span style={{ color: '#e0eaf8', fontWeight: 'bold' }}>{filter.displayLabel || filter.canonicalSubcategory}</span>{' '}
+                  <span style={{ color: '#7a96b8' }}>· quality </span>
+                  <span style={{ color: banner.fg, fontWeight: 'bold' }}>{ql}</span>
+                </div>
+                {ql === 'low' || ql === 'mixed' ? (
+                  <div style={{ color: banner.fg, fontStyle: 'italic', marginTop: 3, fontSize: '0.62rem' }}>
+                    This rollup is exploratory. Use as context, not signal.
+                  </div>
+                ) : null}
+              </div>
+              <button onClick={clearFilter} style={{ background: 'none', border: `1px solid ${banner.bd}`, color: banner.fg, cursor: 'pointer', fontFamily: 'monospace', padding: '4px 10px', fontSize: '0.6rem', borderRadius: 4 }}>
+                clear filter
+              </button>
+            </div>
+
+            {detailLoading && (
+              <div style={{ padding: 12, color: '#7a96b8', fontSize: '0.65rem' }}>Loading subcategory detail…</div>
+            )}
+            {detailError && (
+              <div style={{ background: '#2a1010', border: '1px solid #5a2020', borderRadius: 6, padding: '8px 12px', marginBottom: 12, fontSize: '0.65rem', color: '#ffb0b0' }}>
+                Detail unavailable: {detailError}
+              </div>
+            )}
+
+            {r && (
+              <div style={{ background: '#0c1426', border: '1px solid #1a2740', borderRadius: 6, padding: '12px 14px', marginBottom: 16 }}>
+                <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
+                  Rollup summary · {r.canonicalGroup} · {r.canonicalSubcategory}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, fontSize: '0.62rem', lineHeight: 1.55 }}>
+                  <div><span style={{ color: '#7a96b8' }}>OPNs: </span>{fmtN(r.opnCount)}</div>
+                  <div><span style={{ color: '#7a96b8' }}>GPNs: </span>{fmtN(r.gpnCount)}</div>
+                  <div><span style={{ color: '#7a96b8' }}>Stocked: </span><span style={{ color: '#4dffc3' }}>{fmtN(r.stockedOpnCount)}</span> ({r.stockedPct == null ? '—' : `${r.stockedPct}%`})</div>
+                  <div><span style={{ color: '#7a96b8' }}>Out of stock: </span><span style={{ color: '#f0a84e' }}>{fmtN(r.outOfStockOpnCount)}</span></div>
+                  <div><span style={{ color: '#7a96b8' }}>Total qty: </span>{fmtN(r.totalQuantity)}</div>
+                  <div><span style={{ color: '#7a96b8' }}>Median price: </span>{fmtPrice(r.medianNormalizedUnitPrice)}</div>
+                  <div><span style={{ color: '#7a96b8' }}>Min / Max: </span>{fmtPrice(r.minNormalizedUnitPrice)} / {fmtPrice(r.maxNormalizedUnitPrice)}</div>
+                  <div><span style={{ color: '#7a96b8' }}>Cheapest OPN: </span>{r.cheapestOpn ? <button onClick={() => openPart(r.cheapestOpn)} style={{ background:'none', border:'none', color:'#3d8ef0', cursor:'pointer', fontFamily:'monospace', padding:0, fontWeight:'bold' }}>{r.cheapestOpn}</button> : '—'}</div>
+                  <div><span style={{ color: '#7a96b8' }}>Highest-inv OPN: </span>{r.highestInventoryOpn ? <button onClick={() => openPart(r.highestInventoryOpn)} style={{ background:'none', border:'none', color:'#3d8ef0', cursor:'pointer', fontFamily:'monospace', padding:0, fontWeight:'bold' }}>{r.highestInventoryOpn}</button> : '—'}</div>
+                  <div><span style={{ color: '#7a96b8' }}>Quality: </span><span style={{ color: banner.fg, fontWeight:'bold' }}>{r.qualityLabel}</span> ({r.highConfidencePct}% high-conf)</div>
+                  <div><span style={{ color: '#7a96b8' }}>Snapshot: </span>{fmtDate(r.latestCapturedAt)}</div>
+                </div>
+                <div style={{ marginTop: 6, fontSize: '0.62rem', color: '#7a96b8' }}>
+                  Mapping: <span style={{ color: '#4dffc3' }}>{Number(r.highConfidenceOpnCount||0)} high</span>
+                  {' · '}<span style={{ color: '#00c9a7' }}>{Number(r.mediumConfidenceOpnCount||0)} medium</span>
+                  {' · '}<span style={{ color: '#f0a84e' }}>{Number(r.lowConfidenceOpnCount||0)} low</span>
+                  {' · lifecycle '}<span style={{ color: '#c4d4e8' }}>{fmtLifecycle(r.lifecycleSummary)}</span>
+                </div>
+                {r.qualityWarning && (
+                  <div style={{ color: banner.fg, fontStyle: 'italic', marginTop: 4, fontSize: '0.62rem' }}>⚠ {r.qualityWarning}</div>
+                )}
+                <div style={{ color: '#7a96b8', fontStyle: 'italic', marginTop: 4, fontSize: '0.6rem' }}>
+                  Current TI Direct evidence is latest snapshot only. Trend requires at least two TI catalog snapshots.
+                </div>
+              </div>
+            )}
+
+            {detail?.topGpns?.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
+                  GPN families in this subcategory ({detail.topGpns.length})
+                </div>
+                <div style={{ background: '#0c1426', border: '1px solid #1a2740', borderRadius: 6, overflow: 'auto', maxHeight: 360 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.62rem' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ ...headPad, textAlign: 'left' }}>GPN</th>
+                        <th style={{ ...headPad, textAlign: 'right' }}>OPNs</th>
+                        <th style={{ ...headPad, textAlign: 'right' }}>Stocked</th>
+                        <th style={{ ...headPad, textAlign: 'right' }}>Total qty</th>
+                        <th style={{ ...headPad, textAlign: 'right' }}>Min price</th>
+                        <th style={{ ...headPad, textAlign: 'left' }}>Lifecycle</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {detail.topGpns.map(g => (
+                        <tr key={g.genericPartNumber}>
+                          <td style={cellPad}>
+                            <button onClick={() => openFamily(g.genericPartNumber)} style={{ background:'none', border:'none', color:'#3d8ef0', cursor:'pointer', fontFamily:'monospace', padding:0, fontWeight:'bold' }}>{g.genericPartNumber}</button>
+                          </td>
+                          <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(g.opnCount)}</td>
+                          <td style={{ ...cellPad, textAlign: 'right', color: g.stockedOpnCount > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(g.stockedOpnCount)}</td>
+                          <td style={{ ...cellPad, textAlign: 'right' }}>{fmtN(g.totalQuantity)}</td>
+                          <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(g.minNormalizedUnitPrice)}</td>
+                          <td style={{ ...cellPad, color: '#7a96b8' }}>{fmtLifecycle(g.lifecycleSummary)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {detail?.topOpns?.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: '0.6rem', color: '#7a96b8', fontWeight: 'bold', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
+                  OPNs in this subcategory ({detail.topOpns.length})
+                </div>
+                <div style={{ background: '#0c1426', border: '1px solid #1a2740', borderRadius: 6, overflow: 'auto', maxHeight: 360 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.6rem' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ ...headPad, textAlign: 'left' }}>OPN</th>
+                        <th style={{ ...headPad, textAlign: 'left' }}>GPN</th>
+                        <th style={{ ...headPad, textAlign: 'left' }}>Description</th>
+                        <th style={{ ...headPad, textAlign: 'right' }}>Quantity</th>
+                        <th style={{ ...headPad, textAlign: 'right' }}>Unit price</th>
+                        <th style={{ ...headPad, textAlign: 'left' }}>Lifecycle</th>
+                        <th style={{ ...headPad, textAlign: 'left' }}>Confidence</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {detail.topOpns.map(o => {
+                        const conf = o.mappingConfidence || 'unknown';
+                        const confColor = conf === 'high' ? '#4dffc3' : conf === 'medium' ? '#00c9a7' : conf === 'low' ? '#f0a84e' : '#7a96b8';
+                        return (
+                          <tr key={o.tiPartNumber}>
+                            <td style={cellPad}>
+                              <button onClick={() => openPart(o.tiPartNumber)} style={{ background:'none', border:'none', color:'#3d8ef0', cursor:'pointer', fontFamily:'monospace', padding:0 }}>{o.tiPartNumber}</button>
+                            </td>
+                            <td style={cellPad}>
+                              {o.genericPartNumber ? <button onClick={() => openFamily(o.genericPartNumber)} style={{ background:'none', border:'none', color:'#3d8ef0', cursor:'pointer', fontFamily:'monospace', padding:0 }}>{o.genericPartNumber}</button> : '—'}
+                            </td>
+                            <td style={{ ...cellPad, color: '#7a96b8', maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{o.description || ''}</td>
+                            <td style={{ ...cellPad, textAlign: 'right', color: o.quantity > 0 ? '#4dffc3' : '#f0a84e' }}>{fmtN(o.quantity)}</td>
+                            <td style={{ ...cellPad, textAlign: 'right' }}>{fmtPrice(o.normalizedUnitPrice)}</td>
+                            <td style={cellPad}>{o.lifeCycle || '—'}</td>
+                            <td style={{ ...cellPad, color: confColor, fontWeight: 'bold' }}>{conf}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {/* Phase 24B.1 — catalog refresh state banner. Locked + amber while in
           cooldown; green + 'safe now' once the window opens. The actual
@@ -3957,6 +4173,12 @@ function App(){
   // Phase 19B — two-tab UI. 'prices' is the customer-facing default;
   // 'insights' holds source agreement, signal summary, and operator status.
   const [activeTab,setActiveTab]=useState('prices');
+  // Phase 24D — TI Universe filter set when the user clicks a Prices Live
+  // cell that has a TI Direct rollup. Switches the tab to 'universe' and
+  // pre-fills the panel with a subcategory-scoped detail view (rollup
+  // summary + GPN families + OPN rows). Cleared either via the in-panel
+  // "Clear filter" button or by navigating away from Universe tab.
+  const [universeFilter,setUniverseFilter]=useState(null);
   // Phase 20A — TI direct API status (Product Info active, Store pending).
   const [tiStatus,setTiStatus]=useState(null);
   const { toasts, push, dismiss } = useToasts();
@@ -4431,6 +4653,10 @@ function App(){
               {qualityWarning && (
                 <div style={{color:qualityColor,fontStyle:'italic',marginTop:3}}>⚠ {qualityWarning}</div>
               )}
+              {/* Phase 24D — CTA: clicking the cell opens the Universe
+                  tab pre-filtered to this canonical subcategory's
+                  drilldown (rollup + GPN families + OPN rows). */}
+              <div style={{color:'#3d8ef0',marginTop:3}}>→ Click cell to inspect mapped TI parts</div>
               <div style={{color:'#7a96b8',fontStyle:'italic',marginTop:2}}>Latest catalog snapshot only — historical trend requires ≥2 catalog snapshots.</div>
             </div>
           </div>
@@ -4616,14 +4842,32 @@ function App(){
                 // Phase 24C: TI Direct rollup also opens the tooltip so the
                 // 72k-OPN evidence is reachable from any mapped cell.
                 const hasTooltip = isLive || hasBasket || hasTiRollup;
+                // Phase 24D — when a TI rollup exists, clicking the cell
+                // hops to the Universe tab pre-filtered to this canonical
+                // subcategory's drilldown. Carries qualityLabel +
+                // qualityWarning + a human-readable display label so the
+                // panel banner makes sense at a glance.
+                const handleClick = hasTiRollup ? () => {
+                  setUniverseFilter({
+                    canonicalSubcategory: canonicalForCell,
+                    canonicalGroup: tiRollup?.canonicalGroup ?? null,
+                    qualityLabel: tiQualityLabel,
+                    qualityWarning: tiRollup?.qualityWarning ?? null,
+                    displayLabel: c.l,
+                    sourceCellId: c.id,
+                    usable: tiUsable,
+                  });
+                  setActiveTab('universe');
+                } : undefined;
                 const{txt,col,bold}=v!=null?fmt(v):{txt:loading?'…':isRLCell?'⚡':'—',col:isRLCell?'#3a2800':'#2a4060',bold:false};
                 return(
                   <td key={c.id}
                     onMouseEnter={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
                     onMouseMove={hasTooltip?e=>setTooltip({catId:c.id,x:e.clientX,y:e.clientY}):undefined}
                     onMouseLeave={hasTooltip?()=>setTooltip(null):undefined}
-                    title={isRLCell?'Rate limited — will retry automatically':undefined}
-                    style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:hasTooltip?'crosshair':'default'}}>
+                    onClick={handleClick}
+                    title={isRLCell?'Rate limited — will retry automatically':hasTiRollup?'Click to inspect mapped TI parts in Universe tab':undefined}
+                    style={{padding:'5px 6px',textAlign:'right',borderBottom:`1px solid ${B}`,borderLeft:iF?`1px solid #0d1520`:'none',fontFamily:'monospace',fontSize:bold?'0.76rem':'0.72rem',color:d?.error?isRLCell?'#4a3010':'#2d4a6b':col,fontWeight:bold?'bold':'normal',cursor:handleClick?'pointer':hasTooltip?'crosshair':'default'}}>
                     {txt}{isLive&&<sup style={{fontSize:'0.42rem',color:'#ffd700',marginLeft:1}}>L</sup>}{hasBasket&&<sup style={{fontSize:'0.42rem',color:'#3d8ef0',marginLeft:1}} title="Nexar trusted basket preview available — hover for detail">NX</sup>}{hasTiRollup&&<sup style={{fontSize:'0.42rem',color:tiBadgeColor,marginLeft:1,opacity:tiBadgeOpacity}} title={tiBadgeTitle}>{tiUsable ? 'TI' : 'TI?'}</sup>}
                   </td>
                 );
@@ -4636,7 +4880,10 @@ function App(){
 
       {activeTab==='inventory'&&<InventoryPanel/>}
 
-      {activeTab==='universe'&&<UniversePanel/>}
+      {activeTab==='universe'&&<UniversePanel
+        initialFilter={universeFilter}
+        onClearFilter={()=>setUniverseFilter(null)}
+      />}
 
       {activeTab==='insights'&&<InsightsPanel
         liveData={liveData}

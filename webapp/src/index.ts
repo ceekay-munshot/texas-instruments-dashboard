@@ -3490,6 +3490,213 @@ app.get('/api/ti/universe/catalog/rollups/latest', async (c) => {
   })
 })
 
+// GET /api/ti/universe/catalog/rollups/detail — public, sanitized.
+//
+// Phase 24D — drives the "click a Prices Live cell → see exact mapped
+// TI parts behind that subcategory" workflow. Returns:
+//   - The full ti_catalog_rollup_latest row (with quality fields).
+//   - Top GPN families that mapped into this subcategory (aggregated
+//     from the same OPN predicate that built the rollup).
+//   - Top OPNs in the subcategory, with per-row mapping_confidence
+//     resolved by walking the subcategory's own-rules in order
+//     (mirrors first-match-wins).
+//
+// Filters / limits:
+//   ?subcategory=<canonical_subcategory>  required
+//   ?gpnLimit=1..200  default 50
+//   ?opnLimit=1..500  default 100
+//
+// Never calls TI; never mutates anything.
+app.get('/api/ti/universe/catalog/rollups/detail', async (c) => {
+  const env = c.env
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; rollup detail unavailable.' }, 503)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB as any
+  const subcategory = (c.req.query('subcategory') || '').trim()
+  if (!subcategory) {
+    return c.json({ success: false, status: 'invalid_payload', message: '?subcategory=<canonical_subcategory> is required.' }, 400)
+  }
+  const predicate = listSubcategoryPredicates().find(p => p.canonicalSubcategory === subcategory)
+  if (!predicate) {
+    return c.json({ success: false, status: 'unknown_subcategory', message: `Subcategory '${subcategory}' is not in the canonical mapping list.` }, 404)
+  }
+  const gpnLimitRaw = parseInt(c.req.query('gpnLimit') || '50', 10) || 50
+  const gpnLimit = Math.max(1, Math.min(200, gpnLimitRaw))
+  const opnLimitRaw = parseInt(c.req.query('opnLimit') || '100', 10) || 100
+  const opnLimit = Math.max(1, Math.min(500, opnLimitRaw))
+
+  // 1. Read the rollup row (with quality fields derived in JS so older
+  //    backfills that predate Phase 24C.2 still surface them).
+  type RollupRaw = {
+    canonical_group: string;
+    canonical_subcategory: string;
+    opn_count: number; gpn_count: number;
+    priced_opn_count: number; stocked_opn_count: number; out_of_stock_opn_count: number;
+    stocked_pct: number | null; total_quantity: number | null;
+    median_normalized_unit_price: number | null;
+    min_normalized_unit_price: number | null;
+    max_normalized_unit_price: number | null;
+    cheapest_opn: string | null; highest_inventory_opn: string | null;
+    lifecycle_summary: string | null; mapping_confidence_summary: string | null;
+    latest_captured_at: string;
+  }
+  const rollupRow = await d1.prepare(
+    `SELECT canonical_group, canonical_subcategory,
+            opn_count, gpn_count, priced_opn_count,
+            stocked_opn_count, out_of_stock_opn_count, stocked_pct,
+            total_quantity, median_normalized_unit_price,
+            min_normalized_unit_price, max_normalized_unit_price,
+            cheapest_opn, highest_inventory_opn,
+            lifecycle_summary, mapping_confidence_summary,
+            latest_captured_at
+       FROM ti_catalog_rollup_latest
+       WHERE canonical_subcategory = ?
+       LIMIT 1`,
+  ).bind(subcategory).first<RollupRaw>()
+  if (!rollupRow) {
+    return c.json({ success: false, status: 'rollup_not_built', message: `Rollup row for '${subcategory}' has not been built yet. Operator: POST /rollups/rebuild?mode=run.` }, 404)
+  }
+  const parseJson = (s: string | null) => {
+    if (typeof s !== 'string') return s ?? null
+    try { return JSON.parse(s) } catch { return s }
+  }
+  const mappingConfidenceSummary = parseJson(rollupRow.mapping_confidence_summary)
+  const quality = computeRollupQuality({ opnCount: rollupRow.opn_count, mappingConfidenceSummary })
+  const rollup = {
+    canonicalGroup: rollupRow.canonical_group,
+    canonicalSubcategory: rollupRow.canonical_subcategory,
+    opnCount: rollupRow.opn_count,
+    gpnCount: rollupRow.gpn_count,
+    pricedOpnCount: rollupRow.priced_opn_count,
+    stockedOpnCount: rollupRow.stocked_opn_count,
+    outOfStockOpnCount: rollupRow.out_of_stock_opn_count,
+    stockedPct: rollupRow.stocked_pct,
+    totalQuantity: rollupRow.total_quantity,
+    medianNormalizedUnitPrice: rollupRow.median_normalized_unit_price,
+    minNormalizedUnitPrice: rollupRow.min_normalized_unit_price,
+    maxNormalizedUnitPrice: rollupRow.max_normalized_unit_price,
+    cheapestOpn: rollupRow.cheapest_opn,
+    highestInventoryOpn: rollupRow.highest_inventory_opn,
+    lifecycleSummary: parseJson(rollupRow.lifecycle_summary),
+    mappingConfidenceSummary,
+    latestCapturedAt: rollupRow.latest_captured_at,
+    ...quality,
+  }
+
+  // 2. Top GPN families inside the subcategory predicate. Aggregate from
+  //    OPN matches so the gpn_count + total_qty here line up exactly
+  //    with the rollup's own counts (the GPN aggregate table is unaware
+  //    of canonical subcategories — it groups across the whole catalog).
+  const where = predicate.whereClause
+  type GpnAggRow = {
+    gpn: string;
+    opn_count: number;
+    stocked_opn_count: number;
+    total_quantity: number;
+    min_normalized_unit_price: number | null;
+    median_normalized_unit_price: number | null;
+    cheapest_opn: string | null;
+    highest_inventory_opn: string | null;
+    lifecycle_summary: string | null;
+  }
+  const gpnRows = await d1.prepare(
+    `SELECT generic_part_number AS gpn,
+            COUNT(*) AS opn_count,
+            SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0 THEN 1 ELSE 0 END) AS stocked_opn_count,
+            SUM(COALESCE(quantity, 0)) AS total_quantity,
+            MIN(normalized_unit_price) AS min_normalized_unit_price,
+            NULL AS median_normalized_unit_price,
+            NULL AS cheapest_opn,
+            NULL AS highest_inventory_opn,
+            (SELECT json_group_object(lifecycle, cnt) FROM (
+              SELECT lifecycle, COUNT(*) AS cnt
+                FROM ti_catalog_latest_opn lc_inner
+               WHERE lc_inner.lifecycle IS NOT NULL
+                 AND TRIM(lc_inner.lifecycle) != ''
+                 AND lc_inner.generic_part_number = ti_catalog_latest_opn.generic_part_number
+               GROUP BY lifecycle)) AS lifecycle_summary
+       FROM ti_catalog_latest_opn
+       WHERE generic_part_number IS NOT NULL
+         AND ${where}
+       GROUP BY generic_part_number
+       ORDER BY total_quantity DESC NULLS LAST
+       LIMIT ?`,
+  ).bind(gpnLimit).all<GpnAggRow>()
+  const topGpns = (gpnRows.results ?? []).map((g: GpnAggRow) => ({
+    genericPartNumber: g.gpn,
+    opnCount: g.opn_count,
+    stockedOpnCount: g.stocked_opn_count,
+    totalQuantity: g.total_quantity ?? 0,
+    minNormalizedUnitPrice: g.min_normalized_unit_price,
+    medianNormalizedUnitPrice: g.median_normalized_unit_price,
+    cheapestOpn: g.cheapest_opn,
+    highestInventoryOpn: g.highest_inventory_opn,
+    lifecycleSummary: parseJson(g.lifecycle_summary),
+  }))
+
+  // 3. Top OPNs inside the subcategory. Per-OPN mapping_confidence is
+  //    resolved by walking the subcategory's ownRules in global rule
+  //    order — first WHEN that matches a row determines that row's
+  //    confidence, mirroring the JS first-match-wins matcher.
+  const ownRules = predicate.ownRules
+  const confidenceCase = (() => {
+    if (ownRules.length === 0) return `'unknown'`
+    const whens = ownRules.map(r => `WHEN (${r.sql}) THEN '${r.confidence}'`).join('\n              ')
+    return `CASE\n              ${whens}\n              ELSE 'unknown'\n            END`
+  })()
+  type OpnDetailRow = {
+    ti_part_number: string;
+    generic_part_number: string | null;
+    description: string | null;
+    quantity: number | null;
+    normalized_unit_price: number | null;
+    normalized_price_qty: number | null;
+    currency: string | null;
+    lifecycle: string | null;
+    buy_now_url: string | null;
+    mapping_confidence: string | null;
+  }
+  const opnRows = await d1.prepare(
+    `SELECT ti_part_number, generic_part_number, description, quantity,
+            normalized_unit_price, normalized_price_qty, currency,
+            lifecycle, buy_now_url,
+            (${confidenceCase}) AS mapping_confidence
+       FROM ti_catalog_latest_opn
+       WHERE ${where}
+       ORDER BY quantity DESC NULLS LAST, ti_part_number ASC
+       LIMIT ?`,
+  ).bind(opnLimit).all<OpnDetailRow>()
+  const topOpns = (opnRows.results ?? []).map((o: OpnDetailRow) => ({
+    tiPartNumber: o.ti_part_number,
+    genericPartNumber: o.generic_part_number,
+    description: o.description,
+    quantity: o.quantity,
+    normalizedUnitPrice: o.normalized_unit_price,
+    normalizedPriceQty: o.normalized_price_qty,
+    currency: o.currency,
+    lifeCycle: o.lifecycle,
+    buyNowUrl: o.buy_now_url,
+    mappingConfidence: o.mapping_confidence,
+  }))
+
+  return c.json({
+    success: true,
+    backend: 'd1',
+    filter: {
+      canonicalSubcategory: subcategory,
+      canonicalGroup: rollup.canonicalGroup,
+    },
+    rollup,
+    gpnLimit,
+    opnLimit,
+    topGpns,
+    topOpns,
+    mappingRuleIds: predicate.ruleIds,
+    note: 'Phase 24D — TI Direct evidence is latest catalog snapshot only; trend requires ≥2 catalog snapshots. Click GPN/OPN to drill into family/part detail.',
+  })
+})
+
 // GET /api/ti/universe/catalog/rollups/quality — public, sanitized.
 //
 // Phase 24C.2 — operator + customer-facing diagnostic that surfaces
