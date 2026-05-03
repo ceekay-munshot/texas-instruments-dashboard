@@ -332,3 +332,133 @@ export async function completeRun(d1: CatalogD1, args: CompleteRunArgs): Promise
     return { updated: false, reason: 'd1_update_failed' }
   }
 }
+
+/** Phase 23C.5 — repair a previously-closed ledger row.
+ *
+ *  Use case: a real_catalog run failed only because the post-finalize
+ *  validation step saw an inflated opnCount caused by leftover
+ *  synthetic rows. The TI fetch itself was successful, the catalog
+ *  data is correct, and the quota was already consumed — so the row
+ *  should not stay marked as failed_validation forever. This helper
+ *  flips the status (and optional diagnostics) without re-fetching TI.
+ *
+ *  Repairable statuses: failed_validation, failed_chunk_write,
+ *  failed_after_fetch. We never repair `in_flight` (that's what
+ *  completeRun is for), `success` (already terminal), or
+ *  `rate_limited` / `failed_before_fetch` (the TI fetch did not
+ *  succeed — they should not be quietly flipped to success).
+ *
+ *  When `runId` is omitted the helper picks the most recent ledger
+ *  row whose status ∈ repairable set, scoped to mode='real_catalog'. */
+export type RepairRunArgs = {
+  /** Optional. When omitted the helper auto-picks the latest repairable
+   *  real_catalog row (status IN failed_validation / failed_chunk_write
+   *  / failed_after_fetch). */
+  runId?: string | null
+  /** New status to set. Defaults to 'success' — that's the entire
+   *  point of repair — but the helper accepts any allowed
+   *  complete-time status for symmetry. */
+  newStatus?: Exclude<QuotaLedgerStatus, 'in_flight'>
+  httpStatus?: number | null
+  tiErrorCode?: string | null
+  productsParsed?: number | null
+  opnRowsUpserted?: number | null
+  notes?: string | null
+}
+
+export type RepairRunResult = {
+  updated: boolean
+  reason: string | null
+  /** The id of the ledger row that was actually repaired (useful when
+   *  the caller did NOT supply a runId so we picked one). */
+  repairedRunId: string | null
+  previousStatus: QuotaLedgerStatus | null
+}
+
+const REPAIRABLE_STATUSES: ReadonlyArray<QuotaLedgerStatus> = [
+  'failed_validation',
+  'failed_chunk_write',
+  'failed_after_fetch',
+]
+
+export async function repairRun(d1: CatalogD1, args: RepairRunArgs): Promise<RepairRunResult> {
+  const newStatus = args.newStatus ?? 'success'
+  if (!isAllowedCompleteStatus(newStatus)) {
+    return { updated: false, reason: 'invalid_new_status', repairedRunId: null, previousStatus: null }
+  }
+  // Find the row to repair. Either the caller-supplied runId, or the
+  // latest repairable real_catalog row.
+  let target: { id: string; status: QuotaLedgerStatus; finished_at: string | null } | null = null
+  try {
+    if (args.runId) {
+      const row = await d1
+        .prepare(
+          `SELECT id, status, finished_at FROM ti_catalog_quota_ledger
+           WHERE id = ? AND mode = 'real_catalog'
+           LIMIT 1`,
+        )
+        .bind(args.runId)
+        .all<{ id: string; status: QuotaLedgerStatus; finished_at: string | null }>()
+      target = row.results?.[0] ?? null
+    } else {
+      const placeholders = REPAIRABLE_STATUSES.map(() => '?').join(', ')
+      const row = await d1
+        .prepare(
+          `SELECT id, status, finished_at FROM ti_catalog_quota_ledger
+           WHERE mode = 'real_catalog' AND status IN (${placeholders})
+           ORDER BY attempted_at DESC LIMIT 1`,
+        )
+        .bind(...REPAIRABLE_STATUSES)
+        .all<{ id: string; status: QuotaLedgerStatus; finished_at: string | null }>()
+      target = row.results?.[0] ?? null
+    }
+  } catch {
+    return { updated: false, reason: 'd1_lookup_failed', repairedRunId: null, previousStatus: null }
+  }
+  if (!target) {
+    return { updated: false, reason: 'no_repairable_row_found', repairedRunId: null, previousStatus: null }
+  }
+  if (!REPAIRABLE_STATUSES.includes(target.status)) {
+    return {
+      updated: false,
+      reason: `status_not_repairable:${target.status}`,
+      repairedRunId: target.id,
+      previousStatus: target.status,
+    }
+  }
+  const finishedAt = target.finished_at ?? isoNow()
+  try {
+    const res: any = await d1
+      .prepare(
+        `UPDATE ti_catalog_quota_ledger
+         SET status = ?, finished_at = ?, http_status = ?, ti_error_code = ?,
+             products_parsed = COALESCE(?, products_parsed),
+             opn_rows_upserted = COALESCE(?, opn_rows_upserted),
+             notes = COALESCE(?, notes)
+         WHERE id = ?`,
+      )
+      .bind(
+        newStatus,
+        finishedAt,
+        Number.isFinite(args.httpStatus as number) ? args.httpStatus : null,
+        typeof args.tiErrorCode === 'string' ? args.tiErrorCode.slice(0, 64) : null,
+        Number.isFinite(args.productsParsed as number) ? args.productsParsed : null,
+        Number.isFinite(args.opnRowsUpserted as number) ? args.opnRowsUpserted : null,
+        typeof args.notes === 'string' ? args.notes.slice(0, 512) : null,
+        target.id,
+      )
+      .run()
+    const changes = res?.meta?.changes ?? res?.changes
+    if (typeof changes === 'number' && changes <= 0) {
+      return {
+        updated: false,
+        reason: 'd1_update_no_change',
+        repairedRunId: target.id,
+        previousStatus: target.status,
+      }
+    }
+    return { updated: true, reason: null, repairedRunId: target.id, previousStatus: target.status }
+  } catch {
+    return { updated: false, reason: 'd1_update_failed', repairedRunId: target.id, previousStatus: target.status }
+  }
+}

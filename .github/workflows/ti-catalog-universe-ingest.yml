@@ -1,6 +1,6 @@
-name: TI Catalog Universe Ingest (Phase 23C.4)
+name: TI Catalog Universe Ingest (Phase 23C.5)
 
-# Manual-trigger only. Two operating modes:
+# Manual-trigger only. Three operating modes:
 #
 #   1. real_catalog (default) — Calls /api/ti/universe/catalog/quota/preflight
 #      FIRST. If unsafe, the job exits success without ever touching TI.
@@ -16,6 +16,18 @@ name: TI Catalog Universe Ingest (Phase 23C.4)
 #      entirely; sends ONE chunk of synthetic products to the Worker.
 #      Used to verify the D1 micro-batch writer without burning catalog
 #      quota. Never writes to the quota ledger.
+#
+#   3. validate_existing_catalog (Phase 23C.5) — NEVER calls TI. Reads
+#      /api/ti/universe/catalog/status, asserts opnCount equals
+#      `expected_opn_count`, gpnCount/pricedOpnCount > 0,
+#      inStock+outOfStock ≥ 90% of opnCount, latestCapturedAt present,
+#      latestRun.parsed_ok = 1. If all assertions pass, calls
+#      /api/ti/universe/catalog/quota/repair to flip the most recent
+#      failed_validation / failed_chunk_write / failed_after_fetch
+#      ledger row to success without re-fetching TI. Use this after a
+#      real_catalog run that succeeded at TI fetch but failed only at
+#      the post-finalize validation step (e.g. opnCount briefly inflated
+#      by leftover synthetic test rows).
 #
 # Why GitHub Actions and not a Worker invocation:
 #   - The Cloudflare Worker memory cap (~128MB) makes parsing 50MB JSON
@@ -50,13 +62,14 @@ on:
   workflow_dispatch:
     inputs:
       test_mode:
-        description: 'Operating mode: real_catalog (default) or synthetic_chunk (no TI fetch).'
+        description: 'Operating mode: real_catalog (default), synthetic_chunk (no TI fetch), or validate_existing_catalog (read-only assertions + ledger repair, no TI fetch).'
         required: false
         default: 'real_catalog'
         type: choice
         options:
           - real_catalog
           - synthetic_chunk
+          - validate_existing_catalog
       chunk_size:
         description: 'Products per chunk POSTed to Worker (default 100; Phase 23C.4 lowered from 200).'
         required: false
@@ -69,6 +82,14 @@ on:
         description: 'real_catalog only: skip the Worker POSTs; only parse + report. Still calls /quota/preflight if mode is real_catalog.'
         required: false
         default: 'false'
+      expected_opn_count:
+        description: 'For validate_existing_catalog mode: required exact opnCount in /catalog/status (default 72138 — current production figure).'
+        required: false
+        default: '72138'
+      repair_run_id:
+        description: 'For validate_existing_catalog mode: optional ledger runId to repair. Leave empty to auto-pick the most recent failed_validation / failed_chunk_write / failed_after_fetch row.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -100,7 +121,7 @@ jobs:
             echo "::error::Repo secret SNAPSHOT_CAPTURE_SECRET is not set."
             exit 1
           fi
-          if [ "${TEST_MODE}" != "synthetic_chunk" ]; then
+          if [ "${TEST_MODE}" = "real_catalog" ]; then
             if [ -z "${TI_CLIENT_ID:-}" ]; then
               echo "::error::Repo secret TI_CLIENT_ID is not set. Add it under: Settings → Secrets and variables → Actions → New repository secret."
               exit 1
@@ -111,8 +132,120 @@ jobs:
             fi
             echo "All three secrets are configured (values not printed)."
           else
-            echo "synthetic_chunk mode — only SNAPSHOT_CAPTURE_SECRET is required (it is set)."
+            echo "${TEST_MODE} mode — only SNAPSHOT_CAPTURE_SECRET is required (it is set). TI_CLIENT_* are not used in this mode."
           fi
+
+      # ──────────────────────────────────────────────────────────────────────
+      # validate_existing_catalog path — Phase 23C.5.
+      # Read-only assertions over /catalog/status + optional ledger repair.
+      # NEVER calls TI. Use after a real_catalog run failed at validation
+      # only (e.g. opnCount briefly inflated by leftover synthetic rows)
+      # to confirm the catalog data is fine and flip the ledger row to
+      # success without re-fetching TI.
+      # ──────────────────────────────────────────────────────────────────────
+
+      - name: Read /catalog/status + assert (validate_existing_catalog only)
+        if: ${{ inputs.test_mode == 'validate_existing_catalog' }}
+        id: validate_existing
+        env:
+          EXPECTED_OPN: ${{ inputs.expected_opn_count }}
+        run: |
+          set -uo pipefail
+          status_file="$(mktemp)"
+          curl -sS "${BASE_URL}/api/ti/universe/catalog/status" -o "$status_file"
+          jq -c '{success, backend, opnCount, gpnCount, pricedOpnCount, inStockOpnCount, outOfStockOpnCount, latestCapturedAt, parsedOk: (.latestRun.parsed_ok // null)}' < "$status_file"
+
+          opn_count=$(jq -r '.opnCount // 0' < "$status_file")
+          gpn_count=$(jq -r '.gpnCount // 0' < "$status_file")
+          priced=$(jq -r '.pricedOpnCount // 0' < "$status_file")
+          in_stock=$(jq -r '.inStockOpnCount // 0' < "$status_file")
+          out_of_stock=$(jq -r '.outOfStockOpnCount // 0' < "$status_file")
+          latest_at=$(jq -r '.latestCapturedAt // ""' < "$status_file")
+          parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_file")
+
+          fail=0
+          if [ "${opn_count}" != "${EXPECTED_OPN}" ]; then
+            echo "::error::status.opnCount (${opn_count}) != expected_opn_count (${EXPECTED_OPN}). Override the input if production has legitimately moved on."
+            fail=1
+          fi
+          if [ "${gpn_count}" -le 0 ]; then
+            echo "::error::status.gpnCount (${gpn_count}) must be > 0."
+            fail=1
+          fi
+          if [ "${priced}" -le 0 ]; then
+            echo "::error::status.pricedOpnCount (${priced}) must be > 0."
+            fail=1
+          fi
+          if [ -z "${latest_at}" ] || [ "${latest_at}" = "null" ]; then
+            echo "::error::status.latestCapturedAt missing."
+            fail=1
+          fi
+          if [ "${parsed_ok}" != "1" ] && [ "${parsed_ok}" != "true" ]; then
+            echo "::error::status.latestRun.parsed_ok != true (${parsed_ok})."
+            fail=1
+          fi
+          if_known=$((in_stock + out_of_stock))
+          ratio_ok=$(awk -v k="${if_known}" -v t="${opn_count}" 'BEGIN { if (t <= 0) { print 0 } else { print (k * 100 / t >= 90) ? 1 : 0 } }')
+          if [ "${ratio_ok}" != "1" ]; then
+            echo "::error::inStock (${in_stock}) + outOfStock (${out_of_stock}) = ${if_known} is < 90% of opnCount (${opn_count})."
+            fail=1
+          fi
+
+          if [ "${fail}" = "1" ]; then
+            echo "::error::validate_existing_catalog assertions failed; not repairing ledger."
+            exit 1
+          fi
+          echo "validate_existing_catalog assertions passed: opnCount=${opn_count}, gpnCount=${gpn_count}, pricedOpnCount=${priced}, in+out=${if_known}, latestCapturedAt=${latest_at}, parsedOk=${parsed_ok}."
+          echo "opn_count=${opn_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Repair quota ledger (validate_existing_catalog only)
+        if: ${{ inputs.test_mode == 'validate_existing_catalog' }}
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          OPN_COUNT: ${{ steps.validate_existing.outputs.opn_count }}
+          REPAIR_RUN_ID: ${{ inputs.repair_run_id }}
+        run: |
+          set -uo pipefail
+          # Build the body. runId is omitted when REPAIR_RUN_ID is empty
+          # so the Worker auto-picks the most recent repairable row.
+          if [ -n "${REPAIR_RUN_ID}" ]; then
+            payload=$(jq -nc \
+              --arg r  "${REPAIR_RUN_ID}" \
+              --argjson p "${OPN_COUNT}" \
+              --argjson o "${OPN_COUNT}" \
+              '{runId:$r, newStatus:"success", httpStatus:200, productsParsed:$p, opnRowsUpserted:$o, notes:"Catalog data validated after synthetic-row cleanup; no TI re-fetch."}')
+          else
+            payload=$(jq -nc \
+              --argjson p "${OPN_COUNT}" \
+              --argjson o "${OPN_COUNT}" \
+              '{newStatus:"success", httpStatus:200, productsParsed:$p, opnRowsUpserted:$o, notes:"Catalog data validated after synthetic-row cleanup; no TI re-fetch."}')
+          fi
+
+          response_file="$(mktemp)"
+          http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            -H 'Content-Type: application/json' \
+            --data "${payload}" \
+            "${BASE_URL}/api/ti/universe/catalog/quota/repair")"
+          echo "quota/repair HTTP ${http_code}"
+          jq -c '{success, repairedRunId, previousStatus, newStatus, status, reason, message}' < "$response_file" || true
+
+          if [ "${http_code}" = "404" ]; then
+            echo "::notice::No repairable ledger row was found. Either the run was already marked success, or the runId is wrong. Validation already passed, so nothing else to do."
+          elif [ "${http_code}" != "200" ]; then
+            echo "::error::quota/repair returned HTTP ${http_code}. See body above."
+            exit 1
+          else
+            echo "Ledger row repaired."
+          fi
+
+      - name: Confirm /quota/status reflects repair (validate_existing_catalog only)
+        if: ${{ inputs.test_mode == 'validate_existing_catalog' }}
+        run: |
+          set -uo pipefail
+          curl -sS "${BASE_URL}/api/ti/universe/catalog/quota/status" \
+            | jq -c '{success, safeToRun, reason, attemptsLast24h, lastCatalogAttemptAt, lastSuccessfulFetchAt, last429At, nextSafeRunAt, minutesUntilSafe, inFlight}'
 
       # ──────────────────────────────────────────────────────────────────────
       # synthetic_chunk path — no TI OAuth, no TI catalog fetch, no ledger.
@@ -241,7 +374,7 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
 
       - name: Quota preflight (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' }}
+        if: ${{ inputs.test_mode == 'real_catalog' }}
         id: preflight
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
@@ -281,7 +414,7 @@ jobs:
           echo "run_id=${run_id}"          >> "$GITHUB_OUTPUT"
 
       - name: Fetch TI OAuth token (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' }}
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: token
         env:
           TI_CLIENT_ID: ${{ secrets.TI_CLIENT_ID }}
@@ -321,7 +454,7 @@ jobs:
           echo "Token acquired (value masked)."
 
       - name: Fetch TI catalog (one shot) (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' }}
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: fetch
         env:
           TI_TOKEN: ${{ steps.token.outputs.ti_token }}
@@ -384,7 +517,7 @@ jobs:
           echo "total_products=${total}" >> "$GITHUB_OUTPUT"
 
       - name: Split catalog into chunks (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' }}
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: split
         env:
           CHUNK_SIZE: ${{ inputs.chunk_size }}
@@ -439,7 +572,7 @@ jobs:
 
       - name: POST each chunk to Worker (real_catalog only)
         id: post_chunks
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           TOTAL_CHUNKS: ${{ steps.split.outputs.total_chunks }}
@@ -540,7 +673,7 @@ jobs:
           echo "sql_statements=${TOTAL_STMTS}"              >> "$GITHUB_OUTPUT"
 
       - name: Finalize (rebuild GPN aggregates + insert snapshot run row)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
@@ -560,7 +693,7 @@ jobs:
             | jq -c .
 
       - name: Read /catalog/status + validate + close ledger (real_catalog only)
-        if: ${{ inputs.test_mode != 'synthetic_chunk' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           RUN_ID: ${{ steps.preflight.outputs.run_id }}
@@ -634,7 +767,7 @@ jobs:
             "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c .
 
       - name: Upload tiny diagnostic artifacts (failure only)
-        if: failure() && inputs.test_mode != 'synthetic_chunk'
+        if: failure() && inputs.test_mode == 'real_catalog'
         uses: actions/upload-artifact@v4
         with:
           name: ti-catalog-diagnostics

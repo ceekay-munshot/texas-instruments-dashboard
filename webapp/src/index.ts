@@ -79,6 +79,7 @@ import {
   readQuotaStatus,
   preflightAndReserve,
   completeRun,
+  repairRun,
   isAllowedCompleteStatus,
   MAX_ATTEMPTS_PER_24H,
   MIN_HOURS_BETWEEN_CATALOG_CALLS,
@@ -3335,6 +3336,92 @@ app.post('/api/ti/universe/catalog/quota/complete', async (c) => {
     }, 409)
   }
   return c.json({ success: true, runId, status: statusStr })
+})
+
+// POST /api/ti/universe/catalog/quota/repair — auth-gated.
+//
+// Phase 23C.5 — repair a previously-closed real_catalog ledger row
+// without re-fetching TI. Use case: a run failed only at the
+// post-finalize validation step (e.g. opnCount briefly inflated by
+// leftover synthetic test rows) but the TI fetch itself was
+// successful and the catalog data is correct. Without repair the
+// row stays as failed_validation forever and the operator audit
+// log misrepresents what actually happened.
+//
+// This endpoint NEVER calls TI. It only updates the ledger row.
+// Repairable previous statuses: failed_validation,
+// failed_chunk_write, failed_after_fetch. We refuse to repair
+// in_flight (use /complete), success (already terminal), or
+// rate_limited / failed_before_fetch (the TI fetch did not
+// succeed, so they should not silently flip to success).
+//
+// Body:
+//   { runId?, newStatus?, httpStatus?, productsParsed?,
+//     opnRowsUpserted?, notes? }
+// runId is optional; when omitted the helper picks the most recent
+// repairable real_catalog row.
+app.post('/api/ti/universe/catalog/quota/repair', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({
+      success: false, status: 'capture_secret_not_configured',
+      message: 'Set SNAPSHOT_CAPTURE_SECRET in Cloudflare Pages env vars before invoking.',
+    })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_bound', message: 'TI_INVENTORY_HISTORY_DB not bound; cannot repair quota row.' }, 500)
+  }
+  let body: any = {}
+  try { body = await c.req.json() } catch {
+    return c.json({ success: false, status: 'invalid_payload', message: 'Body must be JSON.' }, 400)
+  }
+  const runIdRaw = typeof body?.runId === 'string' ? body.runId.trim() : ''
+  const runId = runIdRaw.length > 0 ? runIdRaw : null
+  const newStatusRaw = typeof body?.newStatus === 'string' ? body.newStatus.trim() : 'success'
+  if (!isAllowedCompleteStatus(newStatusRaw)) {
+    return c.json({
+      success: false, status: 'invalid_status',
+      message: `newStatus must be one of: success | rate_limited | failed_before_fetch | failed_after_fetch | failed_chunk_write | failed_validation. Got '${newStatusRaw}'.`,
+    }, 400)
+  }
+  const httpStatus = Number.isFinite(body?.httpStatus) ? Math.trunc(body.httpStatus) : null
+  const tiErrorCode = typeof body?.tiErrorCode === 'string' ? body.tiErrorCode : null
+  const productsParsed = Number.isFinite(body?.productsParsed) ? Math.trunc(body.productsParsed) : null
+  const opnRowsUpserted = Number.isFinite(body?.opnRowsUpserted) ? Math.trunc(body.opnRowsUpserted) : null
+  const notes = typeof body?.notes === 'string' ? body.notes : null
+  const res = await repairRun(env.TI_INVENTORY_HISTORY_DB as any, {
+    runId,
+    newStatus: newStatusRaw,
+    httpStatus,
+    tiErrorCode,
+    productsParsed,
+    opnRowsUpserted,
+    notes,
+  })
+  if (!res.updated) {
+    const code = res.reason === 'no_repairable_row_found' ? 404 : 409
+    return c.json({
+      success: false,
+      status: 'not_repaired',
+      reason: res.reason,
+      repairedRunId: res.repairedRunId,
+      previousStatus: res.previousStatus,
+      message: res.reason === 'no_repairable_row_found'
+        ? 'No repairable real_catalog ledger row found. Either the supplied runId is wrong, or no row currently has status IN (failed_validation, failed_chunk_write, failed_after_fetch).'
+        : 'Quota ledger repair did not apply; see reason.',
+    }, code)
+  }
+  return c.json({
+    success: true,
+    repairedRunId: res.repairedRunId,
+    previousStatus: res.previousStatus,
+    newStatus: newStatusRaw,
+  })
 })
 
 // Phase 22.2 — POST /api/ti/inventory/staged/validate
