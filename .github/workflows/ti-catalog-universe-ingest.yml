@@ -18,8 +18,8 @@ name: TI Catalog Universe Ingest (Phase 23C.5)
 #      quota. Never writes to the quota ledger.
 #
 #   3. validate_existing_catalog (Phase 23C.5) — NEVER calls TI. Reads
-#      /api/ti/universe/catalog/status, asserts opnCount equals
-#      `expected_opn_count`, gpnCount/pricedOpnCount > 0,
+#      /api/ti/universe/catalog/status, asserts opnCount is within
+#      ±max(50, 0.5%) of `expected_opn_count`, gpnCount/pricedOpnCount > 0,
 #      inStock+outOfStock ≥ 90% of opnCount, latestCapturedAt present,
 #      latestRun.parsed_ok = 1. If all assertions pass, calls
 #      /api/ti/universe/catalog/quota/repair to flip the most recent
@@ -65,7 +65,7 @@ on:
   # Hong Kong 05:00 Monday read. workflow_dispatch is preserved below so
   # operators can still trigger an out-of-band run. Scheduled runs use the
   # workflow_dispatch input defaults (real_catalog, chunk_size 100,
-  # dry_run false, expected_opn_count 72138).
+  # dry_run false, expected_opn_count 72139).
   schedule:
     - cron: '47 19 * * 0'
   workflow_dispatch:
@@ -92,9 +92,9 @@ on:
         required: false
         default: 'false'
       expected_opn_count:
-        description: 'For validate_existing_catalog mode: required exact opnCount in /catalog/status (default 72138 — current production figure).'
+        description: 'For validate_existing_catalog mode: target opnCount in /catalog/status. Validation tolerates ±max(50, 0.5%) drift so trivial TI catalog adds/removes do not fail. Default 72139 — current production figure.'
         required: false
-        default: '72138'
+        default: '72139'
       repair_run_id:
         description: 'For validate_existing_catalog mode: optional ledger runId to repair. Leave empty to auto-pick the most recent failed_validation / failed_chunk_write / failed_after_fetch row.'
         required: false
@@ -173,8 +173,19 @@ jobs:
           parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_file")
 
           fail=0
-          if [ "${opn_count}" != "${EXPECTED_OPN}" ]; then
-            echo "::error::status.opnCount (${opn_count}) != expected_opn_count (${EXPECTED_OPN}). Override the input if production has legitimately moved on."
+          # Tolerate trivial TI-catalog drift (±max(50, 0.5%) of expected).
+          # Catches large data loss / corruption while letting weekly SKU
+          # adds/removes through. Override expected_opn_count or dispatch
+          # input if production has legitimately moved beyond the band.
+          tolerance=$(awk -v e="${EXPECTED_OPN}" 'BEGIN { t = e * 0.005; if (t < 50) t = 50; printf "%d\n", t }')
+          if [ "${opn_count}" -gt "${EXPECTED_OPN}" ]; then
+            diff=$(( opn_count - EXPECTED_OPN ))
+          else
+            diff=$(( EXPECTED_OPN - opn_count ))
+          fi
+          echo "opnCount=${opn_count} expected=${EXPECTED_OPN} drift=${diff} tolerance=±${tolerance}"
+          if [ "${diff}" -gt "${tolerance}" ]; then
+            echo "::error::status.opnCount (${opn_count}) drifted from expected_opn_count (${EXPECTED_OPN}) by ${diff} (tolerance ±${tolerance}). Override the input if production has legitimately moved on."
             fail=1
           fi
           if [ "${gpn_count}" -le 0 ]; then
