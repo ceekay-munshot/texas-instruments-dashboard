@@ -59,6 +59,15 @@ name: TI Catalog Universe Ingest (Phase 23C.5)
 #   - Quota ledger /complete called on success, 429, and any failed_*.
 
 on:
+  # Weekly automatic refresh — Sunday 19:47 UTC.
+  # Lands ~Monday 03:47 Hong Kong / Sunday late-morning San Francisco, with
+  # ~47 minutes of runtime so the full universe is fresh before the
+  # Hong Kong 05:00 Monday read. workflow_dispatch is preserved below so
+  # operators can still trigger an out-of-band run. Scheduled runs use the
+  # workflow_dispatch input defaults (real_catalog, chunk_size 100,
+  # dry_run false, expected_opn_count 72138).
+  schedule:
+    - cron: '47 19 * * 0'
   workflow_dispatch:
     inputs:
       test_mode:
