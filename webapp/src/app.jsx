@@ -16,6 +16,41 @@ const CATS = [
   {id:"dc_sps",g:"Data Center Power",l:"Smart Power Stages"},{id:"dc_efuse",g:"Data Center Power",l:"eFuses"},
   {id:"dc_hswap",g:"Data Center Power",l:"Hot-Swap Controllers"},{id:"dc_tps",g:"Data Center Power",l:"TPS536xx (AI Power)"},
 ];
+// Phase 25.1 — bundled canonical mapping. Mirrors LEGACY_TO_CANONICAL in
+// src/data/tiTaxonomy.ts so the QTD row's flash-suppression gate can
+// recognise canonical-mapped cells from first paint, before the
+// /api/snapshots/evidence/combined response arrives. Keep in sync with
+// the .ts file — every legacy id rendered in CATS must appear here.
+const STATIC_LEGACY_TO_CANONICAL = {
+  pm_ldo: 'power_ldo',
+  pm_acdc: 'power_acdc_switching',
+  pm_dcdc: 'power_dcdc_switching',
+  pm_super: 'power_supervisor_reset',
+  pm_batt: 'power_battery_mgmt',
+  amp_op: 'amp_opamps',
+  amp_instr: 'amp_instrumentation',
+  amp_audio: 'amp_audio',
+  dac_adc: 'conv_adc',
+  dac_dac: 'conv_dac',
+  if_can: 'interface_can',
+  if_lin: 'interface_lin',
+  if_eth: 'interface_ethernet_phy',
+  iso_dig: 'isolation_digital',
+  iso_rein: 'isolation_reinforced',
+  mcu_msp: 'mcu_msp430',
+  mcu_c2k: 'mcu_c2000',
+  mcu_m0: 'mcu_mspm0',
+  mcu_cc: 'mcu_simplelink',
+  mcu_sit: 'mcu_sitara',
+  gan_342: 'gan_lmg342x',
+  gan_365: 'gan_lmg3650',
+  gan_520: 'gan_lmg5200',
+  dc_48v: 'dc_48v_bus',
+  dc_sps: 'dc_smart_power_stages',
+  dc_efuse: 'dc_efuses',
+  dc_hswap: 'dc_hotswap',
+  dc_tps: 'dc_tps536xx_ai_power',
+};
 const HIST = {
   "Jun-22":{pm_ldo:1.3,pm_acdc:0.5,pm_dcdc:0.5,pm_super:1.6,pm_batt:-1.4,amp_op:0.4,amp_instr:0.8,amp_audio:-0.1,dac_adc:0.0,dac_dac:0.1,if_can:0.8,if_lin:-0.4,if_eth:1.1,iso_dig:1.0,iso_rein:2.2,mcu_msp:1.3,mcu_c2k:2.7,mcu_m0:2.4,mcu_cc:1.7,mcu_sit:0.2,gan_342:3.0,gan_365:0.7,gan_520:-0.5,dc_48v:1.1,dc_sps:2.6,dc_efuse:1.7,dc_hswap:1.6,dc_tps:3.1},
   "Sep-22":{pm_ldo:-0.2,pm_acdc:-0.4,pm_dcdc:-0.4,pm_super:0.8,pm_batt:-0.9,amp_op:-0.4,amp_instr:-1.0,amp_audio:-1.0,dac_adc:-0.6,dac_dac:-0.6,if_can:-1.5,if_lin:-0.8,if_eth:-0.7,iso_dig:-0.1,iso_rein:-0.7,mcu_msp:1.4,mcu_c2k:1.4,mcu_m0:1.4,mcu_cc:3.5,mcu_sit:2.8,gan_342:0.1,gan_365:0.6,gan_520:-2.8,dc_48v:0.1,dc_sps:-2.4,dc_efuse:1.5,dc_hswap:-0.3,dc_tps:-0.3},
@@ -2496,6 +2531,14 @@ function App(){
   // trendConfidence ('insufficient' | 'daily' | 'weekly'). Drives the
   // Insights tab's shortage/oversupply classifier.
   const [tiTrendByCanonical,setTiTrendByCanonical]=useState({});
+  // Phase 25.1 — TI trend fetch lifecycle state. Drives the QTD row to
+  // suppress the live-distributor fallback while the TI Direct response
+  // is still in flight, eliminating the brief flash where the row would
+  // render qoqPct values from the persisted live snapshot and then snap
+  // to the (genuinely zero) TI Direct deltas a moment later.
+  // 'loading' on first mount; 'loaded' on a successful response (even if
+  // the map ends up empty); 'failed' on network or backend error.
+  const [tiTrendLoadingState,setTiTrendLoadingState]=useState('loading');
   // Phase 19B — two-tab UI. 'prices' is the customer-facing default;
   // 'insights' holds source agreement, signal summary, and operator status.
   const [activeTab,setActiveTab]=useState('prices');
@@ -2729,6 +2772,12 @@ function App(){
             if (s?.canonicalSubcategory) map[s.canonicalSubcategory] = s;
           }
           setTiTrendByCanonical(map);
+          setTiTrendLoadingState('loaded');
+        } else {
+          // Either rejected, or fulfilled with null / non-array shape
+          // (e.g. backend returned { success:false, status:'d1_not_bound' }).
+          // Either way: trend is unavailable — let the qoq fallback engage.
+          setTiTrendLoadingState('failed');
         }
       } catch (_) { /* silent */ }
     })();
@@ -3097,17 +3146,25 @@ function App(){
               const sample = trendDates[0];
               const latestQtdDate = sample?.latestSnapshotAt?.slice(0,10) || null;
               const previousQtdDate = sample?.previousSnapshotAt?.slice(0,10) || null;
-              const qtdSourceLabel = latestQtdDate && previousQtdDate
-                ? `QTD: TI Direct catalog · latest ${latestQtdDate} vs previous ${previousQtdDate}`
-                : 'QTD: TI Direct catalog (history still building — cells without a previous snapshot show —)';
-              const qtdSourceTitle = 'QTD compares the latest TI Direct catalog rollup against the previous TI Direct snapshot per canonical subcategory. Values are median normalized unit prices. Distributor data (Mouser / Nexar) is never blended into this number; cells without a TI mapping fall back to live distributor price vs Q1-26 close baseline and are flagged in the cell tooltip.';
+              let qtdSourceLabel;
+              if (tiTrendLoadingState === 'loading') {
+                qtdSourceLabel = 'QTD: loading TI Direct catalog comparison…';
+              } else if (tiTrendLoadingState === 'failed') {
+                qtdSourceLabel = 'QTD: TI Direct unavailable · using live source fallback';
+              } else if (latestQtdDate && previousQtdDate) {
+                qtdSourceLabel = `QTD: TI Direct catalog · latest ${latestQtdDate} vs previous ${previousQtdDate}`;
+              } else {
+                qtdSourceLabel = 'QTD: TI Direct catalog (history still building — cells without a previous snapshot show —)';
+              }
+              const qtdSourceTitle = 'QTD compares the latest TI Direct catalog rollup against the previous TI Direct snapshot per canonical subcategory. Values are median normalized unit prices. Distributor data (Mouser / Nexar) is never blended into this number; while TI Direct is loading, canonical-mapped cells render — instead of distributor values to avoid a flash. Cells without a TI mapping (or after a TI fetch failure) fall back to live distributor price vs Q1-26 close baseline and are flagged in the cell tooltip.';
+              const labelColor = tiTrendLoadingState === 'failed' ? '#f0a84e' : '#7a96b8';
               return (
                 <tr>
                   <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
                     <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
                       <span>▼ Latest data {fetchedAt?`· updated ${new Date(fetchedAt).toLocaleString()}`:'· Click Refresh to get latest data'}</span>
                       {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· update pending</span>}
-                      <span title={qtdSourceTitle} style={{color:'#7a96b8'}}>· {qtdSourceLabel}</span>
+                      <span title={qtdSourceTitle} style={{color:labelColor}}>· {qtdSourceLabel}</span>
                     </div>
                   </td>
                 </tr>
@@ -3117,18 +3174,36 @@ function App(){
             {/* QTD / Latest data row.
                 Cell value priority (first non-null wins):
                   1. tiTrend.priceDeltaPct  (true catalog QoQ when ≥2 TI snapshots)
-                  2. liveData[c.id].qoqPct  (Mouser/server-merged qoq)
+                  2. liveData[c.id].qoqPct  (Mouser/server-merged qoq) — but
+                     ONLY once tiTrendLoadingState is no longer 'loading' for
+                     cells that have a canonical TI mapping. While the trend
+                     fetch is in flight we render '—' instead, so the row
+                     does not flash distributor values that get replaced a
+                     second later when the (genuinely zero) TI Direct deltas
+                     arrive. Cells without a canonical mapping (none today,
+                     but the path exists) skip the gate and use qoq directly.
                   3. Computed (avg-baseline)/baseline*100 from the persisted
-                     snapshot — covers the rate-limit placeholder case where
-                     the server returned baseline prices but qoqPct was null.
+                     snapshot — same gate as #2.
                 Cells with no value render '—'. The row collapses to a single
                 message ONLY when no category can produce any value. */}
             {(() => {
               function qtdValueFor(catId) {
-                const canonical = combinedEvidence?.legacyToCanonical?.[catId];
+                // Resolve canonical with a static fallback so the gate is
+                // available from first paint (combinedEvidence is async too).
+                const canonical = combinedEvidence?.legacyToCanonical?.[catId] ?? STATIC_LEGACY_TO_CANONICAL[catId];
                 const trend = canonical ? tiTrendByCanonical[canonical] : null;
                 const trendPct = trend?.hasEnoughHistory ? trend.priceDeltaPct : null;
                 if (Number.isFinite(trendPct)) return { v: trendPct, fromTrend: true };
+                // For canonical-mapped cells, the live-distributor fallback
+                // ONLY engages when the TI Direct fetch has failed. While
+                // the fetch is in flight ('loading') or succeeded but the
+                // subcategory lacks enough history ('loaded' with null
+                // priceDeltaPct), the cell shows '—'. This eliminates the
+                // flash of qoq values that the user reported, and honours
+                // the original audit spec: null priceDeltaPct → '—', not
+                // +0.00% and not a distributor fallback.
+                const fallbackBlocked = !!canonical && tiTrendLoadingState !== 'failed';
+                if (fallbackBlocked) return { v: null, fromTrend: false };
                 const d = liveData?.[catId];
                 if (Number.isFinite(d?.qoqPct)) return { v: d.qoqPct, fromTrend: false };
                 const avg = Number(d?.avgPriceUSD);
@@ -3140,9 +3215,11 @@ function App(){
               }
               const qtdHasAnyValue = visCats.some(c => qtdValueFor(c.id).v != null);
               if (!qtdHasAnyValue) {
-                const message = loading
-                  ? 'Loading latest data…'
-                  : 'QTD data is being collected. Latest price moves will appear here as soon as they are available.';
+                const message = tiTrendLoadingState === 'loading'
+                  ? 'Loading TI Direct catalog comparison…'
+                  : loading
+                    ? 'Loading latest data…'
+                    : 'QTD data is being collected. Latest price moves will appear here as soon as they are available.';
                 return (
                   <tr style={{background:'rgba(255,215,0,0.035)'}}>
                     <td style={{padding:'6px 12px 6px 16px',borderRight:`1px solid ${B}`,borderBottom:`1px solid ${B}`,fontFamily:'monospace',fontSize:'0.72rem',position:'sticky',left:0,background:'#141102',zIndex:2,color:'#ffd700',fontWeight:'bold'}}>
@@ -3157,10 +3234,15 @@ function App(){
               return null;
             })()}
             {visCats.some(c => {
-              const canonical = combinedEvidence?.legacyToCanonical?.[c.id];
+              const canonical = combinedEvidence?.legacyToCanonical?.[c.id] ?? STATIC_LEGACY_TO_CANONICAL[c.id];
               const trend = canonical ? tiTrendByCanonical[canonical] : null;
               const trendPct = trend?.hasEnoughHistory ? trend.priceDeltaPct : null;
               if (Number.isFinite(trendPct)) return true;
+              // Match qtdValueFor: canonical-mapped cells only count as
+              // "has value" via the TI trend, unless the TI fetch has
+              // explicitly failed. While loading or after a successful
+              // load with insufficient history, the cell shows '—'.
+              if (canonical && tiTrendLoadingState !== 'failed') return false;
               const d = liveData?.[c.id];
               if (Number.isFinite(d?.qoqPct)) return true;
               const avg = Number(d?.avgPriceUSD);
@@ -3189,12 +3271,23 @@ function App(){
                 // gates the marker color + warning on the server-supplied
                 // qualityLabel (high|medium|low|mixed) so contaminated
                 // rollups appear as caution rather than clean signal.
-                const canonicalForCell = combinedEvidence?.legacyToCanonical?.[c.id];
+                const canonicalForCell = combinedEvidence?.legacyToCanonical?.[c.id] ?? STATIC_LEGACY_TO_CANONICAL[c.id];
                 const tiRollup = canonicalForCell ? tiRollupsByCanonical[canonicalForCell] : null;
                 const tiTrend = canonicalForCell ? tiTrendByCanonical[canonicalForCell] : null;
                 const tiTrendPct = tiTrend?.hasEnoughHistory ? tiTrend.priceDeltaPct : null;
-                let v = Number.isFinite(tiTrendPct) ? tiTrendPct : (Number.isFinite(d?.qoqPct) ? d.qoqPct : null);
-                if (v == null) {
+                // Suppress live/qoq/baseline fallback for canonical cells
+                // unless the TI Direct trend fetch has failed. This both
+                // (a) eliminates the flash of qoq values that get replaced
+                // by +0.00% once the trend resolves, and (b) honours the
+                // audit spec — null priceDeltaPct must render '—', not a
+                // distributor fallback.
+                const fallbackBlocked = !!canonicalForCell && tiTrendLoadingState !== 'failed';
+                let v = Number.isFinite(tiTrendPct)
+                  ? tiTrendPct
+                  : (fallbackBlocked
+                      ? null
+                      : (Number.isFinite(d?.qoqPct) ? d.qoqPct : null));
+                if (v == null && !fallbackBlocked) {
                   const avg = Number(d?.avgPriceUSD);
                   const base = Number(d?.baselinePriceUSD);
                   if (Number.isFinite(avg) && Number.isFinite(base) && base > 0) {
@@ -3260,7 +3353,11 @@ function App(){
                 const dateOnly = (s) => (typeof s === 'string' ? s.slice(0,10) : null);
                 let cellTitle;
                 if (v == null) {
-                  if (isRLCell) {
+                  if (fallbackBlocked && tiTrendLoadingState === 'loading') {
+                    cellTitle = `QTD: loading TI Direct catalog comparison…\nCanonical subcategory: ${canonicalForCell}\nDistributor fallback is intentionally suppressed while TI Direct is in flight, so the row does not flash values that get replaced a moment later.`;
+                  } else if (fallbackBlocked && tiTrendLoadingState === 'loaded') {
+                    cellTitle = `QTD: TI Direct catalog (no comparison yet)\nCanonical subcategory: ${canonicalForCell}\nTI Direct hasn't recorded enough history for this subcategory yet — at least two daily snapshots are required. Distributor fallback is intentionally suppressed for canonical-mapped cells.`;
+                  } else if (isRLCell) {
                     cellTitle = 'QTD: update pending — TI Direct still available, but no comparison yet for this category.';
                   } else if (canonicalForCell) {
                     cellTitle = `QTD: TI Direct catalog (no comparison yet)\nCanonical subcategory: ${canonicalForCell}\nTI Direct hasn't recorded enough history for this subcategory yet — at least two daily snapshots are required.`;
@@ -3290,9 +3387,12 @@ Snapshots in window: ${tiTrend.snapshotCount ?? '—'} (confidence: ${tiTrend.tr
                 } else if (Number.isFinite(d?.qoqPct)) {
                   const latestPx = fmtUSD(d?.avgPriceUSD);
                   const basePx = fmtUSD(d?.baselinePriceUSD);
+                  const reason = tiTrendLoadingState === 'failed'
+                    ? 'TI Direct trend unavailable — using live source fallback'
+                    : 'TI Direct comparison unavailable for this category';
                   cellTitle =
 `QTD: live source price vs Q1-26 close baseline
-Source: live distributor (TI Direct comparison unavailable for this category)
+Source: live distributor (${reason})
 Latest:   ${latestPx}
 Baseline: ${basePx}
 Δ:        ${fmtSignedPct(d.qoqPct)}`;
