@@ -2804,7 +2804,16 @@ function App(){
     const basket=basketCatFor(catId);
     const evid=evidenceCatFor(catId);
     const agree=combinedAgreementFor(catId);
-    if(!d&&!basket&&!evid&&!agree)return null; // nothing to show
+    // Phase 24E — TI Direct primary, channel checks secondary.
+    const tiCanonical = combinedEvidence?.legacyToCanonical?.[catId];
+    const tiRollupRow = tiCanonical ? tiRollupsByCanonical[tiCanonical] : null;
+    // Phase 25 — TI Direct snapshot delta (drives the QTD row). Surfaced
+    // in the tooltip so users can see what the QTD cell is comparing
+    // without having to inspect the native title attribute.
+    const tiTrendRow = tiCanonical ? tiTrendByCanonical[tiCanonical] : null;
+    // Allow rendering even when distributor data is silent — TI Direct
+    // alone is enough to show the QTD evidence block.
+    if(!d&&!basket&&!evid&&!agree&&!tiRollupRow&&!tiTrendRow)return null;
     const cat=CATS.find(c=>c.id===catId);
     // Source confidence (coverage, not direction confirmation):
     //   multi-source → ≥2 trusted distributors with quoted available offers
@@ -2817,9 +2826,6 @@ function App(){
       else if(dist>=2) confidence='multi-source';
       else if(dist===1) confidence='single-source';
     }
-    // Phase 24E — TI Direct primary, channel checks secondary.
-    const tiCanonical = combinedEvidence?.legacyToCanonical?.[catId];
-    const tiRollupRow = tiCanonical ? tiRollupsByCanonical[tiCanonical] : null;
 
     // Compact summary inputs
     const lastP = HP[HP.length - 1];
@@ -2890,6 +2896,44 @@ function App(){
         <span style={{color:'#7a96b8'}}>Latest check</span>
         <span style={{color:'#e0eaf8'}}>{latestCheckText}</span>
       </div>
+
+      {/* QTD evidence — visible only when TI Direct has captured at
+          least two snapshots for this canonical subcategory. Mirrors
+          the per-cell title attribute so the comparison is auditable
+          without leaving the tooltip. */}
+      {tiTrendRow && tiTrendRow.hasEnoughHistory && (() => {
+        const dateOnly = (s) => (typeof s === 'string' ? s.slice(0,10) : '—');
+        const fmtUSD = (n) => Number.isFinite(n)
+          ? `$${Number(n).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4})}`
+          : '—';
+        const dpx = Number.isFinite(tiTrendRow.priceDeltaPct) ? tiTrendRow.priceDeltaPct : null;
+        const dst = Number.isFinite(tiTrendRow.stockDeltaPct) ? tiTrendRow.stockDeltaPct : null;
+        const dpxColor = dpx == null ? '#7a96b8' : dpx > 0 ? '#4dffc3' : dpx < 0 ? '#f05c5c' : '#e0eaf8';
+        const dstColor = dst == null ? '#7a96b8' : dst > 0 ? '#4dffc3' : dst < 0 ? '#f05c5c' : '#e0eaf8';
+        const fmtPct = (n) => n == null ? '—' : `${n > 0 ? '+' : ''}${(Math.round(n * 100) / 100).toFixed(2)}%`;
+        return (
+          <div style={{borderTop:'1px solid #1a2740',paddingTop:8,marginBottom:9}}>
+            <div style={{fontSize:'0.55rem',color:'#7a96b8',letterSpacing:'0.04em',marginBottom:5,textTransform:'uppercase'}}>
+              QTD evidence — TI Direct catalog
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'auto 1fr',rowGap:4,columnGap:14,fontSize:'0.6rem'}}>
+              <span style={{color:'#7a96b8'}}>Latest snapshot</span>
+              <span style={{color:'#e0eaf8',fontFamily:'monospace'}}>{dateOnly(tiTrendRow.latestSnapshotAt)} · {fmtUSD(tiTrendRow.latestPrice)}</span>
+              <span style={{color:'#7a96b8'}}>Previous snapshot</span>
+              <span style={{color:'#e0eaf8',fontFamily:'monospace'}}>{dateOnly(tiTrendRow.previousSnapshotAt)} · {fmtUSD(tiTrendRow.previousPrice)}</span>
+              <span style={{color:'#7a96b8'}}>Δ price</span>
+              <span style={{color:dpxColor,fontFamily:'monospace',fontWeight:'bold'}}>{fmtPct(dpx)}</span>
+              <span style={{color:'#7a96b8'}}>Δ stock</span>
+              <span style={{color:dstColor,fontFamily:'monospace'}}>{fmtPct(dst)}</span>
+            </div>
+            {dpx === 0 && (
+              <div style={{fontSize:'0.55rem',color:'#7a96b8',marginTop:6,fontStyle:'italic',lineHeight:1.4}}>
+                No price movement detected between the two TI Direct snapshots.
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Source detail */}
       <div style={{fontSize:'0.55rem',color:'#4a6a8a',marginBottom:9,fontStyle:'italic',lineHeight:1.45}}>
@@ -3039,15 +3083,36 @@ function App(){
               );
             })}
 
-            {/* Divider — slim, customer-facing copy only */}
-            <tr>
-              <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
-                <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
-                  <span>▼ Latest data {fetchedAt?`· updated ${new Date(fetchedAt).toLocaleString()}`:'· Click Refresh to get latest data'}</span>
-                  {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· update pending</span>}
-                </div>
-              </td>
-            </tr>
+            {/* Divider — slim, customer-facing copy only.
+                The QTD source line states exactly what the row below is
+                comparing so the cell values are auditable. With the TI
+                Direct full-catalog rollup wired in, every cell that has a
+                canonical mapping reads from TI's median normalized unit
+                price (latest snapshot vs previous snapshot). Cells that
+                fall back to the live distributor path are flagged in
+                their per-cell title attribute. */}
+            {(() => {
+              const trendDates = Object.values(tiTrendByCanonical || {})
+                .filter(s => s?.latestSnapshotAt && s?.previousSnapshotAt);
+              const sample = trendDates[0];
+              const latestQtdDate = sample?.latestSnapshotAt?.slice(0,10) || null;
+              const previousQtdDate = sample?.previousSnapshotAt?.slice(0,10) || null;
+              const qtdSourceLabel = latestQtdDate && previousQtdDate
+                ? `QTD: TI Direct catalog · latest ${latestQtdDate} vs previous ${previousQtdDate}`
+                : 'QTD: TI Direct catalog (history still building — cells without a previous snapshot show —)';
+              const qtdSourceTitle = 'QTD compares the latest TI Direct catalog rollup against the previous TI Direct snapshot per canonical subcategory. Values are median normalized unit prices. Distributor data (Mouser / Nexar) is never blended into this number; cells without a TI mapping fall back to live distributor price vs Q1-26 close baseline and are flagged in the cell tooltip.';
+              return (
+                <tr>
+                  <td colSpan={visCats.length+1} style={{padding:'0',background:'#0c1018',borderTop:`1px solid ${B}`,borderBottom:`1px solid ${B}`}}>
+                    <div style={{fontSize:'0.52rem',color:'#2d4a6b',padding:'4px 16px',letterSpacing:'0.1em',display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
+                      <span>▼ Latest data {fetchedAt?`· updated ${new Date(fetchedAt).toLocaleString()}`:'· Click Refresh to get latest data'}</span>
+                      {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· update pending</span>}
+                      <span title={qtdSourceTitle} style={{color:'#7a96b8'}}>· {qtdSourceLabel}</span>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })()}
 
             {/* QTD / Latest data row.
                 Cell value priority (first non-null wins):
@@ -3156,7 +3221,7 @@ function App(){
                 // section (Phase 9: cross-source enrichment must be reachable).
                 // Phase 24C: TI Direct rollup also opens the tooltip so the
                 // 72k-OPN evidence is reachable from any mapped cell.
-                const hasTooltip = isLive || hasBasket || hasTiRollup;
+                const hasTooltip = isLive || hasBasket || hasTiRollup || !!tiTrend;
                 // Phase 24D — when a TI rollup exists, clicking the cell
                 // hops to the Universe tab pre-filtered to this canonical
                 // subcategory's drilldown. Carries qualityLabel +
@@ -3175,13 +3240,71 @@ function App(){
                   setActiveTab('universe');
                 } : undefined;
                 const{txt,col,bold}=v!=null?fmt(v):{txt:'—',col:'#2a4060',bold:false};
-                const cellTitle = isRLCell && v == null
-                  ? 'Update pending — TI data is still available'
-                  : fromTiTrend
-                    ? 'Latest price move from TI data'
-                    : hasTiRollup
-                      ? 'Click to see the TI parts in this category'
-                      : undefined;
+                // Rich, multi-line title — every QTD cell is auditable:
+                //   * names the comparison being made (TI Direct vs TI
+                //     Direct, or live vs Q1-26 close baseline),
+                //   * shows both timestamps,
+                //   * shows the two median prices being subtracted,
+                //   * shows the price delta and (when available) stock delta,
+                //   * for the priceDeltaPct === 0 case, explicitly states
+                //     "no price movement detected" so +0.00% is not
+                //     mistaken for missing data.
+                const fmtSignedPct = (n) => {
+                  if (!Number.isFinite(n)) return '—';
+                  const r = Math.round(n * 100) / 100;
+                  return `${r > 0 ? '+' : ''}${r.toFixed(2)}%`;
+                };
+                const fmtUSD = (n) => Number.isFinite(n)
+                  ? `$${Number(n).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4})}`
+                  : '—';
+                const dateOnly = (s) => (typeof s === 'string' ? s.slice(0,10) : null);
+                let cellTitle;
+                if (v == null) {
+                  if (isRLCell) {
+                    cellTitle = 'QTD: update pending — TI Direct still available, but no comparison yet for this category.';
+                  } else if (canonicalForCell) {
+                    cellTitle = `QTD: TI Direct catalog (no comparison yet)\nCanonical subcategory: ${canonicalForCell}\nTI Direct hasn't recorded enough history for this subcategory yet — at least two daily snapshots are required.`;
+                  } else {
+                    cellTitle = `QTD: no comparison available\nThis legacy category id (${c.id}) is not mapped to a TI canonical subcategory and live distributor data is unavailable.`;
+                  }
+                } else if (fromTiTrend && tiTrend) {
+                  const latestAt = dateOnly(tiTrend.latestSnapshotAt) || '—';
+                  const prevAt = dateOnly(tiTrend.previousSnapshotAt) || '—';
+                  const latestPx = fmtUSD(tiTrend.latestPrice);
+                  const prevPx = fmtUSD(tiTrend.previousPrice);
+                  const dpx = fmtSignedPct(tiTrend.priceDeltaPct);
+                  const dst = Number.isFinite(tiTrend.stockDeltaPct)
+                    ? fmtSignedPct(tiTrend.stockDeltaPct)
+                    : '—';
+                  const noMove = tiTrend.priceDeltaPct === 0
+                    ? '\nNo price movement detected between the two TI Direct snapshots.'
+                    : '';
+                  cellTitle =
+`QTD: latest TI Direct catalog rollup vs previous TI Direct snapshot
+Canonical subcategory: ${canonicalForCell || '—'}${noMove}
+Latest snapshot:   ${latestAt}  ·  median ${latestPx}
+Previous snapshot: ${prevAt}  ·  median ${prevPx}
+Δ price: ${dpx}
+Δ stock: ${dst}
+Snapshots in window: ${tiTrend.snapshotCount ?? '—'} (confidence: ${tiTrend.trendConfidence || '—'})${hasTiRollup ? '\nClick to see the TI parts in this category.' : ''}`;
+                } else if (Number.isFinite(d?.qoqPct)) {
+                  const latestPx = fmtUSD(d?.avgPriceUSD);
+                  const basePx = fmtUSD(d?.baselinePriceUSD);
+                  cellTitle =
+`QTD: live source price vs Q1-26 close baseline
+Source: live distributor (TI Direct comparison unavailable for this category)
+Latest:   ${latestPx}
+Baseline: ${basePx}
+Δ:        ${fmtSignedPct(d.qoqPct)}`;
+                } else {
+                  const latestPx = fmtUSD(d?.avgPriceUSD);
+                  const basePx = fmtUSD(d?.baselinePriceUSD);
+                  cellTitle =
+`QTD: live source price vs Q1-26 close baseline (computed)
+Latest:   ${latestPx}
+Baseline: ${basePx}
+Δ:        ${fmtSignedPct(v)}`;
+                }
                 return(
                   <td key={c.id}
                     className={handleClick?'tdc':undefined}
@@ -3231,7 +3354,7 @@ function App(){
           useEffect measures the rendered tooltip height + flips above
           the cursor when it would clip the viewport bottom, then
           re-renders with the corrected top. */}
-      {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId)||tiRollupsByCanonical[combinedEvidence?.legacyToCanonical?.[tooltip.catId]])&&(
+      {activeTab==='prices'&&tooltip&&(liveData?.[tooltip.catId]||basketCatFor(tooltip.catId)||evidenceCatFor(tooltip.catId)||tiRollupsByCanonical[combinedEvidence?.legacyToCanonical?.[tooltip.catId]]||tiTrendByCanonical[combinedEvidence?.legacyToCanonical?.[tooltip.catId]])&&(
         <div
           ref={tooltipRef}
           className="tt"
