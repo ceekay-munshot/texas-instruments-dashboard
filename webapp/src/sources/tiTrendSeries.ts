@@ -33,6 +33,11 @@ export type LiveCellBreakdown = {
   anchorUSD: number
   anchorDate: string
   anchorLabel: 'TI capture' | 'Historical baseline'
+  /** Internal/debug-only — never rendered in the customer-facing receipt.
+   *  Tells us which input fed the live USD: own captured TI inventory data
+   *  (`ti_inventory`) or the /api/prices distributor mirror used when no TI
+   *  inventory row exists for the representative SKU (`prices_fallback`). */
+  latestSource?: 'ti_inventory' | 'prices_fallback'
 }
 
 export type TrendCell = {
@@ -177,6 +182,8 @@ type LiveSnapshot = Record<string, {
   liveUSD: number
   /** ISO calendar date the live capture came from (e.g. "2026-05-07"). */
   liveDate: string
+  /** Internal flag — see LiveCellBreakdown.latestSource. */
+  latestSource?: 'ti_inventory' | 'prices_fallback'
 }>
 
 /** Anchor lookup result — what to compare today's price against. Provided
@@ -335,6 +342,7 @@ export function buildTrendView(
           anchorUSD: anchor.anchorUSD,
           anchorDate: anchor.anchorDate,
           anchorLabel: anchor.anchorLabel,
+          latestSource: live.latestSource,
         }
       }
       // If no anchor resolves, leave pct null — the live cell is blank and

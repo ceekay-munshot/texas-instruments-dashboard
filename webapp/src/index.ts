@@ -655,7 +655,30 @@ app.get('/api/ti/trend/series', async (c) => {
     }
   }
 
+  // Build the live snapshot. Per-SKU preference:
+  //   1. Own captured TI inventory data (ti_inventory_price_snapshot)
+  //   2. /api/prices distributor mirror (only when no TI inventory row exists)
+  // The chosen source is recorded as `latestSource` for internal verification;
+  // the receipt UI never renders this field.
   const liveSnapshot = buildLiveSnapshot(pricesData, liveAsOf)
+  const fallbackSubs: string[] = []
+  for (const canonicalId of Object.keys(SUB_TO_BASELINE)) {
+    const legacyId = canonicalToLegacy(canonicalId)
+    const repPart = legacyId ? PART_MAP[legacyId]?.parts?.[0] : null
+    if (!repPart) continue
+    const tiToday = await getTiInventoryAt(c.env.TI_INVENTORY_HISTORY_DB ?? null, repPart, liveAsOf)
+    if (tiToday && tiToday.priceUSD > 0) {
+      liveSnapshot[canonicalId] = {
+        canonicalId,
+        liveUSD: tiToday.priceUSD,
+        liveDate: String(tiToday.capturedAt).slice(0, 10),
+        latestSource: 'ti_inventory',
+      }
+    } else if (liveSnapshot[canonicalId]) {
+      liveSnapshot[canonicalId].latestSource = 'prices_fallback'
+      fallbackSubs.push(canonicalId)
+    }
+  }
 
   // Compute the live row's anchor date — start of the current period.
   const today = new Date(`${liveAsOf}T00:00:00Z`)
@@ -714,13 +737,24 @@ app.get('/api/ti/trend/series', async (c) => {
     if (!resolved && mapping.kind === 'series') {
       const histAnchor = resolveHistoricalPoint(canonicalId, anchorTargetDate)
       if (histAnchor) {
-        const firstCapture = await getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
+        // Splice source must match today's source so the back-derivation lives
+        // on a single price scale. ti_inventory → first inventory capture;
+        // prices_fallback → today's /api/prices value as its own splice (the
+        // ratio collapses to 1, leaving anchorUSD = today × histRatio honestly).
         const liveSnap = liveSnapshot[canonicalId]
-        const firstLiveUSD = firstCapture?.priceUSD ?? liveSnap?.liveUSD ?? null
-        const firstLiveDate =
-          firstCapture?.capturedAt
-            ? String(firstCapture.capturedAt).slice(0, 10)
-            : (liveSnap?.liveDate ?? null)
+        let firstLiveUSD: number | null = null
+        let firstLiveDate: string | null = null
+        if (liveSnap?.latestSource === 'ti_inventory') {
+          const firstCapture = await getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
+          if (firstCapture && firstCapture.priceUSD > 0) {
+            firstLiveUSD = firstCapture.priceUSD
+            firstLiveDate = String(firstCapture.capturedAt).slice(0, 10)
+          }
+        }
+        if (firstLiveUSD == null && liveSnap?.liveUSD && liveSnap.liveUSD > 0) {
+          firstLiveUSD = liveSnap.liveUSD
+          firstLiveDate = liveSnap.liveDate
+        }
         if (firstLiveUSD && firstLiveUSD > 0 && firstLiveDate) {
           const splice = resolveHistoricalPoint(canonicalId, firstLiveDate)
           if (splice && splice.index > 0) {
@@ -740,11 +774,18 @@ app.get('/api/ti/trend/series', async (c) => {
   }
 
   const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot)
+  // Internal/debug counts — used during verification, not shown in customer UI.
+  const sourceCounts = { ti_inventory: 0, prices_fallback: 0 }
+  for (const entry of Object.values(liveSnapshot)) {
+    if (entry?.latestSource === 'ti_inventory') sourceCounts.ti_inventory += 1
+    else if (entry?.latestSource === 'prices_fallback') sourceCounts.prices_fallback += 1
+  }
   return c.json({
     view: result.view,
     liveAsOf: result.liveAsOf,
     columns: result.columns,
     rows: result.rows,
+    _internal: { sourceCounts, fallbackSubcategories: fallbackSubs.sort() },
   })
 })
 
