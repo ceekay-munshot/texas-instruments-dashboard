@@ -35,6 +35,10 @@ export type TrendRow = {
   label: string
   /** True when this row represents the live, still-open period. */
   liveToDate: boolean
+  /** True when both period boundaries fall in the carry-forward bridge window
+   *  (between the last historical pulse Apr-11-2026 and our first own
+   *  capture May-2-2026). Bridge rows render as 0% across all cells. */
+  bridgeRow: boolean
   /** Cell per subcategory, keyed by canonical id. */
   cells: Record<string, TrendCell>
 }
@@ -252,13 +256,23 @@ export function buildTrendView(
       }
       cells[col.canonicalId] = { index: cur, pct }
     }
+    // A "bridge" row is one where BOTH endpoints fall strictly inside the
+    // carry-forward window (between the last historical pulse and our first
+    // own capture). Such rows produce 0% movement on every cell because
+    // both endpoints resolve to the same carried-forward anchor.
+    const prevISO = prev ? isoDate(prev) : null
+    const curISO = isoDate(b)
+    const bridgeRow = !!(
+      prevISO && prevISO > '2026-04-11' && curISO < '2026-05-02'
+    )
     rows.push({
-      periodEnd: isoDate(b),
+      periodEnd: curISO,
       label:
         view === 'wow' ? fmtWeek(b)
         : view === 'mom' ? fmtMonthShort(b)
         : fmtQuarter(b),
       liveToDate: false,
+      bridgeRow,
       cells,
     })
   }
@@ -282,6 +296,7 @@ export function buildTrendView(
         : view === 'mom' ? `MTD · ${fmtMonthShort(today)}`
         : `QTD · ${fmtQuarter(today)}`,
       liveToDate: true,
+      bridgeRow: false,
       cells,
     })
   }

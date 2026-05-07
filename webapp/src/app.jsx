@@ -2660,9 +2660,10 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                     left:0,
                     background: stickyBg,
                     zIndex:2,
-                    color: labelColor,
+                    color: r.bridgeRow ? '#3a4d65' : labelColor,
                     fontWeight: live ? 'bold' : 'normal',
-                  }}>
+                    cursor: r.bridgeRow ? 'help' : 'default',
+                  }} title={r.bridgeRow ? 'TI API full data available from May 1 due to access restriction. Limited data availability from Mouser prior — first capture from Mouser Feb 27, 2026.' : undefined}>
                     {live ? '★ ' : '   '}{r.label}
                   </td>
                   {visCanonical.map((c, i) => {
@@ -2671,6 +2672,9 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                     const pct = cell?.pct;
                     const text = fmtPct(pct);
                     const color = pctColor(pct);
+                    const cellTitle = r.bridgeRow
+                      ? 'TI API full data available from May 1 due to access restriction. Limited data availability from Mouser prior — first capture from Mouser Feb 27, 2026.'
+                      : (cell?.index != null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data');
                     return (
                       <td key={c.canonicalId} style={{
                         padding:'4px 6px',
@@ -2679,9 +2683,10 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                         borderLeft: iF ? `1px solid #0d1520` : 'none',
                         fontFamily:'monospace',
                         fontSize: live ? '0.74rem' : '0.7rem',
-                        color,
+                        color: r.bridgeRow ? '#3a4d65' : color,
                         fontWeight: live ? 'bold' : 'normal',
-                      }} title={cell?.index!=null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data'}>
+                        cursor: r.bridgeRow ? 'help' : 'default',
+                      }} title={cellTitle}>
                         {text}
                       </td>
                     );
