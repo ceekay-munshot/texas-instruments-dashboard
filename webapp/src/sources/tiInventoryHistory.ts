@@ -585,6 +585,40 @@ export async function getTiInventoryAt(
   }
 }
 
+// Returns the EARLIEST captured price at-or-after `dateISO` for a single SKU.
+// Used as the historical-to-live splice point: the first authentic own capture
+// from May 2026 onward, which we use to convert historical baseline indices
+// into a USD scale that matches our captured prices.
+export async function getTiInventoryFirstAfter(
+  d1: D1Database | null | undefined,
+  partNumber: string,
+  dateISO: string,
+): Promise<TiInventoryPoint | null> {
+  if (!d1 || !partNumber) return null
+  try {
+    const result = await d1
+      .prepare(
+        `SELECT normalized_unit_price, captured_at
+         FROM ti_inventory_price_snapshot
+         WHERE UPPER(orderable_part_number) = UPPER(?)
+           AND captured_at >= ?
+           AND normalized_unit_price IS NOT NULL
+           AND price_available = 1
+         ORDER BY captured_at ASC
+         LIMIT 1`,
+      )
+      .bind(partNumber, `${dateISO}T00:00:00.000Z`)
+      .first<{ normalized_unit_price: number; captured_at: string }>()
+    if (!result || result.normalized_unit_price == null) return null
+    return {
+      priceUSD: Number(result.normalized_unit_price),
+      capturedAt: String(result.captured_at),
+    }
+  } catch {
+    return null
+  }
+}
+
 // ── Signal engine ──────────────────────────────────────────────────────────
 
 export type InventorySignalType =

@@ -2680,21 +2680,22 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                     color: r.bridgeRow ? '#3a4d65' : labelColor,
                     fontWeight: live ? 'bold' : 'normal',
                     cursor: r.bridgeRow ? 'help' : 'default',
-                  }} title={r.bridgeRow ? 'TI API full data available from May 1 due to access restriction. Limited data availability from Mouser prior — first capture from Mouser Feb 27, 2026.' : undefined}>
+                  }} title={r.bridgeRow ? 'Live capture begins from May 2026. Historical baseline used where available.' : undefined}>
                     {live ? '★ ' : '   '}{r.label}
                   </td>
                   {visCanonical.map((c, i) => {
                     const iF = i === 0 || visCanonical[i-1].groupLabel !== c.groupLabel;
                     const cell = r.cells[c.canonicalId];
                     const pct = cell?.pct;
-                    const text = fmtPct(pct);
-                    const color = pctColor(pct);
                     const isLiveCell = live && !!cell?.breakdown;
+                    const isLiveBlank = live && !cell?.breakdown;
+                    const text = isLiveBlank ? '—' : fmtPct(pct);
+                    const color = pctColor(pct);
                     let cellTitle;
                     if (r.bridgeRow) {
-                      cellTitle = 'TI API full data available from May 1 due to access restriction. Limited data availability from Mouser prior — first capture from Mouser Feb 27, 2026.';
+                      cellTitle = 'Live capture begins from May 2026. Historical baseline used where available.';
                     } else if (live) {
-                      cellTitle = isLiveCell ? 'Click for calculation' : undefined;
+                      cellTitle = isLiveCell ? 'Click for calculation' : 'No valid prior-period anchor yet.';
                     } else {
                       cellTitle = cell?.index != null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data';
                     }
@@ -2718,9 +2719,9 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                         borderLeft: iF ? `1px solid #0d1520` : 'none',
                         fontFamily:'monospace',
                         fontSize: live ? '0.74rem' : '0.7rem',
-                        color: r.bridgeRow ? '#3a4d65' : color,
-                        fontWeight: live ? 'bold' : 'normal',
-                        cursor: r.bridgeRow ? 'help' : (isLiveCell ? 'pointer' : 'default'),
+                        color: r.bridgeRow ? '#3a4d65' : (isLiveBlank ? '#3a4d65' : color),
+                        fontWeight: live && !isLiveBlank ? 'bold' : 'normal',
+                        cursor: r.bridgeRow ? 'help' : (isLiveCell ? 'pointer' : (isLiveBlank ? 'help' : 'default')),
                       }} title={cellTitle} onClick={onCellClick}>
                         {text}
                       </td>

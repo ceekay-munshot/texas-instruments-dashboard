@@ -21,13 +21,11 @@ import {
 import { computeTrends } from './sources/snapshotTrends'
 import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
 import { buildTrendView, buildLiveSnapshot, type ViewKind, type AnchorSnapshot } from './sources/tiTrendSeries'
-import { getTiInventoryAt } from './sources/tiInventoryHistory'
+import { getTiInventoryAt, getTiInventoryFirstAfter } from './sources/tiInventoryHistory'
 import {
   SUB_TO_BASELINE,
-  FEB27_BASELINES_USD,
-  FEB27_ANCHOR_DATE,
-  HISTORICAL_SERIES_LAST_DATE,
-  latestBaselineReferenceUSD,
+  OWN_CAPTURE_FIRST_DATE,
+  resolveHistoricalPoint,
 } from './data/historicalBaseline'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
@@ -683,47 +681,61 @@ app.get('/api/ti/trend/series', async (c) => {
   }
 
   // Resolve the anchor cascade per subcategory.
+  // Per revised spec: NO Feb-27 fallback for live rows. Subcategories without
+  // a resolvable anchor are intentionally absent from anchorSnapshot — their
+  // live cells render blank in the UI.
   const d1 = c.env.TI_INVENTORY_HISTORY_DB ?? null
   const anchorSnapshot: AnchorSnapshot = {}
   for (const [canonicalId, mapping] of Object.entries(SUB_TO_BASELINE)) {
-    // Step 1: TI direct capture at-or-before the anchor date for the
-    // representative SKU. We need the part number — pick from PART_MAP
-    // by reverse-mapping canonical → legacy.
     const legacyId = canonicalToLegacy(canonicalId)
-    const repPart = legacyId ? PART_MAP[legacyId]?.part : null
-    let resolved: { anchorUSD: number; anchorDate: string; anchorLabel: 'TI capture' | 'Baseline reference' } | null = null
-    if (repPart) {
-      const tiPoint = await getTiInventoryAt(d1, repPart, anchorTargetDate)
-      if (tiPoint && tiPoint.priceUSD > 0) {
-        resolved = {
-          anchorUSD: tiPoint.priceUSD,
-          anchorDate: String(tiPoint.capturedAt).slice(0, 10),
-          anchorLabel: 'TI capture',
-        }
+    const repPart = legacyId ? PART_MAP[legacyId]?.parts?.[0] : null
+    if (!repPart) continue
+
+    let resolved: { anchorUSD: number; anchorDate: string; anchorLabel: 'TI capture' | 'Historical baseline' } | null = null
+
+    // Step 1: own TI capture at-or-before the period anchor target.
+    const tiPoint = await getTiInventoryAt(d1, repPart, anchorTargetDate)
+    if (tiPoint && tiPoint.priceUSD > 0) {
+      resolved = {
+        anchorUSD: tiPoint.priceUSD,
+        anchorDate: String(tiPoint.capturedAt).slice(0, 10),
+        anchorLabel: 'TI capture',
       }
     }
-    // Step 2: latest baseline reference (Apr-11-2026) — series subs only.
+
+    // Step 2: historical baseline (series subs only). Convert the historical
+    // index at the period anchor to USD using a splice calibration:
+    //   anchorUSD = firstLiveUSD × (historicalAnchorIndex / historicalSpliceIndex)
+    // — where historicalSpliceIndex is the historical index at-or-before the
+    // first own-capture date. firstLiveUSD comes from ti_inventory_history,
+    // falling back to the current /api/prices snapshot when no own capture
+    // is persisted yet (the calibration math collapses harmlessly in that
+    // case but the historical anchor date is still reported faithfully).
     if (!resolved && mapping.kind === 'series') {
-      const usd = latestBaselineReferenceUSD(canonicalId)
-      if (usd != null && usd > 0) {
-        resolved = {
-          anchorUSD: usd,
-          anchorDate: HISTORICAL_SERIES_LAST_DATE,
-          anchorLabel: 'Baseline reference',
+      const histAnchor = resolveHistoricalPoint(canonicalId, anchorTargetDate)
+      if (histAnchor) {
+        const firstCapture = await getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
+        const liveSnap = liveSnapshot[canonicalId]
+        const firstLiveUSD = firstCapture?.priceUSD ?? liveSnap?.liveUSD ?? null
+        const firstLiveDate =
+          firstCapture?.capturedAt
+            ? String(firstCapture.capturedAt).slice(0, 10)
+            : (liveSnap?.liveDate ?? null)
+        if (firstLiveUSD && firstLiveUSD > 0 && firstLiveDate) {
+          const splice = resolveHistoricalPoint(canonicalId, firstLiveDate)
+          if (splice && splice.index > 0) {
+            resolved = {
+              anchorUSD: firstLiveUSD * (histAnchor.index / splice.index),
+              anchorDate: histAnchor.date,
+              anchorLabel: 'Historical baseline',
+            }
+          }
         }
       }
     }
-    // Step 3: Feb-27 anchor — anchor-kind subs (or any sub if step 2 fails).
-    if (!resolved) {
-      const usd = FEB27_BASELINES_USD[canonicalId]
-      if (usd && usd > 0) {
-        resolved = {
-          anchorUSD: usd,
-          anchorDate: FEB27_ANCHOR_DATE,
-          anchorLabel: 'Baseline reference',
-        }
-      }
-    }
+
+    // Step 3: no anchor — leave the entry absent. Live cell renders blank.
+
     if (resolved) anchorSnapshot[canonicalId] = resolved
   }
 

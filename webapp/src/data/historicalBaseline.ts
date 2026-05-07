@@ -149,26 +149,31 @@ export function indexAtFeb27(seriesId: string): number | null {
   return v
 }
 
-// Look up the latest historical baseline index value for a series — i.e. the
-// last point in the bundled series. Used by the live-row anchor cascade as
-// the "Apr 11, 2026 baseline reference" for any pre-our-capture anchor date.
-export function latestHistoricalIndex(seriesId: string): number | null {
-  const pts = HISTORICAL_SERIES[seriesId]
-  if (!pts || pts.length === 0) return null
-  return pts[pts.length - 1][1]
-}
-
-// Back-derive a USD value at the latest historical baseline date by anchoring
-// to the Feb-27 calibration: latest_usd = feb27_usd × (latest_idx / feb27_idx)
-export function latestBaselineReferenceUSD(canonicalId: string): number | null {
+// Look up the historical baseline point at-or-before a given calendar date
+// for a series-kind subcategory. Returns both the index value AND the actual
+// data-point date — the receipt shows that date verbatim ("Historical baseline
+// (Mar 28, 2026)" rather than the period-anchor target like "Mar 31").
+//
+// Returns null for anchor-kind subs (no baseline series) or for dates that
+// predate the bundled series.
+export function resolveHistoricalPoint(
+  canonicalId: string,
+  dateISO: string,
+): { index: number; date: string } | null {
   const m = SUB_TO_BASELINE[canonicalId]
   if (!m || m.kind !== 'series') return null
-  const feb27USD = FEB27_BASELINES_USD[canonicalId]
-  if (!feb27USD) return null
-  const feb27Idx = indexAtFeb27(m.seriesId)
-  const latestIdx = latestHistoricalIndex(m.seriesId)
-  if (feb27Idx == null || latestIdx == null || feb27Idx <= 0) return null
-  return feb27USD * (latestIdx / feb27Idx)
+  const points = HISTORICAL_SERIES[m.seriesId]
+  if (!points || points.length === 0) return null
+  if (dateISO < points[0][0]) return null
+  let lo = 0
+  let hi = points.length - 1
+  let ans = points[0]
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1
+    if (points[mid][0] <= dateISO) { ans = points[mid]; lo = mid + 1 }
+    else hi = mid - 1
+  }
+  return { index: ans[1], date: ans[0] }
 }
 
 // Convert a captured live USD price for a subcategory to an index value

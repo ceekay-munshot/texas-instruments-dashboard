@@ -22,14 +22,17 @@ import { TI_TAXONOMY_FLAT } from '../data/tiTaxonomy'
 export type ViewKind = 'wow' | 'mom' | 'qoq'
 
 /** Receipt payload attached to live-row cells only. Powers the click-to-
- *  explain popover. Closed-row cells leave this undefined. */
+ *  explain popover. Closed-row cells leave this undefined.
+ *  When no valid anchor exists (subcategory has no own-capture and no
+ *  historical baseline), the live cell omits `breakdown` entirely and
+ *  renders blank — the cell is not clickable. */
 export type LiveCellBreakdown = {
   todayUSD: number
   todayDate: string
-  todayLabel: 'TI capture'
+  todayLabel: 'Latest capture'
   anchorUSD: number
   anchorDate: string
-  anchorLabel: 'TI capture' | 'Baseline reference'
+  anchorLabel: 'TI capture' | 'Historical baseline'
 }
 
 export type TrendCell = {
@@ -178,11 +181,12 @@ type LiveSnapshot = Record<string, {
 
 /** Anchor lookup result — what to compare today's price against. Provided
  *  by the caller (handler) so the trend module is DB-agnostic. Keyed by
- *  canonical subcategory id. */
+ *  canonical subcategory id. Subcategories without a resolvable anchor are
+ *  intentionally absent from this map; their live cells render blank. */
 export type AnchorSnapshot = Record<string, {
   anchorUSD: number
   anchorDate: string
-  anchorLabel: 'TI capture' | 'Baseline reference'
+  anchorLabel: 'TI capture' | 'Historical baseline'
 }>
 
 /**
@@ -324,24 +328,18 @@ export function buildTrendView(
       if (live && anchor && anchor.anchorUSD > 0) {
         // USD-first math (the user-facing path).
         pct = ((live.liveUSD - anchor.anchorUSD) / anchor.anchorUSD) * 100
-        index = idxAt(col.canonicalId, today)
         breakdown = {
           todayUSD: live.liveUSD,
           todayDate: live.liveDate,
-          todayLabel: 'TI capture',
+          todayLabel: 'Latest capture',
           anchorUSD: anchor.anchorUSD,
           anchorDate: anchor.anchorDate,
           anchorLabel: anchor.anchorLabel,
         }
-      } else {
-        // Fallback (sub has no live data or no resolvable anchor): index math.
-        const cur = idxAt(col.canonicalId, today)
-        const prevIdx = lastClosed ? idxAt(col.canonicalId, lastClosed) : null
-        if (cur != null && prevIdx != null && prevIdx > 0) {
-          pct = ((cur - prevIdx) / prevIdx) * 100
-        }
-        index = cur
       }
+      // If no anchor resolves, leave pct null — the live cell is blank and
+      // not clickable. We deliberately do NOT fall back to Feb-27 or to
+      // index-only math here (per revised spec).
       cells[col.canonicalId] = breakdown
         ? { index, pct, breakdown }
         : { index, pct }
