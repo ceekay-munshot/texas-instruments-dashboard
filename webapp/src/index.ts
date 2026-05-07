@@ -716,13 +716,31 @@ app.get('/api/ti/trend/series', async (c) => {
 
     let resolved: { anchorUSD: number; anchorDate: string; anchorLabel: 'TI capture' | 'Historical baseline' } | null = null
 
+    // Step 0 (MoM only): prefer the first own TI capture on/after the start
+    // of the current calendar month. This makes the MTD anchor "real
+    // captured data from this month" rather than a back-derived historical
+    // baseline. Only applies to the Month-on-Month view; WoW/QoQ unchanged.
+    if (view === 'mom') {
+      const monthStart = `${liveAsOf.slice(0, 7)}-01`
+      const firstOwnInMonth = await getTiInventoryFirstAfter(d1, repPart, monthStart)
+      if (firstOwnInMonth && firstOwnInMonth.priceUSD > 0) {
+        resolved = {
+          anchorUSD: firstOwnInMonth.priceUSD,
+          anchorDate: String(firstOwnInMonth.capturedAt).slice(0, 10),
+          anchorLabel: 'TI capture',
+        }
+      }
+    }
+
     // Step 1: own TI capture at-or-before the period anchor target.
-    const tiPoint = await getTiInventoryAt(d1, repPart, anchorTargetDate)
-    if (tiPoint && tiPoint.priceUSD > 0) {
-      resolved = {
-        anchorUSD: tiPoint.priceUSD,
-        anchorDate: String(tiPoint.capturedAt).slice(0, 10),
-        anchorLabel: 'TI capture',
+    if (!resolved) {
+      const tiPoint = await getTiInventoryAt(d1, repPart, anchorTargetDate)
+      if (tiPoint && tiPoint.priceUSD > 0) {
+        resolved = {
+          anchorUSD: tiPoint.priceUSD,
+          anchorDate: String(tiPoint.capturedAt).slice(0, 10),
+          anchorLabel: 'TI capture',
+        }
       }
     }
 
