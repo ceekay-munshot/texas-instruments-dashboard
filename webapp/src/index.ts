@@ -20,6 +20,7 @@ import {
 } from './sources/snapshotStore'
 import { computeTrends } from './sources/snapshotTrends'
 import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
+import { buildTrendView, buildLiveSnapshot, type ViewKind } from './sources/tiTrendSeries'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -608,6 +609,50 @@ app.get('/api/status', async (c) => {
     baselineAgeDays: meta.baselineAgeDays,
     baselineIsStale: meta.baselineIsStale,
     comparisonMode: meta.comparisonMode,
+  })
+})
+
+// ── TI trend series — three-resolution price-movement views (WoW/MoM/QoQ) ───
+//
+// Returns rows of period-end index values + % changes for all 28 canonical TI
+// subcategories. Stitches:
+//   • historical baseline series (Sept-2021 → Apr-11-2026)
+//   • carry-forward bridge (Apr-11 → May-2-2026)
+//   • live captures from /api/prices (May-2-2026 onward)
+//
+// Query: ?view=wow|mom|qoq (default qoq).
+app.get('/api/ti/trend/series', async (c) => {
+  const rawView = (c.req.query('view') ?? 'qoq').toLowerCase()
+  const view: ViewKind = rawView === 'wow' || rawView === 'mom' ? rawView as ViewKind : 'qoq'
+
+  // Resolve live prices: prefer the edge-cached /api/prices payload to avoid
+  // a redundant Mouser fetch on every request. Fall back to KV-persisted
+  // snapshot, then to an empty live set (historical-only view).
+  let pricesData: Record<string, any> = {}
+  let liveAsOf: string = new Date().toISOString().slice(0, 10)
+  try {
+    const cached = await caches.default.match(CACHE_KEY)
+    if (cached) {
+      const data: any = await cached.json()
+      pricesData = data._results ?? {}
+      if (data._cachedAt) liveAsOf = String(data._cachedAt).slice(0, 10)
+    }
+  } catch {}
+  if (Object.keys(pricesData).length === 0) {
+    const persisted = await readPersistedPriceSnapshot(c.env.SOURCE_SNAPSHOTS_KV)
+    if (persisted) {
+      pricesData = persisted.data ?? {}
+      if (persisted.fetchedAt) liveAsOf = String(persisted.fetchedAt).slice(0, 10)
+    }
+  }
+
+  const liveSnapshot = buildLiveSnapshot(pricesData)
+  const result = buildTrendView(view, liveSnapshot, liveAsOf)
+  return c.json({
+    view: result.view,
+    liveAsOf: result.liveAsOf,
+    columns: result.columns,
+    rows: result.rows,
   })
 })
 

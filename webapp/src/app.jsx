@@ -2506,6 +2506,196 @@ function UniversePanel({ initialFilter, onClearFilter }) {
   );
 }
 
+// ── TrendSeriesPanel — UBS-format 28-column WoW/MoM/QoQ price-movement table ─
+//
+// Replaces the legacy Prices table. Three sub-tabs (WoW / MoM / QoQ) hit
+// /api/ti/trend/series and render rows for every period the data covers.
+// The most recent row is the live to-date row (WTD / MTD / QTD), highlighted
+// in gold. Cells are colored green/red by % change vs prior period.
+function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }){
+  const [view, setView] = useState('qoq');     // 'wow' | 'mom' | 'qoq'
+  const [data, setData] = useState(null);      // { columns, rows, liveAsOf }
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError(null);
+    fetch(`/api/ti/trend/series?view=${view}`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+      .then(j => { if (alive) { setData(j); setLoading(false); } })
+      .catch(e => { if (alive) { setError(String(e)); setLoading(false); } });
+    return () => { alive = false; };
+  }, [view]);
+
+  // Visible columns honoring the parent-group toggle (vis from parent App).
+  const visCanonical = useMemo(() => {
+    if (!data) return [];
+    const visGroupLabels = new Set([...vis]);
+    return data.columns.filter(c => visGroupLabels.has(c.groupLabel));
+  }, [data, vis]);
+
+  // Group spans for the top header row.
+  const grpSpans = useMemo(() => {
+    const out = [];
+    visCanonical.forEach(c => {
+      const last = out[out.length - 1];
+      if (last && last.g === c.groupLabel) last.n++;
+      else out.push({ g: c.groupLabel, n: 1 });
+    });
+    return out;
+  }, [visCanonical]);
+
+  // Newest-first order so latest periods appear at the top.
+  const orderedRows = useMemo(() => {
+    if (!data) return [];
+    return [...data.rows].reverse();
+  }, [data]);
+
+  function fmtPct(v) {
+    if (v == null || !isFinite(v)) return '—';
+    const sign = v > 0 ? '+' : '';
+    return `${sign}${v.toFixed(2)}%`;
+  }
+  function pctColor(v) {
+    if (v == null || !isFinite(v)) return '#3a4d65';
+    if (v > 0.05) return '#00c9a7';
+    if (v < -0.05) return '#f05c5c';
+    return '#7a96b8';
+  }
+
+  const VIEW_TABS = [
+    { id: 'wow', label: 'Week on Week', live: 'WTD' },
+    { id: 'mom', label: 'Month on Month', live: 'MTD' },
+    { id: 'qoq', label: 'Quarter on Quarter', live: 'QTD' },
+  ];
+
+  return (
+    <>
+      {/* ── View tabs ── */}
+      <div style={{display:'flex',gap:0,borderBottom:`1px solid ${B}`,background:'#050810'}}>
+        {VIEW_TABS.map(t => {
+          const on = view === t.id;
+          return (
+            <button key={t.id} onClick={() => setView(t.id)} style={{
+              flex: '0 0 auto',
+              padding: '8px 18px',
+              border: 'none',
+              borderRight: `1px solid ${B}`,
+              borderBottom: on ? '2px solid #3d8ef0' : '2px solid transparent',
+              background: on ? '#0a1220' : 'transparent',
+              color: on ? '#3d8ef0' : '#7a96b8',
+              fontSize: '0.7rem',
+              fontFamily: 'monospace',
+              fontWeight: on ? 'bold' : 'normal',
+              letterSpacing: '0.06em',
+              cursor: 'pointer',
+            }}>
+              {t.label} <span style={{opacity:0.6,fontSize:'0.62rem'}}>· {t.live} live</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── Group toggles (mirror of legacy panel) ── */}
+      <div style={{display:'flex',gap:5,padding:'7px 16px',borderBottom:`1px solid ${B}`,flexWrap:'wrap',alignItems:'center',background:'#050810'}}>
+        <span style={{fontSize:'0.57rem',color:'#2d4a6b',letterSpacing:'0.1em'}}>SHOW:</span>
+        {Object.keys(GC).map(g=>{const on=vis.has(g),c=GC[g];return(
+          <button key={g} onClick={()=>setVis(prev=>{const n=new Set(prev);n.has(g)?n.delete(g):n.add(g);return n;})} style={{background:on?c+'22':'none',border:`1px solid ${on?c:B}`,borderRadius:3,padding:'2px 8px',fontSize:'0.62rem',color:on?c:'#2d4a6b',cursor:'pointer',transition:'all 0.15s'}}>
+            {g} <span style={{opacity:.6,fontSize:'0.52rem'}}>({CATS.filter(x=>x.g===g).length})</span>
+          </button>);
+        })}
+      </div>
+
+      {/* ── Legend ── */}
+      <div style={{display:'flex',gap:18,padding:'7px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.62rem',color:'#7a96b8',flexWrap:'wrap',background:'#050810',alignItems:'center'}}>
+        <span><span style={{color:'#00c9a7'}}>■</span> Price increase</span>
+        <span><span style={{color:'#f05c5c'}}>■</span> Price decrease</span>
+        <span style={{color:'#4a6a8a'}}>· Closed periods show {view==='wow'?'WoW':view==='mom'?'MoM':'QoQ'} % movement</span>
+        <span style={{color:'#ffd700'}}>★ Live row updates with each daily capture</span>
+      </div>
+
+      {/* ── Status / loading line ── */}
+      <div style={{padding:'6px 16px',fontSize:'0.62rem',color:'#7a96b8',background:'#050810',borderBottom:`1px solid #0d1520`,display:'flex',gap:14,alignItems:'center',flexWrap:'wrap'}}>
+        {loading && <span style={{color:'#7a96b8'}}>Loading {view.toUpperCase()} series…</span>}
+        {error && <span style={{color:'#f0a84e'}}>Error: {error}</span>}
+        {data && !loading && <>
+          <span>{data.rows.length} period{data.rows.length===1?'':'s'} · {visCanonical.length} subcategor{visCanonical.length===1?'y':'ies'} shown</span>
+          <span style={{color:'#4a6a8a'}}>· live as of {data.liveAsOf}</span>
+          {fetchedAt && <span style={{color:'#4a6a8a'}}>· prices updated {new Date(fetchedAt).toLocaleString()}</span>}
+          {isRateLimited && <span style={{color:'#7a96b8',fontStyle:'italic'}}>· update pending</span>}
+        </>}
+      </div>
+
+      {/* ── Table ── */}
+      <div style={{overflowX:'auto',position:'relative',zIndex:1}}>
+        <table style={{borderCollapse:'collapse',whiteSpace:'nowrap'}}>
+          <thead>
+            <tr style={{background:'#050810'}}>
+              <th rowSpan={2} style={{padding:'6px 12px 6px 16px',textAlign:'left',borderBottom:`1px solid ${B}`,borderRight:`1px solid ${B}`,color:'#2d4a6b',fontWeight:'normal',fontSize:'0.58rem',position:'sticky',left:0,background:'#050810',zIndex:3,minWidth:140,verticalAlign:'bottom'}}>Period</th>
+              {grpSpans.map(({g,n})=><th key={g} colSpan={n} style={{padding:'5px 6px',textAlign:'center',borderBottom:`1px solid ${B}`,borderLeft:`1px solid ${B}`,fontWeight:'normal',fontSize:'0.62rem',letterSpacing:'0.04em',color:GC[g]||'#888'}}>{g}</th>)}
+            </tr>
+            <tr style={{background:'#07090f'}}>
+              {visCanonical.map((c,i)=>{const iF=i===0||visCanonical[i-1].groupLabel!==c.groupLabel;return(
+                <th key={c.canonicalId} style={{padding:'4px 6px',textAlign:'right',borderBottom:`2px solid ${B}`,borderLeft:iF?`1px solid ${B}`:'none',fontWeight:'normal',fontSize:'0.58rem',color:(GC[c.groupLabel]||'#888')+'bb',minWidth:80,maxWidth:110,overflow:'hidden',textOverflow:'ellipsis'}}>{c.label}</th>
+              );})}
+            </tr>
+          </thead>
+          <tbody>
+            {orderedRows.map((r, ri) => {
+              const live = r.liveToDate;
+              const bg = live ? 'rgba(255,215,0,0.05)' : ri % 2 === 0 ? '#080c14' : '#06080f';
+              const stickyBg = live ? '#141102' : ri % 2 === 0 ? '#080c14' : '#06080f';
+              const labelColor = live ? '#ffd700' : '#7a96b8';
+              return (
+                <tr key={r.periodEnd + (live?'-live':'')} style={{background: bg}}>
+                  <td style={{
+                    padding:'5px 12px 5px 16px',
+                    borderRight:`1px solid ${B}`,
+                    borderBottom:`1px solid #0d1520`,
+                    fontFamily:'monospace',
+                    fontSize: live ? '0.74rem' : '0.7rem',
+                    position:'sticky',
+                    left:0,
+                    background: stickyBg,
+                    zIndex:2,
+                    color: labelColor,
+                    fontWeight: live ? 'bold' : 'normal',
+                  }}>
+                    {live ? '★ ' : '   '}{r.label}
+                  </td>
+                  {visCanonical.map((c, i) => {
+                    const iF = i === 0 || visCanonical[i-1].groupLabel !== c.groupLabel;
+                    const cell = r.cells[c.canonicalId];
+                    const pct = cell?.pct;
+                    const text = fmtPct(pct);
+                    const color = pctColor(pct);
+                    return (
+                      <td key={c.canonicalId} style={{
+                        padding:'4px 6px',
+                        textAlign:'right',
+                        borderBottom:`1px solid #0d1520`,
+                        borderLeft: iF ? `1px solid #0d1520` : 'none',
+                        fontFamily:'monospace',
+                        fontSize: live ? '0.74rem' : '0.7rem',
+                        color,
+                        fontWeight: live ? 'bold' : 'normal',
+                      }} title={cell?.index!=null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data'}>
+                        {text}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 function App(){
   // Hydrate from the last successful snapshot first so the live row never
@@ -3146,16 +3336,10 @@ function App(){
         })}
       </div>
 
-      {activeTab==='prices'&&<>
-      {/* ── Group toggles ── */}
-      <div style={{display:'flex',gap:5,padding:'7px 16px',borderBottom:`1px solid ${B}`,flexWrap:'wrap',alignItems:'center',background:'#050810'}}>
-        <span style={{fontSize:'0.57rem',color:'#2d4a6b',letterSpacing:'0.1em'}}>SHOW:</span>
-        {Object.keys(GC).map(g=>{const on=vis.has(g),c=GC[g];return(
-          <button key={g} onClick={()=>setVis(prev=>{const n=new Set(prev);n.has(g)?n.delete(g):n.add(g);return n;})} style={{background:on?c+'22':'none',border:`1px solid ${on?c:B}`,borderRadius:3,padding:'2px 8px',fontSize:'0.62rem',color:on?c:'#2d4a6b',cursor:'pointer',transition:'all 0.15s'}}>
-            {g} <span style={{opacity:.6,fontSize:'0.52rem'}}>({CATS.filter(x=>x.g===g).length})</span>
-          </button>);
-        })}
-      </div>
+      {activeTab==='prices'&&<TrendSeriesPanel vis={vis} setVis={setVis} isRateLimited={isRateLimited} fetchedAt={fetchedAt} GC={GC} CATS={CATS} B={B} />}
+      {false&&<>
+      {/* ── Legacy panel (replaced by TrendSeriesPanel) ── */}
+      <div style={{display:'none'}}>
 
       {/* ── Customer-facing legend (clean) ── */}
       <div style={{display:'flex',gap:18,padding:'7px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.62rem',color:'#7a96b8',flexWrap:'wrap',background:'#050810',alignItems:'center'}}>
@@ -3363,6 +3547,7 @@ Once a Mar-26 / Q1-26 close TI Direct snapshot is captured and stored, this cell
             </tr>
           </tbody>
         </table>
+      </div>
       </div>
       </>}
 
