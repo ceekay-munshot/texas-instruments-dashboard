@@ -2517,6 +2517,23 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
   const [data, setData] = useState(null);      // { columns, rows, liveAsOf }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Pinned receipt for click-to-explain on live-row cells.
+  // Shape: { subLabel, periodLabel, viewLive, breakdown, anchorXY:{top,left} }
+  const [receipt, setReceipt] = useState(null);
+  const receiptRef = useRef(null);
+
+  // Click-outside dismissal for the receipt popover.
+  useEffect(() => {
+    if (!receipt) return;
+    const onDocClick = (e) => {
+      if (receiptRef.current && receiptRef.current.contains(e.target)) return;
+      setReceipt(null);
+    };
+    // Defer attaching the listener so the click that opened the receipt
+    // doesn't immediately close it.
+    const t = setTimeout(() => document.addEventListener('click', onDocClick), 0);
+    return () => { clearTimeout(t); document.removeEventListener('click', onDocClick); };
+  }, [receipt]);
 
   useEffect(() => {
     let alive = true;
@@ -2672,9 +2689,27 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                     const pct = cell?.pct;
                     const text = fmtPct(pct);
                     const color = pctColor(pct);
-                    const cellTitle = r.bridgeRow
-                      ? 'TI API full data available from May 1 due to access restriction. Limited data availability from Mouser prior — first capture from Mouser Feb 27, 2026.'
-                      : (cell?.index != null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data');
+                    const isLiveCell = live && !!cell?.breakdown;
+                    let cellTitle;
+                    if (r.bridgeRow) {
+                      cellTitle = 'TI API full data available from May 1 due to access restriction. Limited data availability from Mouser prior — first capture from Mouser Feb 27, 2026.';
+                    } else if (live) {
+                      cellTitle = isLiveCell ? 'Click for calculation' : undefined;
+                    } else {
+                      cellTitle = cell?.index != null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data';
+                    }
+                    const onCellClick = isLiveCell
+                      ? (e) => {
+                          e.stopPropagation();
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          setReceipt({
+                            subLabel: c.label,
+                            periodLabel: r.label,
+                            breakdown: cell.breakdown,
+                            anchorXY: { x: rect.left + rect.width / 2, y: rect.bottom },
+                          });
+                        }
+                      : undefined;
                     return (
                       <td key={c.canonicalId} style={{
                         padding:'4px 6px',
@@ -2685,8 +2720,8 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
                         fontSize: live ? '0.74rem' : '0.7rem',
                         color: r.bridgeRow ? '#3a4d65' : color,
                         fontWeight: live ? 'bold' : 'normal',
-                        cursor: r.bridgeRow ? 'help' : 'default',
-                      }} title={cellTitle}>
+                        cursor: r.bridgeRow ? 'help' : (isLiveCell ? 'pointer' : 'default'),
+                      }} title={cellTitle} onClick={onCellClick}>
                         {text}
                       </td>
                     );
@@ -2697,7 +2732,95 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
           </tbody>
         </table>
       </div>
+
+      {/* ── Click-to-explain receipt popover ── */}
+      {receipt && <ReceiptPopover receipt={receipt} onClose={() => setReceipt(null)} popoverRef={receiptRef} B={B} />}
     </>
+  );
+}
+
+// Renders the math receipt: subcategory, period, two USD lines, formula.
+function ReceiptPopover({ receipt, onClose, popoverRef, B }){
+  const { subLabel, periodLabel, breakdown, anchorXY } = receipt;
+  const fmtUSD = (v) => `$${Number(v).toFixed(4)}`;
+  const today = breakdown.todayUSD;
+  const anchor = breakdown.anchorUSD;
+  const pct = ((today - anchor) / anchor) * 100;
+  const sign = pct > 0 ? '+' : '';
+  const pctText = `${sign}${pct.toFixed(2)}%`;
+
+  // Position: pinned just below the clicked cell, viewport-clamped.
+  const [pos, setPos] = useState(null);
+  useEffect(() => {
+    if (!popoverRef.current) return;
+    const rect = popoverRef.current.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const EDGE = 8;
+    let top = anchorXY.y + 8;
+    if (top + rect.height > vh - EDGE) {
+      top = Math.max(EDGE, anchorXY.y - rect.height - 16);
+    }
+    let left = anchorXY.x - rect.width / 2;
+    left = Math.max(EDGE, Math.min(left, vw - rect.width - EDGE));
+    setPos({ top, left });
+  }, [anchorXY.x, anchorXY.y]);
+
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(`${iso.slice(0,10)}T00:00:00Z`);
+    if (isNaN(d.getTime())) return iso;
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
+  }
+
+  return (
+    <div
+      ref={popoverRef}
+      style={{
+        position: 'fixed',
+        top: pos?.top ?? -9999,
+        left: pos?.left ?? -9999,
+        visibility: pos ? 'visible' : 'hidden',
+        background: '#0c1220',
+        border: `1px solid ${B}`,
+        borderRadius: 6,
+        padding: '12px 16px',
+        fontFamily: 'monospace',
+        fontSize: '0.7rem',
+        color: '#c4d4e8',
+        boxShadow: '0 6px 24px rgba(0,0,0,0.6)',
+        zIndex: 1000,
+        minWidth: 360,
+        maxWidth: 460,
+      }}
+    >
+      <button onClick={onClose} style={{
+        position: 'absolute', top: 6, right: 8,
+        background: 'none', border: 'none', color: '#4a6a8a',
+        cursor: 'pointer', fontSize: '0.85rem', lineHeight: 1, padding: 4,
+      }} aria-label="close">×</button>
+
+      <div style={{fontSize:'0.85rem',fontWeight:'bold',color:'#3d8ef0',marginBottom:2}}>{subLabel}</div>
+      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom:12,letterSpacing:'0.04em'}}>{periodLabel}</div>
+
+      <div style={{display:'grid',gridTemplateColumns:'auto auto',rowGap:6,columnGap:18,marginBottom:12}}>
+        <div style={{color:'#7a96b8'}}>{breakdown.todayLabel} ({fmtDate(breakdown.todayDate)})</div>
+        <div style={{textAlign:'right',color:'#c4d4e8',fontWeight:'bold'}}>{fmtUSD(today)}</div>
+        <div style={{color:'#7a96b8'}}>{breakdown.anchorLabel} ({fmtDate(breakdown.anchorDate)})</div>
+        <div style={{textAlign:'right',color:'#c4d4e8',fontWeight:'bold'}}>{fmtUSD(anchor)}</div>
+      </div>
+
+      <div style={{borderTop:`1px solid ${B}`,paddingTop:10,fontSize:'0.7rem'}}>
+        <span style={{color:'#7a96b8'}}>
+          ({fmtUSD(today)} − {fmtUSD(anchor)}) / {fmtUSD(anchor)} × 100 =
+        </span>
+        <span style={{
+          marginLeft: 6,
+          fontWeight: 'bold',
+          color: pct > 0.05 ? '#00c9a7' : pct < -0.05 ? '#f05c5c' : '#c4d4e8',
+        }}>{pctText}</span>
+      </div>
+    </div>
   );
 }
 

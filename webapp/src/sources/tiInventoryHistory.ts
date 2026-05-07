@@ -539,6 +539,52 @@ function tryParsePriceBreaks(
   }
 }
 
+// ── Point-in-time price lookup for trend receipts ─────────────────────────
+//
+// Returns the most recent captured normalized unit price at-or-before the
+// given calendar date for a single representative SKU. Used by the live-row
+// trend computation to anchor in real captured USD where available.
+//
+// `dateISO` is treated as inclusive end-of-day (string compare is enough
+// since `captured_at` is stored as ISO 8601 and we sort by it).
+//
+// Returns null if no D1 binding, the SKU has no rows, or no row predates
+// `dateISO`. Callers cascade to the historical baseline anchor on null.
+export type TiInventoryPoint = {
+  priceUSD: number
+  capturedAt: string
+}
+
+export async function getTiInventoryAt(
+  d1: D1Database | null | undefined,
+  partNumber: string,
+  dateISO: string,
+): Promise<TiInventoryPoint | null> {
+  if (!d1 || !partNumber) return null
+  try {
+    const result = await d1
+      .prepare(
+        `SELECT normalized_unit_price, captured_at
+         FROM ti_inventory_price_snapshot
+         WHERE UPPER(orderable_part_number) = UPPER(?)
+           AND captured_at <= ?
+           AND normalized_unit_price IS NOT NULL
+           AND price_available = 1
+         ORDER BY captured_at DESC
+         LIMIT 1`,
+      )
+      .bind(partNumber, `${dateISO}T23:59:59.999Z`)
+      .first<{ normalized_unit_price: number; captured_at: string }>()
+    if (!result || result.normalized_unit_price == null) return null
+    return {
+      priceUSD: Number(result.normalized_unit_price),
+      capturedAt: String(result.captured_at),
+    }
+  } catch {
+    return null
+  }
+}
+
 // ── Signal engine ──────────────────────────────────────────────────────────
 
 export type InventorySignalType =

@@ -20,7 +20,15 @@ import {
 } from './sources/snapshotStore'
 import { computeTrends } from './sources/snapshotTrends'
 import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
-import { buildTrendView, buildLiveSnapshot, type ViewKind } from './sources/tiTrendSeries'
+import { buildTrendView, buildLiveSnapshot, type ViewKind, type AnchorSnapshot } from './sources/tiTrendSeries'
+import { getTiInventoryAt } from './sources/tiInventoryHistory'
+import {
+  SUB_TO_BASELINE,
+  FEB27_BASELINES_USD,
+  FEB27_ANCHOR_DATE,
+  HISTORICAL_SERIES_LAST_DATE,
+  latestBaselineReferenceUSD,
+} from './data/historicalBaseline'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -614,11 +622,14 @@ app.get('/api/status', async (c) => {
 
 // ── TI trend series — three-resolution price-movement views (WoW/MoM/QoQ) ───
 //
-// Returns rows of period-end index values + % changes for all 28 canonical TI
-// subcategories. Stitches:
-//   • historical baseline series (Sept-2021 → Apr-11-2026)
-//   • carry-forward bridge (Apr-11 → May-2-2026)
-//   • live captures from /api/prices (May-2-2026 onward)
+// Live to-date row computes pct in pure USD against an anchor cascade:
+//   1. TI direct capture at-or-before the period anchor date (per-SKU,
+//      from `ti_inventory_history`).
+//   2. Latest baseline reference (Apr-11-2026) — back-derived to USD using
+//      the Feb-27 calibration. Applies to subs with historical data.
+//   3. Feb-27-2026 baseline price — for subs without historical data.
+//
+// Closed historical rows keep their existing index-derived computation.
 //
 // Query: ?view=wow|mom|qoq (default qoq).
 app.get('/api/ti/trend/series', async (c) => {
@@ -646,8 +657,77 @@ app.get('/api/ti/trend/series', async (c) => {
     }
   }
 
-  const liveSnapshot = buildLiveSnapshot(pricesData)
-  const result = buildTrendView(view, liveSnapshot, liveAsOf)
+  const liveSnapshot = buildLiveSnapshot(pricesData, liveAsOf)
+
+  // Compute the live row's anchor date — start of the current period.
+  const today = new Date(`${liveAsOf}T00:00:00Z`)
+  let anchorTargetDate: string
+  if (view === 'wow') {
+    // Friday-on-or-before today. Same convention as the period boundary
+    // generator in tiTrendSeries.ts.
+    const dow = today.getUTCDay()
+    const delta = dow >= 5 ? dow - 5 : dow + 2
+    const fri = new Date(today)
+    fri.setUTCDate(fri.getUTCDate() - delta)
+    anchorTargetDate = fri.toISOString().slice(0, 10)
+  } else if (view === 'mom') {
+    // Last day of the prior month.
+    const prev = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 0))
+    anchorTargetDate = prev.toISOString().slice(0, 10)
+  } else {
+    // Last day of the prior quarter.
+    const m = today.getUTCMonth()
+    const qStart = Math.floor(m / 3) * 3
+    const prev = new Date(Date.UTC(today.getUTCFullYear(), qStart, 0))
+    anchorTargetDate = prev.toISOString().slice(0, 10)
+  }
+
+  // Resolve the anchor cascade per subcategory.
+  const d1 = c.env.TI_INVENTORY_HISTORY_DB ?? null
+  const anchorSnapshot: AnchorSnapshot = {}
+  for (const [canonicalId, mapping] of Object.entries(SUB_TO_BASELINE)) {
+    // Step 1: TI direct capture at-or-before the anchor date for the
+    // representative SKU. We need the part number — pick from PART_MAP
+    // by reverse-mapping canonical → legacy.
+    const legacyId = canonicalToLegacy(canonicalId)
+    const repPart = legacyId ? PART_MAP[legacyId]?.part : null
+    let resolved: { anchorUSD: number; anchorDate: string; anchorLabel: 'TI capture' | 'Baseline reference' } | null = null
+    if (repPart) {
+      const tiPoint = await getTiInventoryAt(d1, repPart, anchorTargetDate)
+      if (tiPoint && tiPoint.priceUSD > 0) {
+        resolved = {
+          anchorUSD: tiPoint.priceUSD,
+          anchorDate: String(tiPoint.capturedAt).slice(0, 10),
+          anchorLabel: 'TI capture',
+        }
+      }
+    }
+    // Step 2: latest baseline reference (Apr-11-2026) — series subs only.
+    if (!resolved && mapping.kind === 'series') {
+      const usd = latestBaselineReferenceUSD(canonicalId)
+      if (usd != null && usd > 0) {
+        resolved = {
+          anchorUSD: usd,
+          anchorDate: HISTORICAL_SERIES_LAST_DATE,
+          anchorLabel: 'Baseline reference',
+        }
+      }
+    }
+    // Step 3: Feb-27 anchor — anchor-kind subs (or any sub if step 2 fails).
+    if (!resolved) {
+      const usd = FEB27_BASELINES_USD[canonicalId]
+      if (usd && usd > 0) {
+        resolved = {
+          anchorUSD: usd,
+          anchorDate: FEB27_ANCHOR_DATE,
+          anchorLabel: 'Baseline reference',
+        }
+      }
+    }
+    if (resolved) anchorSnapshot[canonicalId] = resolved
+  }
+
+  const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot)
   return c.json({
     view: result.view,
     liveAsOf: result.liveAsOf,
@@ -655,6 +735,41 @@ app.get('/api/ti/trend/series', async (c) => {
     rows: result.rows,
   })
 })
+
+// Reverse map for handler use only — canonical id → legacy id (for PART_MAP).
+function canonicalToLegacy(canonicalId: string): string | null {
+  const map: Record<string, string> = {
+    power_ldo: 'pm_ldo',
+    power_acdc_switching: 'pm_acdc',
+    power_dcdc_switching: 'pm_dcdc',
+    power_supervisor_reset: 'pm_super',
+    power_battery_mgmt: 'pm_batt',
+    amp_opamps: 'amp_op',
+    amp_instrumentation: 'amp_instr',
+    amp_audio: 'amp_audio',
+    conv_adc: 'dac_adc',
+    conv_dac: 'dac_dac',
+    interface_can: 'if_can',
+    interface_lin: 'if_lin',
+    interface_ethernet_phy: 'if_eth',
+    isolation_digital: 'iso_dig',
+    isolation_reinforced: 'iso_rein',
+    mcu_msp430: 'mcu_msp',
+    mcu_c2000: 'mcu_c2k',
+    mcu_mspm0: 'mcu_m0',
+    mcu_simplelink: 'mcu_cc',
+    mcu_sitara: 'mcu_sit',
+    gan_lmg342x: 'gan_342',
+    gan_lmg3650: 'gan_365',
+    gan_lmg5200: 'gan_520',
+    dc_48v_bus: 'dc_48v',
+    dc_smart_power_stages: 'dc_sps',
+    dc_efuses: 'dc_efuse',
+    dc_hotswap: 'dc_hswap',
+    dc_tps536xx_ai_power: 'dc_tps',
+  }
+  return map[canonicalId] ?? null
+}
 
 // ── Multi-source roadmap status — never exposes secret values ────────────────
 app.get('/api/sources/status', (c) => {

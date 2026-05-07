@@ -138,7 +138,7 @@ export const FEB27_BASELINES_USD: Record<string, number> = {
 
 // Look up the historical series index value at-or-before Feb-27-2026 — the
 // pivot point we use to convert live USD captures into index values.
-function indexAtFeb27(seriesId: string): number | null {
+export function indexAtFeb27(seriesId: string): number | null {
   const pts = HISTORICAL_SERIES[seriesId]
   if (!pts || pts.length === 0) return null
   let v = pts[0][1]
@@ -147,6 +147,28 @@ function indexAtFeb27(seriesId: string): number | null {
     else break
   }
   return v
+}
+
+// Look up the latest historical baseline index value for a series — i.e. the
+// last point in the bundled series. Used by the live-row anchor cascade as
+// the "Apr 11, 2026 baseline reference" for any pre-our-capture anchor date.
+export function latestHistoricalIndex(seriesId: string): number | null {
+  const pts = HISTORICAL_SERIES[seriesId]
+  if (!pts || pts.length === 0) return null
+  return pts[pts.length - 1][1]
+}
+
+// Back-derive a USD value at the latest historical baseline date by anchoring
+// to the Feb-27 calibration: latest_usd = feb27_usd × (latest_idx / feb27_idx)
+export function latestBaselineReferenceUSD(canonicalId: string): number | null {
+  const m = SUB_TO_BASELINE[canonicalId]
+  if (!m || m.kind !== 'series') return null
+  const feb27USD = FEB27_BASELINES_USD[canonicalId]
+  if (!feb27USD) return null
+  const feb27Idx = indexAtFeb27(m.seriesId)
+  const latestIdx = latestHistoricalIndex(m.seriesId)
+  if (feb27Idx == null || latestIdx == null || feb27Idx <= 0) return null
+  return feb27USD * (latestIdx / feb27Idx)
 }
 
 // Convert a captured live USD price for a subcategory to an index value

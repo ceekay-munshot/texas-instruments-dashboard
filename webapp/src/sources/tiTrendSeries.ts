@@ -21,11 +21,24 @@ import { TI_TAXONOMY_FLAT } from '../data/tiTaxonomy'
 
 export type ViewKind = 'wow' | 'mom' | 'qoq'
 
+/** Receipt payload attached to live-row cells only. Powers the click-to-
+ *  explain popover. Closed-row cells leave this undefined. */
+export type LiveCellBreakdown = {
+  todayUSD: number
+  todayDate: string
+  todayLabel: 'TI capture'
+  anchorUSD: number
+  anchorDate: string
+  anchorLabel: 'TI capture' | 'Baseline reference'
+}
+
 export type TrendCell = {
   /** Index value at this period boundary. */
   index: number | null
   /** % change vs the previous period boundary (or vs anchor for to-date rows). */
   pct: number | null
+  /** Present only on the live to-date row. */
+  breakdown?: LiveCellBreakdown
 }
 
 export type TrendRow = {
@@ -156,7 +169,21 @@ function quarterlyBoundaries(today: Date, firstISO: string): Date[] {
 
 // ── Index resolver across stitch ────────────────────────────────────────────
 
-type LiveSnapshot = Record<string, { canonicalId: string; liveUSD: number }>
+type LiveSnapshot = Record<string, {
+  canonicalId: string
+  liveUSD: number
+  /** ISO calendar date the live capture came from (e.g. "2026-05-07"). */
+  liveDate: string
+}>
+
+/** Anchor lookup result — what to compare today's price against. Provided
+ *  by the caller (handler) so the trend module is DB-agnostic. Keyed by
+ *  canonical subcategory id. */
+export type AnchorSnapshot = Record<string, {
+  anchorUSD: number
+  anchorDate: string
+  anchorLabel: 'TI capture' | 'Baseline reference'
+}>
 
 /**
  * Resolve the index value for a subcategory at a given period-end date,
@@ -209,6 +236,10 @@ export function buildTrendView(
   view: ViewKind,
   liveSnapshot: LiveSnapshot,
   liveAsOfISO: string,
+  /** Per-canonical anchor data for the live row's USD math. Caller resolves
+   *  via DB lookups + baseline cascade and passes the result. May be empty
+   *  per-key — falls back to index-derived pct for that cell only. */
+  anchorSnapshot: AnchorSnapshot = {},
 ): TrendView {
   const today = parseISO(liveAsOfISO)
 
@@ -278,16 +309,42 @@ export function buildTrendView(
   }
 
   // Append live to-date row if the current period is still open.
+  // The live row's pct is computed in pure USD against caller-supplied anchors
+  // (resolved via TI inventory cascade), and a `breakdown` is attached for
+  // the click-to-explain receipt. Falls back to index math if no anchor is
+  // available for a given subcategory.
   if (isLiveOpen) {
     const cells: Record<string, TrendCell> = {}
     for (const col of columns) {
-      const cur = idxAt(col.canonicalId, today)
-      const prevIdx = lastClosed ? idxAt(col.canonicalId, lastClosed) : null
+      const live = liveSnapshot[col.canonicalId]
+      const anchor = anchorSnapshot[col.canonicalId]
+      let index: number | null = null
       let pct: number | null = null
-      if (cur != null && prevIdx != null && prevIdx > 0) {
-        pct = ((cur - prevIdx) / prevIdx) * 100
+      let breakdown: LiveCellBreakdown | undefined
+      if (live && anchor && anchor.anchorUSD > 0) {
+        // USD-first math (the user-facing path).
+        pct = ((live.liveUSD - anchor.anchorUSD) / anchor.anchorUSD) * 100
+        index = idxAt(col.canonicalId, today)
+        breakdown = {
+          todayUSD: live.liveUSD,
+          todayDate: live.liveDate,
+          todayLabel: 'TI capture',
+          anchorUSD: anchor.anchorUSD,
+          anchorDate: anchor.anchorDate,
+          anchorLabel: anchor.anchorLabel,
+        }
+      } else {
+        // Fallback (sub has no live data or no resolvable anchor): index math.
+        const cur = idxAt(col.canonicalId, today)
+        const prevIdx = lastClosed ? idxAt(col.canonicalId, lastClosed) : null
+        if (cur != null && prevIdx != null && prevIdx > 0) {
+          pct = ((cur - prevIdx) / prevIdx) * 100
+        }
+        index = cur
       }
-      cells[col.canonicalId] = { index: cur, pct }
+      cells[col.canonicalId] = breakdown
+        ? { index, pct, breakdown }
+        : { index, pct }
     }
     rows.push({
       periodEnd: isoDate(today),
@@ -306,7 +363,10 @@ export function buildTrendView(
 
 // ── Public: build a snapshot from /api/prices payload ───────────────────────
 
-export function buildLiveSnapshot(pricesData: Record<string, any>): LiveSnapshot {
+export function buildLiveSnapshot(
+  pricesData: Record<string, any>,
+  fallbackDateISO?: string,
+): LiveSnapshot {
   const out: LiveSnapshot = {}
   for (const [legacyId, entry] of Object.entries(pricesData)) {
     if (!entry || typeof entry !== 'object') continue
@@ -314,9 +374,14 @@ export function buildLiveSnapshot(pricesData: Record<string, any>): LiveSnapshot
     if (typeof usd !== 'number' || usd <= 0) continue
     const canonicalId = legacyToCanonical(legacyId)
     if (!(canonicalId in SUB_TO_BASELINE)) continue
+    const fetchedAt: string | undefined = (entry as any).fetchedAt
+    const liveDate = (fetchedAt ? String(fetchedAt).slice(0, 10) : null)
+      ?? fallbackDateISO
+      ?? new Date().toISOString().slice(0, 10)
     out[canonicalId] = {
       canonicalId,
       liveUSD: usd,
+      liveDate,
     }
   }
   return out
