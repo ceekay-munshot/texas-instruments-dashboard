@@ -264,11 +264,23 @@ export function buildTrendView(
   // Drop any boundary that lands in the future (after today).
   boundaries = boundaries.filter(d => d <= today)
 
+  // For WoW: if today is itself a Friday, the boundary at today represents
+  // the week that is about to close. Treat it as in-progress (not yet rolled
+  // into history) so the live WTD row always renders. The prior Friday
+  // becomes the most recently closed boundary.
+  if (view === 'wow' && boundaries.length > 0 &&
+      isoDate(boundaries[boundaries.length - 1]) === isoDate(today)) {
+    boundaries.pop()
+  }
+
   // The last boundary represents the most recently CLOSED period (e.g. last
-  // Friday close, last month-end, last quarter-end). If today is past that,
-  // we add a "live to-date" row.
+  // Friday close, last month-end, last quarter-end). The live to-date row
+  // always renders for WoW (when there's a prior closed boundary) so users
+  // see "this week so far" regardless of which weekday it is.
   const lastClosed = boundaries[boundaries.length - 1]
-  const isLiveOpen = lastClosed && isoDate(today) > isoDate(lastClosed)
+  const isLiveOpen = !!lastClosed && (
+    view === 'wow' ? true : isoDate(today) > isoDate(lastClosed)
+  )
 
   const columns = TI_TAXONOMY_FLAT
     .filter(s => s.categoryId in SUB_TO_BASELINE)

@@ -656,14 +656,16 @@ app.get('/api/ti/trend/series', async (c) => {
     }
   }
 
-  // Compute the live row's anchor date — start of the current period.
+  // Compute the live row's anchor date — most recently CLOSED period boundary
+  // before today. For WoW this is the prior Friday close; if today is itself
+  // a Friday we go back one more week (today is in-progress). For MoM/QoQ
+  // it's the prior month-end / quarter-end.
   const today = new Date(`${liveAsOf}T00:00:00Z`)
   let anchorTargetDate: string
   if (view === 'wow') {
-    // Friday-on-or-before today. Same convention as the period boundary
-    // generator in tiTrendSeries.ts.
     const dow = today.getUTCDay()
-    const delta = dow >= 5 ? dow - 5 : dow + 2
+    let delta = dow >= 5 ? dow - 5 : dow + 2
+    if (delta === 0) delta = 7 // today is Friday → use prior Friday
     const fri = new Date(today)
     fri.setUTCDate(fri.getUTCDate() - delta)
     anchorTargetDate = fri.toISOString().slice(0, 10)
@@ -679,6 +681,14 @@ app.get('/api/ti/trend/series', async (c) => {
     anchorTargetDate = prev.toISOString().slice(0, 10)
   }
   const monthStart = `${liveAsOf.slice(0, 7)}-01`
+  // Day after the prior closed Friday — start of the current ISO-Saturday week.
+  // Used by the WoW Step 0 cascade as "first own capture in current week".
+  let weekStart: string | null = null
+  if (view === 'wow') {
+    const ws = new Date(`${anchorTargetDate}T00:00:00Z`)
+    ws.setUTCDate(ws.getUTCDate() + 1)
+    weekStart = ws.toISOString().slice(0, 10)
+  }
 
   // ── Parallel D1 read phase ──────────────────────────────────────────────
   // Each subcategory needs up to 4 D1 queries. Firing them sequentially
@@ -693,6 +703,7 @@ app.get('/api/ti/trend/series', async (c) => {
     repPart: string
     todayPoint: TiInventoryPoint | null
     monthStartFirstPoint: TiInventoryPoint | null
+    weekStartFirstPoint: TiInventoryPoint | null
     anchorAtPoint: TiInventoryPoint | null
     spliceFirstPoint: TiInventoryPoint | null
   }
@@ -707,17 +718,20 @@ app.get('/api/ti/trend/series', async (c) => {
 
   const subResolutions: SubResolved[] = await Promise.all(
     subEntries.map(async ({ canonicalId, mapping, repPart }) => {
-      const [todayPoint, monthStartFirstPoint, anchorAtPoint, spliceFirstPoint] = await Promise.all([
+      const [todayPoint, monthStartFirstPoint, weekStartFirstPoint, anchorAtPoint, spliceFirstPoint] = await Promise.all([
         getTiInventoryAt(d1, repPart, liveAsOf),
         view === 'mom'
           ? getTiInventoryFirstAfter(d1, repPart, monthStart)
+          : Promise.resolve(null),
+        view === 'wow' && weekStart
+          ? getTiInventoryFirstAfter(d1, repPart, weekStart)
           : Promise.resolve(null),
         getTiInventoryAt(d1, repPart, anchorTargetDate),
         mapping.kind === 'series'
           ? getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
           : Promise.resolve(null),
       ])
-      return { canonicalId, mapping, repPart, todayPoint, monthStartFirstPoint, anchorAtPoint, spliceFirstPoint }
+      return { canonicalId, mapping, repPart, todayPoint, monthStartFirstPoint, weekStartFirstPoint, anchorAtPoint, spliceFirstPoint }
     }),
   )
 
@@ -758,6 +772,18 @@ app.get('/api/ti/trend/series', async (c) => {
       resolved = {
         anchorUSD: r.monthStartFirstPoint.priceUSD,
         anchorDate: String(r.monthStartFirstPoint.capturedAt).slice(0, 10),
+        anchorLabel: 'TI capture',
+      }
+    }
+
+    // Step 0 (WoW only): first own TI capture on/after start of current week.
+    // Mirrors the MoM Step 0 — anchors WTD on real captured data from this
+    // week rather than the prior Friday's close (which often falls back to
+    // a historical baseline pre-May).
+    if (!resolved && view === 'wow' && r.weekStartFirstPoint && r.weekStartFirstPoint.priceUSD > 0) {
+      resolved = {
+        anchorUSD: r.weekStartFirstPoint.priceUSD,
+        anchorDate: String(r.weekStartFirstPoint.capturedAt).slice(0, 10),
         anchorLabel: 'TI capture',
       }
     }
