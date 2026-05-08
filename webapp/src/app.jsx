@@ -2517,6 +2517,13 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
   const [data, setData] = useState(null);      // { columns, rows, liveAsOf }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Per-view cache. Keyed by 'wow' | 'mom' | 'qoq'. When the user switches
+  // back to a tab they've already loaded, we render the cached payload
+  // instantly and only background-refresh when the entry is older than
+  // CACHE_FRESH_MS. Cache survives within the session; an explicit reload
+  // resets it.
+  const cacheRef = useRef({}); // { [view]: { data, fetchedAt } }
+  const CACHE_FRESH_MS = 60_000;
   // Pinned receipt for click-to-explain on live-row cells.
   // Shape: { subLabel, periodLabel, viewLive, breakdown, anchorXY:{top,left} }
   const [receipt, setReceipt] = useState(null);
@@ -2537,12 +2544,33 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
 
   useEffect(() => {
     let alive = true;
-    setLoading(true);
-    setError(null);
-    fetch(`/api/ti/trend/series?view=${view}`, { cache: 'no-store' })
+    const cached = cacheRef.current[view];
+    const now = Date.now();
+    const isFresh = cached && (now - cached.fetchedAt) < CACHE_FRESH_MS;
+    if (cached) {
+      // Render cached data immediately — no spinner flash on tab switch.
+      setData(cached.data);
+      setError(null);
+      setLoading(false);
+      if (isFresh) return; // Skip refetch entirely when cache is fresh.
+    } else {
+      setLoading(true);
+      setError(null);
+    }
+    fetch(`/api/ti/trend/series?view=${view}`)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-      .then(j => { if (alive) { setData(j); setLoading(false); } })
-      .catch(e => { if (alive) { setError(String(e)); setLoading(false); } });
+      .then(j => {
+        if (!alive) return;
+        cacheRef.current[view] = { data: j, fetchedAt: Date.now() };
+        setData(j);
+        setLoading(false);
+      })
+      .catch(e => {
+        if (!alive) return;
+        // If we have stale cached data, keep showing it; just surface the error.
+        setError(String(e));
+        if (!cached) setLoading(false);
+      });
     return () => { alive = false; };
   }, [view]);
 

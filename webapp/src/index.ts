@@ -21,7 +21,7 @@ import {
 import { computeTrends } from './sources/snapshotTrends'
 import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
 import { buildTrendView, buildLiveSnapshot, type ViewKind, type AnchorSnapshot } from './sources/tiTrendSeries'
-import { getTiInventoryAt, getTiInventoryFirstAfter } from './sources/tiInventoryHistory'
+import { getTiInventoryAt, getTiInventoryFirstAfter, type TiInventoryPoint } from './sources/tiInventoryHistory'
 import {
   SUB_TO_BASELINE,
   OWN_CAPTURE_FIRST_DATE,
@@ -631,6 +631,7 @@ app.get('/api/status', async (c) => {
 //
 // Query: ?view=wow|mom|qoq (default qoq).
 app.get('/api/ti/trend/series', async (c) => {
+  const serverStart = Date.now()
   const rawView = (c.req.query('view') ?? 'qoq').toLowerCase()
   const view: ViewKind = rawView === 'wow' || rawView === 'mom' ? rawView as ViewKind : 'qoq'
 
@@ -652,31 +653,6 @@ app.get('/api/ti/trend/series', async (c) => {
     if (persisted) {
       pricesData = persisted.data ?? {}
       if (persisted.fetchedAt) liveAsOf = String(persisted.fetchedAt).slice(0, 10)
-    }
-  }
-
-  // Build the live snapshot. Per-SKU preference:
-  //   1. Own captured TI inventory data (ti_inventory_price_snapshot)
-  //   2. /api/prices distributor mirror (only when no TI inventory row exists)
-  // The chosen source is recorded as `latestSource` for internal verification;
-  // the receipt UI never renders this field.
-  const liveSnapshot = buildLiveSnapshot(pricesData, liveAsOf)
-  const fallbackSubs: string[] = []
-  for (const canonicalId of Object.keys(SUB_TO_BASELINE)) {
-    const legacyId = canonicalToLegacy(canonicalId)
-    const repPart = legacyId ? PART_MAP[legacyId]?.parts?.[0] : null
-    if (!repPart) continue
-    const tiToday = await getTiInventoryAt(c.env.TI_INVENTORY_HISTORY_DB ?? null, repPart, liveAsOf)
-    if (tiToday && tiToday.priceUSD > 0) {
-      liveSnapshot[canonicalId] = {
-        canonicalId,
-        liveUSD: tiToday.priceUSD,
-        liveDate: String(tiToday.capturedAt).slice(0, 10),
-        latestSource: 'ti_inventory',
-      }
-    } else if (liveSnapshot[canonicalId]) {
-      liveSnapshot[canonicalId].latestSource = 'prices_fallback'
-      fallbackSubs.push(canonicalId)
     }
   }
 
@@ -702,79 +678,118 @@ app.get('/api/ti/trend/series', async (c) => {
     const prev = new Date(Date.UTC(today.getUTCFullYear(), qStart, 0))
     anchorTargetDate = prev.toISOString().slice(0, 10)
   }
+  const monthStart = `${liveAsOf.slice(0, 7)}-01`
 
-  // Resolve the anchor cascade per subcategory.
-  // Per revised spec: NO Feb-27 fallback for live rows. Subcategories without
-  // a resolvable anchor are intentionally absent from anchorSnapshot — their
-  // live cells render blank in the UI.
+  // ── Parallel D1 read phase ──────────────────────────────────────────────
+  // Each subcategory needs up to 4 D1 queries. Firing them sequentially
+  // across 28 subs adds up to ~10s in production. Promise.all over the
+  // whole batch finishes in roughly the slowest single query (~200-400ms).
   const d1 = c.env.TI_INVENTORY_HISTORY_DB ?? null
-  const anchorSnapshot: AnchorSnapshot = {}
+  const d1LookupStart = Date.now()
+
+  type SubResolved = {
+    canonicalId: string
+    mapping: typeof SUB_TO_BASELINE[keyof typeof SUB_TO_BASELINE]
+    repPart: string
+    todayPoint: TiInventoryPoint | null
+    monthStartFirstPoint: TiInventoryPoint | null
+    anchorAtPoint: TiInventoryPoint | null
+    spliceFirstPoint: TiInventoryPoint | null
+  }
+
+  const subEntries: { canonicalId: string; mapping: typeof SUB_TO_BASELINE[keyof typeof SUB_TO_BASELINE]; repPart: string }[] = []
   for (const [canonicalId, mapping] of Object.entries(SUB_TO_BASELINE)) {
     const legacyId = canonicalToLegacy(canonicalId)
     const repPart = legacyId ? PART_MAP[legacyId]?.parts?.[0] : null
     if (!repPart) continue
+    subEntries.push({ canonicalId, mapping, repPart })
+  }
 
+  const subResolutions: SubResolved[] = await Promise.all(
+    subEntries.map(async ({ canonicalId, mapping, repPart }) => {
+      const [todayPoint, monthStartFirstPoint, anchorAtPoint, spliceFirstPoint] = await Promise.all([
+        getTiInventoryAt(d1, repPart, liveAsOf),
+        view === 'mom'
+          ? getTiInventoryFirstAfter(d1, repPart, monthStart)
+          : Promise.resolve(null),
+        getTiInventoryAt(d1, repPart, anchorTargetDate),
+        mapping.kind === 'series'
+          ? getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
+          : Promise.resolve(null),
+      ])
+      return { canonicalId, mapping, repPart, todayPoint, monthStartFirstPoint, anchorAtPoint, spliceFirstPoint }
+    }),
+  )
+
+  const d1LookupMs = Date.now() - d1LookupStart
+
+  // ── Synchronous post-processing ─────────────────────────────────────────
+  // Build the live snapshot. Per-SKU preference:
+  //   1. Own captured TI inventory data (ti_inventory_price_snapshot)
+  //   2. /api/prices distributor mirror (only when no TI inventory row exists)
+  // The chosen source is recorded as `latestSource` for internal verification;
+  // the receipt UI never renders this field.
+  const liveSnapshot = buildLiveSnapshot(pricesData, liveAsOf)
+  const fallbackSubs: string[] = []
+  for (const r of subResolutions) {
+    if (r.todayPoint && r.todayPoint.priceUSD > 0) {
+      liveSnapshot[r.canonicalId] = {
+        canonicalId: r.canonicalId,
+        liveUSD: r.todayPoint.priceUSD,
+        liveDate: String(r.todayPoint.capturedAt).slice(0, 10),
+        latestSource: 'ti_inventory',
+      }
+    } else if (liveSnapshot[r.canonicalId]) {
+      liveSnapshot[r.canonicalId].latestSource = 'prices_fallback'
+      fallbackSubs.push(r.canonicalId)
+    }
+  }
+
+  // Resolve the anchor cascade per subcategory. Per revised spec: NO Feb-27
+  // fallback for live rows. Subcategories without a resolvable anchor are
+  // intentionally absent from anchorSnapshot — their live cells render blank
+  // in the UI.
+  const anchorSnapshot: AnchorSnapshot = {}
+  for (const r of subResolutions) {
     let resolved: { anchorUSD: number; anchorDate: string; anchorLabel: 'TI capture' | 'Historical baseline' } | null = null
 
-    // Step 0 (MoM only): prefer the first own TI capture on/after the start
-    // of the current calendar month. This makes the MTD anchor "real
-    // captured data from this month" rather than a back-derived historical
-    // baseline. Only applies to the Month-on-Month view; WoW/QoQ unchanged.
-    if (view === 'mom') {
-      const monthStart = `${liveAsOf.slice(0, 7)}-01`
-      const firstOwnInMonth = await getTiInventoryFirstAfter(d1, repPart, monthStart)
-      if (firstOwnInMonth && firstOwnInMonth.priceUSD > 0) {
-        resolved = {
-          anchorUSD: firstOwnInMonth.priceUSD,
-          anchorDate: String(firstOwnInMonth.capturedAt).slice(0, 10),
-          anchorLabel: 'TI capture',
-        }
+    // Step 0 (MoM only): first own TI capture on/after start of current month.
+    if (view === 'mom' && r.monthStartFirstPoint && r.monthStartFirstPoint.priceUSD > 0) {
+      resolved = {
+        anchorUSD: r.monthStartFirstPoint.priceUSD,
+        anchorDate: String(r.monthStartFirstPoint.capturedAt).slice(0, 10),
+        anchorLabel: 'TI capture',
       }
     }
 
     // Step 1: own TI capture at-or-before the period anchor target.
-    if (!resolved) {
-      const tiPoint = await getTiInventoryAt(d1, repPart, anchorTargetDate)
-      if (tiPoint && tiPoint.priceUSD > 0) {
-        resolved = {
-          anchorUSD: tiPoint.priceUSD,
-          anchorDate: String(tiPoint.capturedAt).slice(0, 10),
-          anchorLabel: 'TI capture',
-        }
+    if (!resolved && r.anchorAtPoint && r.anchorAtPoint.priceUSD > 0) {
+      resolved = {
+        anchorUSD: r.anchorAtPoint.priceUSD,
+        anchorDate: String(r.anchorAtPoint.capturedAt).slice(0, 10),
+        anchorLabel: 'TI capture',
       }
     }
 
     // Step 2: historical baseline (series subs only). Convert the historical
     // index at the period anchor to USD using a splice calibration:
     //   anchorUSD = firstLiveUSD × (historicalAnchorIndex / historicalSpliceIndex)
-    // — where historicalSpliceIndex is the historical index at-or-before the
-    // first own-capture date. firstLiveUSD comes from ti_inventory_history,
-    // falling back to the current /api/prices snapshot when no own capture
-    // is persisted yet (the calibration math collapses harmlessly in that
-    // case but the historical anchor date is still reported faithfully).
-    if (!resolved && mapping.kind === 'series') {
-      const histAnchor = resolveHistoricalPoint(canonicalId, anchorTargetDate)
+    if (!resolved && r.mapping.kind === 'series') {
+      const histAnchor = resolveHistoricalPoint(r.canonicalId, anchorTargetDate)
       if (histAnchor) {
-        // Splice source must match today's source so the back-derivation lives
-        // on a single price scale. ti_inventory → first inventory capture;
-        // prices_fallback → today's /api/prices value as its own splice (the
-        // ratio collapses to 1, leaving anchorUSD = today × histRatio honestly).
-        const liveSnap = liveSnapshot[canonicalId]
+        const liveSnap = liveSnapshot[r.canonicalId]
         let firstLiveUSD: number | null = null
         let firstLiveDate: string | null = null
-        if (liveSnap?.latestSource === 'ti_inventory') {
-          const firstCapture = await getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
-          if (firstCapture && firstCapture.priceUSD > 0) {
-            firstLiveUSD = firstCapture.priceUSD
-            firstLiveDate = String(firstCapture.capturedAt).slice(0, 10)
-          }
+        if (liveSnap?.latestSource === 'ti_inventory' && r.spliceFirstPoint && r.spliceFirstPoint.priceUSD > 0) {
+          firstLiveUSD = r.spliceFirstPoint.priceUSD
+          firstLiveDate = String(r.spliceFirstPoint.capturedAt).slice(0, 10)
         }
         if (firstLiveUSD == null && liveSnap?.liveUSD && liveSnap.liveUSD > 0) {
           firstLiveUSD = liveSnap.liveUSD
           firstLiveDate = liveSnap.liveDate
         }
         if (firstLiveUSD && firstLiveUSD > 0 && firstLiveDate) {
-          const splice = resolveHistoricalPoint(canonicalId, firstLiveDate)
+          const splice = resolveHistoricalPoint(r.canonicalId, firstLiveDate)
           if (splice && splice.index > 0) {
             resolved = {
               anchorUSD: firstLiveUSD * (histAnchor.index / splice.index),
@@ -788,7 +803,7 @@ app.get('/api/ti/trend/series', async (c) => {
 
     // Step 3: no anchor — leave the entry absent. Live cell renders blank.
 
-    if (resolved) anchorSnapshot[canonicalId] = resolved
+    if (resolved) anchorSnapshot[r.canonicalId] = resolved
   }
 
   const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot)
@@ -798,13 +813,32 @@ app.get('/api/ti/trend/series', async (c) => {
     if (entry?.latestSource === 'ti_inventory') sourceCounts.ti_inventory += 1
     else if (entry?.latestSource === 'prices_fallback') sourceCounts.prices_fallback += 1
   }
-  return c.json({
-    view: result.view,
-    liveAsOf: result.liveAsOf,
-    columns: result.columns,
-    rows: result.rows,
-    _internal: { sourceCounts, fallbackSubcategories: fallbackSubs.sort() },
-  })
+  const serverMs = Date.now() - serverStart
+  return new Response(
+    JSON.stringify({
+      view: result.view,
+      liveAsOf: result.liveAsOf,
+      columns: result.columns,
+      rows: result.rows,
+      _internal: {
+        sourceCounts,
+        fallbackSubcategories: fallbackSubs.sort(),
+        view,
+        serverMs,
+        d1LookupMs,
+      },
+    }),
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        // 60-second edge cache. Parallelization makes a cold call ~0.5s in CF;
+        // most subsequent users on the same view hit the CF cache instead of
+        // re-running the handler. Underlying TI inventory data only refreshes
+        // daily, so 60s is well within the data freshness budget.
+        'Cache-Control': 'public, max-age=60, s-maxage=60',
+      },
+    },
+  )
 })
 
 // Reverse map for handler use only — canonical id → legacy id (for PART_MAP).
