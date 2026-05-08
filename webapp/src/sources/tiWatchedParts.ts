@@ -1309,6 +1309,168 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     confidence: 'high',
     validationStatus: 'validated',
   },
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Phase 22.5 — staged 12-part expansion to cover the trend-dashboard
+  // representative SKUs that were absent from the prior watched list:
+  // Ethernet PHYs, Digital + Reinforced Isolators, the rest of the GaN
+  // family (LMG3650 / LMG5200), Audio Amps, and eFuses. These start as
+  // 'pending' and join production capture only after
+  // POST /api/ti/inventory/staged/validate confirms each one returns
+  // Product Info ok + Store Inventory ok + parsed price breaks.
+  // ────────────────────────────────────────────────────────────────────────
+
+  // ── Interface ICs additions (2) ────────────────────────────────────────
+  {
+    genericPartNumber: 'DP83867',
+    preferredOrderablePartNumber: 'DP83867IRRGZR',
+    displayName: 'DP83867 Industrial Gigabit Ethernet PHY',
+    basket: 'industrial',
+    subcategory: 'Ethernet PHYs',
+    dashboardPriority: 'medium',
+    thesisReason: 'Industrial-grade Gigabit Ethernet PHY — broad design-in across factory automation and time-sensitive networking gear.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'DP83826',
+    preferredOrderablePartNumber: 'DP83826ERHBR',
+    displayName: 'DP83826 100Mbps Ethernet PHY',
+    basket: 'industrial',
+    subcategory: 'Ethernet PHYs',
+    dashboardPriority: 'low',
+    thesisReason: '10/100Mbps fast Ethernet PHY — embedded networking standard for cost-sensitive industrial endpoints.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Isolation additions (4) ─────────────────────────────────────────────
+  {
+    genericPartNumber: 'ISO7742',
+    preferredOrderablePartNumber: 'ISO7742DWR',
+    displayName: 'ISO7742 Quad-Channel Digital Isolator',
+    basket: 'industrial',
+    subcategory: 'Digital isolators',
+    dashboardPriority: 'medium',
+    thesisReason: 'Quad-channel digital isolator — workhorse SKU for industrial isolated communication and control.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ISO1541',
+    preferredOrderablePartNumber: 'ISO1541DWR',
+    displayName: 'ISO1541 Isolated I2C Bridge',
+    basket: 'industrial',
+    subcategory: 'Digital isolators',
+    dashboardPriority: 'low',
+    thesisReason: 'Low-voltage isolated I2C bridge — common in industrial sensor and instrument front-ends.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ISO7042',
+    preferredOrderablePartNumber: 'ISO7042CDWR',
+    displayName: 'ISO7042 Reinforced 4-Channel Isolator',
+    basket: 'industrial',
+    subcategory: 'Digital isolators',
+    dashboardPriority: 'medium',
+    thesisReason: 'Reinforced 4-channel isolator — qualified for high-voltage power-conversion isolation.',
+    demandProxyType: 'industrial_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'ISO5852S-Q1',
+    preferredOrderablePartNumber: 'ISO5852SQDWRQ1',
+    displayName: 'ISO5852S-Q1 Reinforced Isolated Gate Driver',
+    basket: 'automotive',
+    subcategory: 'Gate drivers',
+    dashboardPriority: 'medium',
+    thesisReason: 'AEC-Q100 reinforced isolated gate driver — used in EV traction inverters and on-board chargers.',
+    demandProxyType: 'auto_volume',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+
+  // ── GaN Power additions (4) ─────────────────────────────────────────────
+  {
+    genericPartNumber: 'LMG3652',
+    preferredOrderablePartNumber: 'LMG3652R070KLAR',
+    displayName: 'LMG3652 600V GaN FET (TOLL)',
+    basket: 'data_center_server_power',
+    subcategory: 'GaN power',
+    dashboardPriority: 'medium',
+    thesisReason: '600V GaN FET in TOLL package — power-density driver for AI/data-center high-power converters.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMG3650',
+    preferredOrderablePartNumber: 'LMG3650R070KLAR',
+    displayName: 'LMG3650 600V GaN FET (TOLL)',
+    basket: 'data_center_server_power',
+    subcategory: 'GaN power',
+    dashboardPriority: 'low',
+    thesisReason: 'Alt 600V GaN FET TOLL — companion lifecycle to LMG3652 family.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMG5200',
+    preferredOrderablePartNumber: 'LMG5200MOFT',
+    displayName: 'LMG5200 80V GaN Half-Bridge Module',
+    basket: 'data_center_server_power',
+    subcategory: 'GaN power',
+    dashboardPriority: 'medium',
+    thesisReason: '80V GaN half-bridge module — design anchor for 48V data-center server power conversion.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LMG5350',
+    preferredOrderablePartNumber: 'LMG5350R070YFFT',
+    displayName: 'LMG5350 80V GaN Power Stage',
+    basket: 'data_center_server_power',
+    subcategory: 'GaN power',
+    dashboardPriority: 'low',
+    thesisReason: 'Alt 80V GaN — emerging design-in for next-gen 48V telecom and server boards.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'medium',
+    validationStatus: 'pending',
+  },
+
+  // ── Audio Amps + eFuses additions (2) ───────────────────────────────────
+  {
+    genericPartNumber: 'TPA3118D2',
+    preferredOrderablePartNumber: 'TPA3118D2DAPR',
+    displayName: 'TPA3118D2 Class-D Audio Amplifier',
+    basket: 'analog_signal_chain',
+    subcategory: 'Audio amps',
+    dashboardPriority: 'medium',
+    thesisReason: 'Class-D audio amplifier — broad consumer-electronics attach across speakers, soundbars, and accessories.',
+    demandProxyType: 'consumer_iot',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'TPS25940A',
+    preferredOrderablePartNumber: 'TPS25940ARVCR',
+    displayName: 'TPS25940A 18V eFuse',
+    basket: 'data_center_server_power',
+    subcategory: 'Hot-swap / eFuse',
+    dashboardPriority: 'medium',
+    thesisReason: 'Programmable eFuse — workhorse for hot-swap protection in server, AI accelerator, and storage cards.',
+    demandProxyType: 'data_center_capex',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
 ]
 
 // ── Aggregate metadata ──────────────────────────────────────────────────────
