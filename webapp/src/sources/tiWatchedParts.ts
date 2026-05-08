@@ -1331,7 +1331,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Industrial-grade Gigabit Ethernet PHY — broad design-in across factory automation and time-sensitive networking gear.',
     demandProxyType: 'industrial_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'DP83826',
@@ -1343,7 +1343,10 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '10/100Mbps fast Ethernet PHY — embedded networking standard for cost-sensitive industrial endpoints.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    // Validated cleanly in initial probe (Product Info ok + Inventory ok +
+    // price available); a later pass hit transient Product Info rate-limit
+    // which is not an OPN failure. Promoted on operator review.
+    validationStatus: 'validated',
   },
 
   // ── Isolation additions (4) ─────────────────────────────────────────────
@@ -1357,7 +1360,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Quad-channel digital isolator — workhorse SKU for industrial isolated communication and control.',
     demandProxyType: 'industrial_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'ISO1541',
@@ -1369,7 +1372,11 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Low-voltage isolated I2C bridge — common in industrial sensor and instrument front-ends.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    // Operator validation (May-2026): Product Info no_match / 404. OPN may
+    // be retired or renamed. Marked 'failed' so it's excluded from capture
+    // and won't be reattempted automatically; pick a replacement OPN if/when
+    // we want to cover this subcategory leaf again.
+    validationStatus: 'failed',
   },
   {
     genericPartNumber: 'ISO7042',
@@ -1381,7 +1388,9 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Reinforced 4-channel isolator — qualified for high-voltage power-conversion isolation.',
     demandProxyType: 'industrial_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    // Operator validation (May-2026): Product Info no_match / 404. Verify
+    // the OPN suffix or pick a sibling SKU before re-staging.
+    validationStatus: 'failed',
   },
   {
     genericPartNumber: 'ISO5852S-Q1',
@@ -1393,7 +1402,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'AEC-Q100 reinforced isolated gate driver — used in EV traction inverters and on-board chargers.',
     demandProxyType: 'auto_volume',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
 
   // ── GaN Power additions (4) ─────────────────────────────────────────────
@@ -1407,7 +1416,10 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '600V GaN FET in TOLL package — power-density driver for AI/data-center high-power converters.',
     demandProxyType: 'data_center_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    // Operator validation (May-2026): Product Info no_match / 404 on this
+    // exact OPN. The companion LMG3650R070KLAR validated successfully and
+    // covers the same subcategory leaf, so this one stays excluded.
+    validationStatus: 'failed',
   },
   {
     genericPartNumber: 'LMG3650',
@@ -1419,7 +1431,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Alt 600V GaN FET TOLL — companion lifecycle to LMG3652 family.',
     demandProxyType: 'data_center_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'LMG5200',
@@ -1431,7 +1443,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: '80V GaN half-bridge module — design anchor for 48V data-center server power conversion.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'LMG5350',
@@ -1443,7 +1455,9 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Alt 80V GaN — emerging design-in for next-gen 48V telecom and server boards.',
     demandProxyType: 'data_center_capex',
     confidence: 'medium',
-    validationStatus: 'pending',
+    // Operator validation (May-2026): Product Info no_match / 404. The
+    // companion LMG5200MOFT covers the same subcategory leaf successfully.
+    validationStatus: 'failed',
   },
 
   // ── Audio Amps + eFuses additions (2) ───────────────────────────────────
@@ -1457,7 +1471,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Class-D audio amplifier — broad consumer-electronics attach across speakers, soundbars, and accessories.',
     demandProxyType: 'consumer_iot',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'TPS25940A',
@@ -1469,7 +1483,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Programmable eFuse — workhorse for hot-swap protection in server, AI accelerator, and storage cards.',
     demandProxyType: 'data_center_capex',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
 ]
 

@@ -700,7 +700,13 @@ app.get('/api/ti/trend/series', async (c) => {
   type SubResolved = {
     canonicalId: string
     mapping: typeof SUB_TO_BASELINE[keyof typeof SUB_TO_BASELINE]
+    /** SKU actually used for all D1 lookups in this resolution. Picked by
+     *  scanning PART_MAP[legacyId].parts in order and taking the first one
+     *  with an at-or-before liveAsOf row. Falls back to parts[0] if none of
+     *  the candidates have data, so the prices_fallback path can still
+     *  produce a sensible representativePartUsed for the receipt. */
     repPart: string
+    candidatesChecked: string[]
     todayPoint: TiInventoryPoint | null
     monthStartFirstPoint: TiInventoryPoint | null
     weekStartFirstPoint: TiInventoryPoint | null
@@ -708,18 +714,49 @@ app.get('/api/ti/trend/series', async (c) => {
     spliceFirstPoint: TiInventoryPoint | null
   }
 
-  const subEntries: { canonicalId: string; mapping: typeof SUB_TO_BASELINE[keyof typeof SUB_TO_BASELINE]; repPart: string }[] = []
+  const subEntries: {
+    canonicalId: string
+    mapping: typeof SUB_TO_BASELINE[keyof typeof SUB_TO_BASELINE]
+    candidates: string[]
+  }[] = []
   for (const [canonicalId, mapping] of Object.entries(SUB_TO_BASELINE)) {
     const legacyId = canonicalToLegacy(canonicalId)
-    const repPart = legacyId ? PART_MAP[legacyId]?.parts?.[0] : null
-    if (!repPart) continue
-    subEntries.push({ canonicalId, mapping, repPart })
+    const candidates = legacyId ? (PART_MAP[legacyId]?.parts ?? []) : []
+    if (candidates.length === 0) continue
+    subEntries.push({ canonicalId, mapping, candidates })
   }
 
+  // Two-phase D1 read.
+  //
+  // Phase 1 — for each sub, fire a `getTiInventoryAt(sku, liveAsOf)` for
+  // every candidate SKU in PART_MAP[id].parts. The first candidate with a
+  // non-null row becomes the representative SKU for this request. Order
+  // preserves PART_MAP intent.
+  //
+  // Phase 2 — for each sub's picked SKU (or parts[0] if none had data),
+  // fire the 4 remaining queries: monthStart-first, weekStart-first,
+  // anchorAt, splice-first. Same SKU is used consistently across all
+  // queries so today's USD and the anchor USD live on the same price
+  // scale.
+  const phase1: { todayByCandidate: (TiInventoryPoint | null)[] }[] = await Promise.all(
+    subEntries.map(async ({ candidates }) => {
+      const todayByCandidate = await Promise.all(
+        candidates.map(sku => getTiInventoryAt(d1, sku, liveAsOf)),
+      )
+      return { todayByCandidate }
+    }),
+  )
+
   const subResolutions: SubResolved[] = await Promise.all(
-    subEntries.map(async ({ canonicalId, mapping, repPart }) => {
-      const [todayPoint, monthStartFirstPoint, weekStartFirstPoint, anchorAtPoint, spliceFirstPoint] = await Promise.all([
-        getTiInventoryAt(d1, repPart, liveAsOf),
+    subEntries.map(async ({ canonicalId, mapping, candidates }, idx) => {
+      const { todayByCandidate } = phase1[idx]
+      // Pick the first candidate with a today row (preserves PART_MAP order).
+      let pickedIdx = todayByCandidate.findIndex(p => p && p.priceUSD > 0)
+      if (pickedIdx === -1) pickedIdx = 0 // fallback: keep parts[0] for the receipt label
+      const repPart = candidates[pickedIdx]
+      const todayPoint = todayByCandidate[pickedIdx] ?? null
+
+      const [monthStartFirstPoint, weekStartFirstPoint, anchorAtPoint, spliceFirstPoint] = await Promise.all([
         view === 'mom'
           ? getTiInventoryFirstAfter(d1, repPart, monthStart)
           : Promise.resolve(null),
@@ -731,7 +768,11 @@ app.get('/api/ti/trend/series', async (c) => {
           ? getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
           : Promise.resolve(null),
       ])
-      return { canonicalId, mapping, repPart, todayPoint, monthStartFirstPoint, weekStartFirstPoint, anchorAtPoint, spliceFirstPoint }
+      return {
+        canonicalId, mapping, repPart,
+        candidatesChecked: candidates,
+        todayPoint, monthStartFirstPoint, weekStartFirstPoint, anchorAtPoint, spliceFirstPoint,
+      }
     }),
   )
 
@@ -752,9 +793,13 @@ app.get('/api/ti/trend/series', async (c) => {
         liveUSD: r.todayPoint.priceUSD,
         liveDate: String(r.todayPoint.capturedAt).slice(0, 10),
         latestSource: 'ti_inventory',
+        representativePartUsed: r.repPart,
+        candidatePartsChecked: r.candidatesChecked,
       }
     } else if (liveSnapshot[r.canonicalId]) {
       liveSnapshot[r.canonicalId].latestSource = 'prices_fallback'
+      liveSnapshot[r.canonicalId].representativePartUsed = r.repPart
+      liveSnapshot[r.canonicalId].candidatePartsChecked = r.candidatesChecked
       fallbackSubs.push(r.canonicalId)
     }
   }

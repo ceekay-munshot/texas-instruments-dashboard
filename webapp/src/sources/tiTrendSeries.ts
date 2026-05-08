@@ -38,6 +38,12 @@ export type LiveCellBreakdown = {
    *  (`ti_inventory`) or the /api/prices distributor mirror used when no TI
    *  inventory row exists for the representative SKU (`prices_fallback`). */
   latestSource?: 'ti_inventory' | 'prices_fallback'
+  /** Internal/debug-only — the representative SKU actually used for this
+   *  cell's USD math (today + splice + anchor lookups all use the same SKU). */
+  representativePartUsed?: string
+  /** Internal/debug-only — the ordered list of PART_MAP candidate SKUs the
+   *  handler scanned for this subcategory. */
+  candidatePartsChecked?: string[]
 }
 
 export type TrendCell = {
@@ -184,6 +190,10 @@ type LiveSnapshot = Record<string, {
   liveDate: string
   /** Internal flag — see LiveCellBreakdown.latestSource. */
   latestSource?: 'ti_inventory' | 'prices_fallback'
+  /** Internal — representative SKU used for the trend math this request. */
+  representativePartUsed?: string
+  /** Internal — candidate SKUs scanned, in PART_MAP order. */
+  candidatePartsChecked?: string[]
 }>
 
 /** Anchor lookup result — what to compare today's price against. Provided
@@ -355,6 +365,8 @@ export function buildTrendView(
           anchorDate: anchor.anchorDate,
           anchorLabel: anchor.anchorLabel,
           latestSource: live.latestSource,
+          representativePartUsed: live.representativePartUsed,
+          candidatePartsChecked: live.candidatePartsChecked,
         }
       }
       // If no anchor resolves, leave pct null — the live cell is blank and
