@@ -3500,20 +3500,25 @@ function App(){
     };
   }, [fetchLive]);
 
-  // CSV cell escaping: wrap in quotes only when the value contains a comma,
-  // quote, or newline; double internal quotes per RFC 4180.
-  function csvEscape(v){
-    const s = v == null ? '' : String(v);
-    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-      return `"${s.replace(/"/g, '""')}"`;
-    }
-    return s;
+  // Lazy-load SheetJS on first export so the page-load cost stays zero.
+  // Cached on window so subsequent exports are instant.
+  function loadXLSXLib(){
+    if (window.XLSX) return Promise.resolve(window.XLSX);
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+      script.async = true;
+      script.onload = () => window.XLSX ? resolve(window.XLSX) : reject(new Error('XLSX failed to initialize'));
+      script.onerror = () => reject(new Error('Failed to load XLSX library from CDN'));
+      document.head.appendChild(script);
+    });
   }
 
-  // Mirror the WoW / MoM / QoQ trend table the user sees in TrendSeriesPanel.
-  // Fetches all three views in parallel, applies the same visibility filter
-  // (`vis` for group + `hiddenSub` for individual subcategory), and emits one
-  // CSV with three labeled sections.
+  // Export the WoW / MoM / QoQ trend tables as a single .xlsx workbook with
+  // three named sheets (one per view), mirroring what the user sees in
+  // TrendSeriesPanel. Honors both `vis` (group) and `hiddenSub`
+  // (per-subcategory) filters. Cell values are raw numbers so spreadsheet
+  // math works directly; missing data is left blank.
   async function exportCSV(){
     if (exporting) return;
     setExporting(true);
@@ -3523,41 +3528,38 @@ function App(){
         { key: 'mom', title: 'Month on Month' },
         { key: 'qoq', title: 'Quarter on Quarter' },
       ];
-      const datasets = await Promise.all(
-        views.map(v => fetch(`/api/ti/trend/series?view=${v.key}`).then(r => {
+      const [XLSX, ...datasets] = await Promise.all([
+        loadXLSXLib(),
+        ...views.map(v => fetch(`/api/ti/trend/series?view=${v.key}`).then(r => {
           if (!r.ok) throw new Error(`${v.title}: HTTP ${r.status}`);
           return r.json();
-        }))
-      );
+        })),
+      ]);
 
-      const lines = [];
+      const wb = XLSX.utils.book_new();
       views.forEach((v, i) => {
         const dataset = datasets[i];
         const visibleCols = dataset.columns.filter(c =>
           vis.has(c.groupLabel) && !hiddenSub.has(c.canonicalId)
         );
-        lines.push([v.title]);
-        lines.push(['Period', ...visibleCols.map(c => c.label)]);
-        // Newest-first to match the table's reversed display order.
-        [...dataset.rows].reverse().forEach(row => {
-          lines.push([
+        const rows = [
+          ['Period', ...visibleCols.map(c => c.label)],
+          // Newest-first to match the table's reversed display order.
+          ...[...dataset.rows].reverse().map(row => [
             row.label,
             ...visibleCols.map(c => {
               const pct = row.cells[c.canonicalId]?.pct;
-              return pct == null ? '' : String(pct);
+              return pct == null ? null : pct;
             }),
-          ]);
-        });
-        lines.push([]); // blank separator between sections
+          ]),
+        ];
+        const ws = XLSX.utils.aoa_to_sheet(rows);
+        XLSX.utils.book_append_sheet(wb, ws, v.title);
       });
 
-      const csv = lines.map(r => r.map(csvEscape).join(',')).join('\n');
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-      a.download = `ti_prices_${new Date().toISOString().slice(0,10)}.csv`;
-      a.click();
+      XLSX.writeFile(wb, `ti_prices_${new Date().toISOString().slice(0,10)}.xlsx`);
     } catch (e) {
-      push(`CSV export failed: ${e.message || e}`, 'error');
+      push(`Export failed: ${e.message || e}`, 'error');
     } finally {
       setExporting(false);
     }
@@ -3779,7 +3781,7 @@ function App(){
           </div>}
         </div>
         <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
-          <button onClick={exportCSV} disabled={exporting} style={{background:'none',border:`1px solid ${B}`,borderRadius:4,padding:'5px 10px',fontSize:'0.67rem',color: exporting ? '#2d4a6b' : '#4a6480',cursor: exporting ? 'default' : 'pointer'}}>{exporting ? 'Exporting…' : '↓ CSV'}</button>
+          <button onClick={exportCSV} disabled={exporting} style={{background:'none',border:`1px solid ${B}`,borderRadius:4,padding:'5px 10px',fontSize:'0.67rem',color: exporting ? '#2d4a6b' : '#4a6480',cursor: exporting ? 'default' : 'pointer'}}>{exporting ? 'Exporting…' : '↓ XLSX'}</button>
           <button
             onClick={()=>fetchLive(true)}
             disabled={loading || isRateLimited}
