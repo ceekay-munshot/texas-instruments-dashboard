@@ -3211,6 +3211,7 @@ function App(){
   // Phase 20A — TI direct API status (Product Info active, Store pending).
   const [tiStatus,setTiStatus]=useState(null);
   const { toasts, push, dismiss } = useToasts();
+  const [exporting, setExporting] = useState(false);
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
   const loadingRef = useRef(false);
@@ -3499,13 +3500,67 @@ function App(){
     };
   }, [fetchLive]);
 
-  function exportCSV(){
-    const rows=[['Period',...visCats.map(c=>c.l)]];
-    HP.forEach(p=>rows.push([p,...visCats.map(c=>HIST[p]?.[c.id]??'')]));
-    if(liveData)rows.push(['Live vs latest baseline (Q1-26 close 28-Apr-26)',...visCats.map(c=>liveData[c.id]?.qoqPct??'')]);
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'}));
-    a.download=`ti_prices_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+  // CSV cell escaping: wrap in quotes only when the value contains a comma,
+  // quote, or newline; double internal quotes per RFC 4180.
+  function csvEscape(v){
+    const s = v == null ? '' : String(v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  }
+
+  // Mirror the WoW / MoM / QoQ trend table the user sees in TrendSeriesPanel.
+  // Fetches all three views in parallel, applies the same visibility filter
+  // (`vis` for group + `hiddenSub` for individual subcategory), and emits one
+  // CSV with three labeled sections.
+  async function exportCSV(){
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const views = [
+        { key: 'wow', title: 'Week on Week' },
+        { key: 'mom', title: 'Month on Month' },
+        { key: 'qoq', title: 'Quarter on Quarter' },
+      ];
+      const datasets = await Promise.all(
+        views.map(v => fetch(`/api/ti/trend/series?view=${v.key}`).then(r => {
+          if (!r.ok) throw new Error(`${v.title}: HTTP ${r.status}`);
+          return r.json();
+        }))
+      );
+
+      const lines = [];
+      views.forEach((v, i) => {
+        const dataset = datasets[i];
+        const visibleCols = dataset.columns.filter(c =>
+          vis.has(c.groupLabel) && !hiddenSub.has(c.canonicalId)
+        );
+        lines.push([v.title]);
+        lines.push(['Period', ...visibleCols.map(c => c.label)]);
+        // Newest-first to match the table's reversed display order.
+        [...dataset.rows].reverse().forEach(row => {
+          lines.push([
+            row.label,
+            ...visibleCols.map(c => {
+              const pct = row.cells[c.canonicalId]?.pct;
+              return pct == null ? '' : String(pct);
+            }),
+          ]);
+        });
+        lines.push([]); // blank separator between sections
+      });
+
+      const csv = lines.map(r => r.map(csvEscape).join(',')).join('\n');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+      a.download = `ti_prices_${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+    } catch (e) {
+      push(`CSV export failed: ${e.message || e}`, 'error');
+    } finally {
+      setExporting(false);
+    }
   }
 
   function TT({catId}){
@@ -3724,7 +3779,7 @@ function App(){
           </div>}
         </div>
         <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
-          <button onClick={exportCSV} style={{background:'none',border:`1px solid ${B}`,borderRadius:4,padding:'5px 10px',fontSize:'0.67rem',color:'#4a6480',cursor:'pointer'}}>↓ CSV</button>
+          <button onClick={exportCSV} disabled={exporting} style={{background:'none',border:`1px solid ${B}`,borderRadius:4,padding:'5px 10px',fontSize:'0.67rem',color: exporting ? '#2d4a6b' : '#4a6480',cursor: exporting ? 'default' : 'pointer'}}>{exporting ? 'Exporting…' : '↓ CSV'}</button>
           <button
             onClick={()=>fetchLive(true)}
             disabled={loading || isRateLimited}
