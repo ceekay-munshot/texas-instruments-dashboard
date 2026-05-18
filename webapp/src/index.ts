@@ -537,6 +537,10 @@ app.get('/api/prices', async (c) => {
         'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}`
       }
     })
+    // Explicit delete before put — some cache implementations (including
+    // wrangler dev's local Workers cache) treat put as insert-only and
+    // ignore subsequent writes to the same key.
+    await cache.delete(CACHE_KEY)
     await cache.put(CACHE_KEY, cacheResponse)
   }
 
@@ -823,6 +827,20 @@ export async function resolveLiveCascade(
       }
     }
 
+    // Floor fallback for anchor-kind subs with no D1 capture history yet
+    // (e.g. brand-new comparator basket on day 1). Uses the canonical
+    // anchorUSD as the floor anchor so the live row shows 0% on first
+    // capture and real deltas accumulate as D1 history fills in. Has no
+    // effect on existing anchor-kind subs that already have D1 captures —
+    // they resolve via anchorAtPoint above.
+    if (!resolved && r.mapping.kind === 'anchor' && r.mapping.anchorUSD > 0) {
+      resolved = {
+        anchorUSD: r.mapping.anchorUSD,
+        anchorDate: liveAsOf,
+        anchorLabel: 'Historical baseline',
+      }
+    }
+
     if (resolved) anchorSnapshot[r.canonicalId] = resolved
   }
 
@@ -845,9 +863,14 @@ async function resolveLivePricesContext(env: Bindings): Promise<{
       if (data._cachedAt) liveAsOf = String(data._cachedAt).slice(0, 10)
     }
   } catch {}
-  if (Object.keys(pricesData).length === 0) {
+  // Fall through to KV when the cache is empty OR missing categories that
+  // the current PART_MAP covers (e.g. a newly added subcategory hasn't
+  // landed in the cached payload yet — happens when a stale cached entry
+  // outlives a deployment that added a category).
+  const expectedCount = Object.keys(PART_MAP).length
+  if (Object.keys(pricesData).length < expectedCount) {
     const persisted = await readPersistedPriceSnapshot(env.SOURCE_SNAPSHOTS_KV)
-    if (persisted) {
+    if (persisted && Object.keys(persisted.data ?? {}).length > Object.keys(pricesData).length) {
       pricesData = persisted.data ?? {}
       if (persisted.fetchedAt) liveAsOf = String(persisted.fetchedAt).slice(0, 10)
     }
@@ -1040,6 +1063,7 @@ function canonicalToLegacy(canonicalId: string): string | null {
     amp_opamps: 'amp_op',
     amp_instrumentation: 'amp_instr',
     amp_audio: 'amp_audio',
+    amp_comparators: 'amp_cmp',
     conv_adc: 'dac_adc',
     conv_dac: 'dac_dac',
     interface_can: 'if_can',

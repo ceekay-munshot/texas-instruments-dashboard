@@ -23,6 +23,7 @@ export const PART_MAP: Record<string, MouserCatalogEntry> = {
   amp_op:    { label: 'Op-Amps',              parts: ['OPA376AIDBVR','TLV2372IDGKR'] },
   amp_instr: { label: 'Instrumentation',      parts: ['INA826AIDR','INA333AIDR'] },
   amp_audio: { label: 'Audio Amps',           parts: ['TPA3118D2DAPR','LM4871M/NOPB'] },
+  amp_cmp:   { label: 'Comparators',          parts: ['LM393DR','LM2903DR'] },
   dac_adc:   { label: 'ADC',                  parts: ['ADS1115IRUGR','ADS8685IPW'] },
   dac_dac:   { label: 'DAC',                  parts: ['DAC8552IDGK','DAC60508ZCRTET'] },
   if_can:    { label: 'CAN Transceivers',     parts: ['TCAN1042DRBTQ1','TCAN1051DRQ1'] },
@@ -56,6 +57,7 @@ export const BASELINES: Record<string, number> = {
   amp_op:    2.1983,
   amp_instr: 3.7607,
   amp_audio: 1.9305,
+  amp_cmp:   0.2566, // LM393DR Mouser qty=1 captured 2026-05-18
   dac_adc:   5.7135,
   dac_dac:   22.2963,
   if_can:    2.7898,

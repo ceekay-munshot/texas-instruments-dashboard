@@ -65,6 +65,9 @@ export const SUB_TO_BASELINE: Record<string, BaselineMapping> = {
   gan_lmg342x:            { kind: 'anchor', anchorUSD: 29.1792 },
   gan_lmg3650:            { kind: 'anchor', anchorUSD: 9.5758 },
   gan_lmg5200:            { kind: 'anchor', anchorUSD: 18.2692 },
+  // Anchor-only comparator basket; no long historical series yet.
+  // anchorUSD is the LM393DR Mouser qty=1 captured 2026-05-18.
+  amp_comparators:        { kind: 'anchor', anchorUSD: 0.2566 },
 }
 
 // Resolve the historical index value for a subcategory at a given date
@@ -134,6 +137,7 @@ export const FEB27_BASELINES_USD: Record<string, number> = {
   dc_efuses:              2.6898,
   dc_hotswap:             4.9492,
   dc_tps536xx_ai_power:  12.9327,
+  amp_comparators:        0.2566, // LM393DR Mouser qty=1 captured 2026-05-18
 }
 
 // Look up the historical series index value at-or-before Feb-27-2026 — the

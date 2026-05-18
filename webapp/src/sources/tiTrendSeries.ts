@@ -467,6 +467,7 @@ function legacyToCanonical(id: string): string {
     amp_op: 'amp_opamps',
     amp_instr: 'amp_instrumentation',
     amp_audio: 'amp_audio',
+    amp_cmp: 'amp_comparators',
     dac_adc: 'conv_adc',
     dac_dac: 'conv_dac',
     if_can: 'interface_can',

@@ -99,6 +99,9 @@ export const TI_TAXONOMY: TaxonomyGroup[] = [
       t('amplifiers', 'Amplifiers', 'amp_audio', 'Audio Amps',
         3, { mouser: 'covered', nexar: 'missing', tiDirect: 'future', digikeyDirect: 'future', arrowDirect: 'future' },
         'Mouser-only today.'),
+      t('amplifiers', 'Amplifiers', 'amp_comparators', 'Comparators',
+        3, { mouser: 'covered', nexar: 'missing', tiDirect: 'future', digikeyDirect: 'future', arrowDirect: 'future' },
+        'Anchor-only comparator basket; no long historical series yet. TI general-purpose comparators (LM393 family, TLV320x/349x push-pull).'),
     ],
   },
   {
@@ -225,6 +228,7 @@ export const LEGACY_TO_CANONICAL: Record<string, string> = {
   pm_super: 'power_supervisor_reset',
   amp_instr: 'amp_instrumentation',
   amp_audio: 'amp_audio',
+  amp_cmp: 'amp_comparators',
   dac_dac: 'conv_dac',
   if_lin: 'interface_lin',
   if_eth: 'interface_ethernet_phy',

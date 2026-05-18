@@ -131,6 +131,10 @@ export const CANONICAL_MAPPING_RULES: MappingRule[] = [
   // current-monitor subcategory.
   rule('amp_ina_currentmon', gpnPrefix(['INA']),                     'amplifiers',        'amp_opamps',     'medium'),
   rule('amp_audio',     gpnPrefix(['TPA', 'TAS']),                   'amplifiers',        'amp_audio',      'high'),
+  // Narrow comparator prefixes — every family below is unambiguously a
+  // general-purpose comparator. Wider TLV70x / TLV170x prefixes deliberately
+  // excluded to avoid colliding with the existing power_ldo TLV7 catch-all.
+  rule('amp_comparators', gpnPrefix(['LM393', 'LM339', 'LMV393', 'LM2903', 'TLV3201', 'TLV3202', 'TLV3491', 'TLV3492']), 'amplifiers', 'amp_comparators', 'high'),
 
   // ── Power Management (after data-center / GaN to avoid clobber) ─────────
   rule('power_battery_mgmt', gpnPrefix(['BQ24', 'BQ25', 'BQ27', 'BQ40', 'BQ34', 'BQ76']), 'power_management', 'power_battery_mgmt', 'high'),

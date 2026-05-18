@@ -2557,7 +2557,7 @@ const UBS_GC = {
 const UBS_GROUPS = [
   { groupLabel: 'Amplifiers', subs: [
     { canonicalId: 'ubs_amp_audio',       label: 'Audio',       sources: ['amp_audio'] },
-    { canonicalId: 'ubs_amp_comparators', label: 'Comparators', sources: [] },
+    { canonicalId: 'ubs_amp_comparators', label: 'Comparators', sources: ['amp_comparators'] },
     { canonicalId: 'ubs_amp_operational', label: 'Operational', sources: ['amp_opamps'] },
   ]},
   { groupLabel: 'Data Converters', subs: [
