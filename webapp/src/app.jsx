@@ -2635,7 +2635,17 @@ function tiSeriesToUbs(data) {
 // /api/ti/trend/series and render rows for every period the data covers.
 // The most recent row is the live to-date row (WTD / MTD / QTD), highlighted
 // in gold. Cells are colored green/red by % change vs prior period.
-function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited, fetchedAt, GC, CATS, B, dataTransform }){
+// Arithmetic mean of currently visible pct cells in a single row. Returns
+// null when no finite values exist. Used by the optional Average column.
+function averageVisiblePct(row, visCanonical) {
+  const pcts = visCanonical
+    .map(c => row.cells[c.canonicalId]?.pct)
+    .filter(p => p != null && isFinite(p));
+  if (pcts.length === 0) return null;
+  return pcts.reduce((a, b) => a + b, 0) / pcts.length;
+}
+
+function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited, fetchedAt, GC, CATS, B, dataTransform, showAverageColumn }){
   const [view, setView] = useState('qoq');     // 'wow' | 'mom' | 'qoq'
   // Cached raw payload from /api/ti/trend/series. The downstream `data` value
   // applied to the table is derived via useMemo: identity for the Prices tab
@@ -2916,9 +2926,11 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
           <thead>
             <tr style={{background:'#050810'}}>
               <th rowSpan={2} style={{padding:'6px 12px 6px 16px',textAlign:'left',borderBottom:`1px solid ${B}`,borderRight:`1px solid ${B}`,color:'#2d4a6b',fontWeight:'normal',fontSize:'0.58rem',position:'sticky',left:0,background:'#050810',zIndex:3,minWidth:140,verticalAlign:'bottom'}}>Period</th>
+              {showAverageColumn && <th style={{padding:'5px 6px',textAlign:'center',borderBottom:`1px solid ${B}`,borderLeft:`1px solid ${B}`,borderRight:`2px solid ${B}`,fontWeight:'normal',fontSize:'0.62rem',letterSpacing:'0.04em',color:'#7a96b8'}}>Averages</th>}
               {grpSpans.map(({g,n})=><th key={g} colSpan={n} style={{padding:'5px 6px',textAlign:'center',borderBottom:`1px solid ${B}`,borderLeft:`1px solid ${B}`,fontWeight:'normal',fontSize:'0.62rem',letterSpacing:'0.04em',color:GC[g]||'#888'}}>{g}</th>)}
             </tr>
             <tr style={{background:'#07090f'}}>
+              {showAverageColumn && <th style={{padding:'4px 6px',textAlign:'right',borderBottom:`2px solid ${B}`,borderLeft:`1px solid ${B}`,borderRight:`2px solid ${B}`,fontWeight:'normal',fontSize:'0.58rem',color:'#7a96b8',minWidth:80,maxWidth:100}}>Average</th>}
               {visCanonical.map((c,i)=>{const iF=i===0||visCanonical[i-1].groupLabel!==c.groupLabel;return(
                 <th key={c.canonicalId} style={{padding:'4px 6px',textAlign:'right',borderBottom:`2px solid ${B}`,borderLeft:iF?`1px solid ${B}`:'none',fontWeight:'normal',fontSize:'0.58rem',color:(GC[c.groupLabel]||'#888')+'bb',minWidth:80,maxWidth:110,overflow:'hidden',textOverflow:'ellipsis'}}>{c.label}</th>
               );})}
@@ -2948,6 +2960,27 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                   }} title={r.bridgeRow ? 'Live capture begins from May 2026. Historical baseline used where available.' : undefined}>
                     {live ? '★ ' : '   '}{r.label}
                   </td>
+                  {showAverageColumn && (() => {
+                    const avg = r.bridgeRow ? null : averageVisiblePct(r, visCanonical);
+                    const text = fmtPct(avg);
+                    const color = pctColor(avg);
+                    return (
+                      <td style={{
+                        padding:'4px 6px',
+                        textAlign:'right',
+                        borderBottom:`1px solid #0d1520`,
+                        borderLeft:`1px solid #0d1520`,
+                        borderRight:`2px solid ${B}`,
+                        fontFamily:'monospace',
+                        fontSize: live ? '0.74rem' : '0.7rem',
+                        color: r.bridgeRow ? '#3a4d65' : color,
+                        fontWeight: live ? 'bold' : 'normal',
+                        cursor: 'default',
+                      }} title={r.bridgeRow ? 'Live capture begins from May 2026.' : `Mean of ${visCanonical.length} visible subcategor${visCanonical.length===1?'y':'ies'} for ${r.label}`}>
+                        {text}
+                      </td>
+                    );
+                  })()}
                   {visCanonical.map((c, i) => {
                     const iF = i === 0 || visCanonical[i-1].groupLabel !== c.groupLabel;
                     const cell = r.cells[c.canonicalId];
@@ -3961,6 +3994,7 @@ function App(){
             fetchedAt={fetchedAt}
             GC={UBS_GC} CATS={UBS_CATS} B={B}
             dataTransform={tiSeriesToUbs}
+            showAverageColumn
           />
         </div>
       )}
