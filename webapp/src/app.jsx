@@ -2603,11 +2603,18 @@ function tiSeriesToUbs(data) {
   })));
   const subToSources = new Map();
   UBS_GROUPS.forEach(g => g.subs.forEach(s => subToSources.set(s.canonicalId, s.sources)));
+  // canonicalId → label lookup for the composite receipt's row labels.
+  const labelByCanonical = new Map(data.columns.map(c => [c.canonicalId, c.label]));
   const rows = data.rows.map(r => {
     const cells = {};
     for (const col of columns) {
       const sources = subToSources.get(col.canonicalId) || [];
-      if (sources.length === 0) { cells[col.canonicalId] = { index: null, pct: null }; continue; }
+      if (sources.length === 0) {
+        // Empty-source UBS bucket — render as dash, not clickable. The flag
+        // lets the cell renderer set a helpful hover string.
+        cells[col.canonicalId] = { index: null, pct: null, noSource: true };
+        continue;
+      }
       if (sources.length === 1) {
         const src = r.cells[sources[0]];
         if (!src) { cells[col.canonicalId] = { index: null, pct: null }; }
@@ -2618,11 +2625,15 @@ function tiSeriesToUbs(data) {
         }
         continue;
       }
-      // Multi-source aggregate: simple mean of valid pcts; no breakdown yet.
-      const pcts = sources.map(s => r.cells[s]?.pct).filter(p => p != null && isFinite(p));
-      cells[col.canonicalId] = pcts.length === 0
-        ? { index: null, pct: null }
-        : { index: null, pct: pcts.reduce((a, b) => a + b, 0) / pcts.length };
+      // Multi-source aggregate: simple mean of valid pcts; attach composite
+      // so the click receipt can list each constituent TI source's pct.
+      const items = sources.map(s => ({
+        label: labelByCanonical.get(s) || s,
+        pct: r.cells[s]?.pct ?? null,
+      }));
+      const validPcts = items.map(it => it.pct).filter(p => p != null && isFinite(p));
+      const mean = validPcts.length === 0 ? null : validPcts.reduce((a, b) => a + b, 0) / validPcts.length;
+      cells[col.canonicalId] = { index: null, pct: mean, composite: { items, mean } };
     }
     return { ...r, cells };
   });
@@ -2635,6 +2646,21 @@ function tiSeriesToUbs(data) {
 // /api/ti/trend/series and render rows for every period the data covers.
 // The most recent row is the live to-date row (WTD / MTD / QTD), highlighted
 // in gold. Cells are colored green/red by % change vs prior period.
+// Shared pct formatter/colorer used by the trend table cells and the
+// composite receipt popover. Lifted from TrendSeriesPanel to module scope
+// — pure functions, no behavior change.
+function fmtPct(v) {
+  if (v == null || !isFinite(v)) return '—';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toFixed(2)}%`;
+}
+function pctColor(v) {
+  if (v == null || !isFinite(v)) return '#3a4d65';
+  if (v > 0.05) return '#00c9a7';
+  if (v < -0.05) return '#f05c5c';
+  return '#7a96b8';
+}
+
 // Arithmetic mean of currently visible pct cells in a single row. Returns
 // null when no finite values exist. Used by the optional Average column.
 function averageVisiblePct(row, visCanonical) {
@@ -2765,18 +2791,6 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
     if (!data) return [];
     return [...data.rows].reverse();
   }, [data]);
-
-  function fmtPct(v) {
-    if (v == null || !isFinite(v)) return '—';
-    const sign = v > 0 ? '+' : '';
-    return `${sign}${v.toFixed(2)}%`;
-  }
-  function pctColor(v) {
-    if (v == null || !isFinite(v)) return '#3a4d65';
-    if (v > 0.05) return '#00c9a7';
-    if (v < -0.05) return '#f05c5c';
-    return '#7a96b8';
-  }
 
   const VIEW_TABS = [
     { id: 'wow', label: 'Week on Week', live: 'WTD' },
@@ -2964,6 +2978,23 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                     const avg = r.bridgeRow ? null : averageVisiblePct(r, visCanonical);
                     const text = fmtPct(avg);
                     const color = pctColor(avg);
+                    const avgClickable = !r.bridgeRow && avg != null;
+                    const onAvgClick = avgClickable
+                      ? (e) => {
+                          e.stopPropagation();
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const items = visCanonical.map(c => ({
+                            label: c.label,
+                            pct: r.cells[c.canonicalId]?.pct ?? null,
+                          }));
+                          setReceipt({
+                            subLabel: 'Average',
+                            periodLabel: r.label,
+                            composite: { items, mean: avg },
+                            anchorXY: { x: rect.left + rect.width / 2, y: rect.bottom },
+                          });
+                        }
+                      : undefined;
                     return (
                       <td style={{
                         padding:'4px 6px',
@@ -2975,8 +3006,8 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                         fontSize: live ? '0.74rem' : '0.7rem',
                         color: r.bridgeRow ? '#3a4d65' : color,
                         fontWeight: live ? 'bold' : 'normal',
-                        cursor: 'default',
-                      }} title={r.bridgeRow ? 'Live capture begins from May 2026.' : `Mean of ${visCanonical.length} visible subcategor${visCanonical.length===1?'y':'ies'} for ${r.label}`}>
+                        cursor: r.bridgeRow ? 'help' : (avgClickable ? 'pointer' : 'default'),
+                      }} title={r.bridgeRow ? 'Live capture begins from May 2026.' : (avgClickable ? 'Click for calculation' : `Mean of ${visCanonical.length} visible subcategor${visCanonical.length===1?'y':'ies'} for ${r.label}`)} onClick={onAvgClick}>
                         {text}
                       </td>
                     );
@@ -2986,6 +3017,8 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                     const cell = r.cells[c.canonicalId];
                     const pct = cell?.pct;
                     const hasBreakdown = !!cell?.breakdown;
+                    const hasComposite = !!cell?.composite;
+                    const isNoSource   = !!cell?.noSource;
                     const isLiveCell = live && hasBreakdown;
                     // "Blank" means the live cell has no value to show, not
                     // merely no breakdown. UBS Compare's aggregated buckets
@@ -2998,12 +3031,16 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                     // also clickable — they show the same receipt as the live
                     // row but with frozen values from the moment of close.
                     const isFrozenSnapshot = !live && hasBreakdown;
-                    const isClickable = isLiveCell || isFrozenSnapshot;
+                    const isClickable = isLiveCell || isFrozenSnapshot || hasComposite;
                     const text = isLiveBlank ? '—' : fmtPct(pct);
                     const color = pctColor(pct);
                     let cellTitle;
                     if (r.bridgeRow) {
                       cellTitle = 'Live capture begins from May 2026. Historical baseline used where available.';
+                    } else if (isNoSource) {
+                      cellTitle = 'Insufficient data — no TI taxonomy mapping for this UBS bucket';
+                    } else if (hasComposite) {
+                      cellTitle = 'Click for calculation';
                     } else if (live) {
                       cellTitle = isLiveCell ? 'Click for calculation' : 'No valid prior-period anchor yet.';
                     } else if (isFrozenSnapshot) {
@@ -3018,7 +3055,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                           setReceipt({
                             subLabel: c.label,
                             periodLabel: r.label,
-                            breakdown: cell.breakdown,
+                            ...(hasComposite ? { composite: cell.composite } : { breakdown: cell.breakdown }),
                             anchorXY: { x: rect.left + rect.width / 2, y: rect.bottom },
                           });
                         }
@@ -3033,7 +3070,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                         fontSize: live ? '0.74rem' : '0.7rem',
                         color: r.bridgeRow ? '#3a4d65' : (isLiveBlank ? '#3a4d65' : color),
                         fontWeight: live && !isLiveBlank ? 'bold' : 'normal',
-                        cursor: r.bridgeRow ? 'help' : (isClickable ? 'pointer' : (isLiveBlank ? 'help' : 'default')),
+                        cursor: r.bridgeRow ? 'help' : (isClickable ? 'pointer' : ((isLiveBlank || isNoSource) ? 'help' : 'default')),
                       }} title={cellTitle} onClick={onCellClick}>
                         {text}
                       </td>
@@ -3194,6 +3231,13 @@ function SubcategoryPopover({ group, color, columns, hiddenSub, setHiddenSub, se
 }
 
 function ReceiptPopover({ receipt, onClose, popoverRef, B }){
+  // Composite receipt (UBS aggregated cells + Average column) — render a
+  // list of constituent subcategories with their pct, plus the average.
+  // Guarded BEFORE the USD-breakdown destructure so aggregated UBS clicks
+  // don't crash (those cells have no `breakdown` object).
+  if (receipt.composite) {
+    return <CompositeReceiptPopover receipt={receipt} onClose={onClose} popoverRef={popoverRef} B={B} />;
+  }
   const { subLabel, periodLabel, breakdown, anchorXY } = receipt;
   const fmtUSD = (v) => `$${Number(v).toFixed(4)}`;
   const today = breakdown.todayUSD;
@@ -3272,6 +3316,79 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
           fontWeight: 'bold',
           color: pct > 0.05 ? '#00c9a7' : pct < -0.05 ? '#f05c5c' : '#c4d4e8',
         }}>{pctText}</span>
+      </div>
+    </div>
+  );
+}
+
+// Composite receipt — used by UBS Compare aggregated cells and the Average
+// column. Renders a list of constituent subcategory pcts and a footer mean.
+// Shares the same popover chrome (background, border, position math,
+// dismiss-on-click-outside via popoverRef) as ReceiptPopover.
+function CompositeReceiptPopover({ receipt, onClose, popoverRef, B }){
+  const { subLabel, periodLabel, composite, anchorXY } = receipt;
+  const { items, mean } = composite;
+  const validCount = items.filter(it => it.pct != null && isFinite(it.pct)).length;
+
+  const [pos, setPos] = useState(null);
+  useEffect(() => {
+    if (!popoverRef.current) return;
+    const rect = popoverRef.current.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const EDGE = 8;
+    let top = anchorXY.y + 8;
+    if (top + rect.height > vh - EDGE) {
+      top = Math.max(EDGE, anchorXY.y - rect.height - 16);
+    }
+    let left = anchorXY.x - rect.width / 2;
+    left = Math.max(EDGE, Math.min(left, vw - rect.width - EDGE));
+    setPos({ top, left });
+  }, [anchorXY.x, anchorXY.y]);
+
+  return (
+    <div
+      ref={popoverRef}
+      style={{
+        position: 'fixed',
+        top: pos?.top ?? -9999,
+        left: pos?.left ?? -9999,
+        visibility: pos ? 'visible' : 'hidden',
+        background: '#0c1220',
+        border: `1px solid ${B}`,
+        borderRadius: 6,
+        padding: '12px 16px',
+        fontFamily: 'monospace',
+        fontSize: '0.7rem',
+        color: '#c4d4e8',
+        boxShadow: '0 6px 24px rgba(0,0,0,0.6)',
+        zIndex: 1000,
+        minWidth: 320,
+        maxWidth: 460,
+      }}
+    >
+      <button onClick={onClose} style={{
+        position: 'absolute', top: 6, right: 8,
+        background: 'none', border: 'none', color: '#4a6a8a',
+        cursor: 'pointer', fontSize: '0.85rem', lineHeight: 1, padding: 4,
+      }} aria-label="close">×</button>
+
+      <div style={{fontSize:'0.85rem',fontWeight:'bold',color:'#3d8ef0',marginBottom:2}}>{subLabel}</div>
+      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom:10,letterSpacing:'0.04em'}}>{periodLabel}</div>
+
+      <div style={{display:'grid',gridTemplateColumns:'auto auto',rowGap:4,columnGap:18,marginBottom:10}}>
+        {items.map((it, i) => (
+          <React.Fragment key={i}>
+            <div style={{color:'#7a96b8'}}>{it.label}</div>
+            <div style={{textAlign:'right',color:pctColor(it.pct),fontWeight:'normal'}}>{fmtPct(it.pct)}</div>
+          </React.Fragment>
+        ))}
+      </div>
+
+      <div style={{borderTop:`1px solid ${B}`,paddingTop:8,display:'flex',justifyContent:'space-between',alignItems:'baseline',gap:14}}>
+        <span style={{color:'#7a96b8'}}>
+          Average of {validCount} of {items.length} source categor{items.length===1?'y':'ies'}
+        </span>
+        <span style={{fontWeight:'bold',color:pctColor(mean)}}>{fmtPct(mean)}</span>
       </div>
     </div>
   );
