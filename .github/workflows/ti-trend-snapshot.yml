@@ -1,0 +1,142 @@
+name: TI Trend Period Snapshot
+
+# Phase 26 — daily check that freezes the live WoW/MoM/QoQ row(s) at the
+# moment a period closes. The endpoint auto-detects which views close on
+# the run date (Friday → WoW; last-of-month → MoM; last-of-quarter → QoQ)
+# and is a no-op on non-closing days.
+#
+# Why GitHub Actions instead of wrangler.jsonc cron triggers:
+#   Cloudflare Pages projects ignore `triggers.crons` (Workers-only). The
+#   project already uses GH Actions for the Mouser/Nexar daily snapshot
+#   and the watched-parts inventory capture — this follows that pattern.
+#
+# What it does:
+#   POST /api/ti/trend/snapshot-period (no body) → autodetects today's
+#     closing views, computes the live cascade for each, freezes one
+#     snapshot row per (view, period_end_date, canonical_id) into D1.
+#   Idempotent via PK; safe to re-run.
+#
+# Required GitHub Actions secret:
+#   SNAPSHOT_CAPTURE_SECRET — same secret used by the other capture
+#   workflows. Must match the Cloudflare Pages env var of the same name.
+
+on:
+  schedule:
+    - cron: '30 23 * * *'   # 23:30 UTC daily — after US market close
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Override snapshot date (ISO YYYY-MM-DD). Leave blank for today.'
+        required: false
+        default: ''
+      views:
+        description: 'Comma-separated views to snapshot (wow,mom,qoq). Leave blank to autodetect.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ti-trend-snapshot
+  cancel-in-progress: false
+
+env:
+  BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+
+jobs:
+  snapshot:
+    name: Freeze closed-period rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Validate SNAPSHOT_CAPTURE_SECRET is configured
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+        run: |
+          if [ -z "${CAPTURE_SECRET:-}" ]; then
+            echo "::error::Repository secret SNAPSHOT_CAPTURE_SECRET is not set."
+            exit 1
+          fi
+          echo "Secret is configured (value not printed)."
+
+      - name: POST /api/ti/trend/snapshot-period
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          MANUAL_DATE: ${{ github.event.inputs.date }}
+          MANUAL_VIEWS: ${{ github.event.inputs.views }}
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp)"
+          payload='{}'
+          if [ -n "${MANUAL_DATE}" ] || [ -n "${MANUAL_VIEWS}" ]; then
+            views_json=''
+            if [ -n "${MANUAL_VIEWS}" ]; then
+              # Convert "wow,mom" → ["wow","mom"]
+              views_json=$(echo "${MANUAL_VIEWS}" | jq -R 'split(",") | map(. | gsub("^\\s+|\\s+$"; ""))')
+            fi
+            payload=$(jq -nc \
+              --arg date "${MANUAL_DATE}" \
+              --argjson views "${views_json:-null}" \
+              '{} + (if $date != "" then {date: $date} else {} end) + (if $views != null then {views: $views} else {} end)')
+          fi
+          echo "Request payload: ${payload}"
+
+          http_status=$(curl -sS -o "$tmp" -w '%{http_code}' \
+            -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "${payload}" \
+            "${BASE_URL}/api/ti/trend/snapshot-period")
+
+          echo "HTTP ${http_status}"
+          if [ "${http_status}" != "200" ]; then
+            head -c 1000 "$tmp" || true
+            echo
+            echo "::error::Snapshot endpoint returned HTTP ${http_status}"
+            exit 1
+          fi
+
+          if ! jq -e . < "$tmp" > /dev/null 2>&1; then
+            head -c 1000 "$tmp" || true
+            echo "::error::Snapshot endpoint returned non-JSON"
+            exit 1
+          fi
+
+          jq -c '{success, status, date, runs}' < "$tmp"
+
+          success=$(jq -r '.success // false' < "$tmp")
+          if [ "${success}" != "true" ]; then
+            status=$(jq -r '.status // "unknown"' < "$tmp")
+            echo "::error::Snapshot endpoint reported success=false status=${status}"
+            exit 1
+          fi
+
+          # If runs[] is empty, today isn't a closing day — that's expected
+          # on most days and not an error.
+          run_count=$(jq -r '(.runs // []) | length' < "$tmp")
+          if [ "${run_count}" = "0" ]; then
+            echo "No periods closed on this date; nothing to snapshot. (Expected on most days.)"
+            exit 0
+          fi
+
+          # Strict per-run validation.
+          FAIL=0
+          for i in $(seq 0 $((run_count - 1))); do
+            view=$(jq -r ".runs[${i}].view" < "$tmp")
+            date=$(jq -r ".runs[${i}].periodEndDate" < "$tmp")
+            considered=$(jq -r ".runs[${i}].rowsConsidered" < "$tmp")
+            written=$(jq -r ".runs[${i}].rowsWritten" < "$tmp")
+            errors=$(jq -r ".runs[${i}].writeErrors | length" < "$tmp")
+            echo "  ${view} ${date}: considered=${considered} written=${written} errors=${errors}"
+            if [ "${written}" = "0" ]; then
+              echo "::error::No rows written for view=${view} date=${date}"
+              FAIL=1
+            fi
+            if [ "${errors}" != "0" ]; then
+              echo "::error::Write errors for view=${view} date=${date}"
+              FAIL=1
+            fi
+          done
+          [ "${FAIL}" = "0" ]

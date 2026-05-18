@@ -183,7 +183,7 @@ function quarterlyBoundaries(today: Date, firstISO: string): Date[] {
 
 // ── Index resolver across stitch ────────────────────────────────────────────
 
-type LiveSnapshot = Record<string, {
+export type LiveSnapshot = Record<string, {
   canonicalId: string
   liveUSD: number
   /** ISO calendar date the live capture came from (e.g. "2026-05-07"). */
@@ -261,6 +261,22 @@ export function buildTrendView(
    *  via DB lookups + baseline cascade and passes the result. May be empty
    *  per-key — falls back to index-derived pct for that cell only. */
   anchorSnapshot: AnchorSnapshot = {},
+  /** Phase 26 — frozen period snapshots keyed by `periodEnd → canonicalId`.
+   *  When a closed-row cell has a matching snapshot, its `pct` and
+   *  `breakdown` come from the snapshot instead of index math. This makes
+   *  the closed cell clickable in the UI (same receipt as the live row)
+   *  and freezes the value forever. */
+  snapshotByPeriodCanonical: Record<string, Record<string, {
+    pct: number
+    todayUSD: number
+    todayDate: string
+    todayLabel: 'Latest capture'
+    anchorUSD: number
+    anchorDate: string
+    anchorLabel: string
+    latestSource?: string
+    representativePartUsed?: string
+  }>> = {},
 ): TrendView {
   const today = parseISO(liveAsOfISO)
 
@@ -311,6 +327,8 @@ export function buildTrendView(
     const b = boundaries[i]
     const prev = i > 0 ? boundaries[i - 1] : null
     const cells: Record<string, TrendCell> = {}
+    const curISOForRow = isoDate(b)
+    const snapshotForRow = snapshotByPeriodCanonical[curISOForRow] ?? {}
     for (const col of columns) {
       const cur = idxAt(col.canonicalId, b)
       const prevIdx = prev ? idxAt(col.canonicalId, prev) : null
@@ -318,7 +336,28 @@ export function buildTrendView(
       if (cur != null && prevIdx != null && prevIdx > 0) {
         pct = ((cur - prevIdx) / prevIdx) * 100
       }
-      cells[col.canonicalId] = { index: cur, pct }
+      // Phase 26 — if a frozen snapshot exists for this (period, sub),
+      // it overrides both the pct and attaches a click-to-explain
+      // breakdown so closed rows behave like the live row.
+      const snap = snapshotForRow[col.canonicalId]
+      if (snap) {
+        cells[col.canonicalId] = {
+          index: cur,
+          pct: snap.pct,
+          breakdown: {
+            todayUSD: snap.todayUSD,
+            todayDate: snap.todayDate,
+            todayLabel: 'Latest capture',
+            anchorUSD: snap.anchorUSD,
+            anchorDate: snap.anchorDate,
+            anchorLabel: snap.anchorLabel as LiveCellBreakdown['anchorLabel'],
+            latestSource: snap.latestSource as LiveCellBreakdown['latestSource'],
+            representativePartUsed: snap.representativePartUsed,
+          },
+        }
+      } else {
+        cells[col.canonicalId] = { index: cur, pct }
+      }
     }
     // A "bridge" row is one where BOTH endpoints fall strictly inside the
     // carry-forward window (between the last historical pulse and our first

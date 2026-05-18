@@ -2852,8 +2852,14 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                     const iF = i === 0 || visCanonical[i-1].groupLabel !== c.groupLabel;
                     const cell = r.cells[c.canonicalId];
                     const pct = cell?.pct;
-                    const isLiveCell = live && !!cell?.breakdown;
-                    const isLiveBlank = live && !cell?.breakdown;
+                    const hasBreakdown = !!cell?.breakdown;
+                    const isLiveCell = live && hasBreakdown;
+                    const isLiveBlank = live && !hasBreakdown;
+                    // Closed (historical) rows with a snapshotted breakdown are
+                    // also clickable — they show the same receipt as the live
+                    // row but with frozen values from the moment of close.
+                    const isFrozenSnapshot = !live && hasBreakdown;
+                    const isClickable = isLiveCell || isFrozenSnapshot;
                     const text = isLiveBlank ? '—' : fmtPct(pct);
                     const color = pctColor(pct);
                     let cellTitle;
@@ -2861,10 +2867,12 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                       cellTitle = 'Live capture begins from May 2026. Historical baseline used where available.';
                     } else if (live) {
                       cellTitle = isLiveCell ? 'Click for calculation' : 'No valid prior-period anchor yet.';
+                    } else if (isFrozenSnapshot) {
+                      cellTitle = 'Click for calculation (frozen at period close)';
                     } else {
                       cellTitle = cell?.index != null ? `index ${cell.index.toFixed(2)} · ${r.label}` : 'no data';
                     }
-                    const onCellClick = isLiveCell
+                    const onCellClick = isClickable
                       ? (e) => {
                           e.stopPropagation();
                           const rect = e.currentTarget.getBoundingClientRect();
@@ -2886,7 +2894,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                         fontSize: live ? '0.74rem' : '0.7rem',
                         color: r.bridgeRow ? '#3a4d65' : (isLiveBlank ? '#3a4d65' : color),
                         fontWeight: live && !isLiveBlank ? 'bold' : 'normal',
-                        cursor: r.bridgeRow ? 'help' : (isLiveCell ? 'pointer' : (isLiveBlank ? 'help' : 'default')),
+                        cursor: r.bridgeRow ? 'help' : (isClickable ? 'pointer' : (isLiveBlank ? 'help' : 'default')),
                       }} title={cellTitle} onClick={onCellClick}>
                         {text}
                       </td>

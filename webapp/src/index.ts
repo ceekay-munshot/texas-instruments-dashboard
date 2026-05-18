@@ -20,8 +20,14 @@ import {
 } from './sources/snapshotStore'
 import { computeTrends } from './sources/snapshotTrends'
 import { deriveSnapshotEvidence } from './sources/snapshotEvidence'
-import { buildTrendView, buildLiveSnapshot, type ViewKind, type AnchorSnapshot } from './sources/tiTrendSeries'
+import { buildTrendView, buildLiveSnapshot, type ViewKind, type AnchorSnapshot, type LiveSnapshot } from './sources/tiTrendSeries'
 import { getTiInventoryAt, getTiInventoryFirstAfter, type TiInventoryPoint } from './sources/tiInventoryHistory'
+import {
+  readSnapshotsByView,
+  writeSnapshotsBatch,
+  viewsClosingOn,
+  type SnapshotRow,
+} from './sources/trendSnapshot'
 import {
   SUB_TO_BASELINE,
   OWN_CAPTURE_FIRST_DATE,
@@ -630,32 +636,22 @@ app.get('/api/status', async (c) => {
 // Closed historical rows keep their existing index-derived computation.
 //
 // Query: ?view=wow|mom|qoq (default qoq).
-app.get('/api/ti/trend/series', async (c) => {
-  const serverStart = Date.now()
-  const rawView = (c.req.query('view') ?? 'qoq').toLowerCase()
-  const view: ViewKind = rawView === 'wow' || rawView === 'mom' ? rawView as ViewKind : 'qoq'
-
-  // Resolve live prices: prefer the edge-cached /api/prices payload to avoid
-  // a redundant Mouser fetch on every request. Fall back to KV-persisted
-  // snapshot, then to an empty live set (historical-only view).
-  let pricesData: Record<string, any> = {}
-  let liveAsOf: string = new Date().toISOString().slice(0, 10)
-  try {
-    const cached = await caches.default.match(CACHE_KEY)
-    if (cached) {
-      const data: any = await cached.json()
-      pricesData = data._results ?? {}
-      if (data._cachedAt) liveAsOf = String(data._cachedAt).slice(0, 10)
-    }
-  } catch {}
-  if (Object.keys(pricesData).length === 0) {
-    const persisted = await readPersistedPriceSnapshot(c.env.SOURCE_SNAPSHOTS_KV)
-    if (persisted) {
-      pricesData = persisted.data ?? {}
-      if (persisted.fetchedAt) liveAsOf = String(persisted.fetchedAt).slice(0, 10)
-    }
-  }
-
+// Resolve the live row's full cascade for a given view at a given liveAsOf.
+// Used by both the /api/ti/trend/series request handler and the snapshot
+// writer in /api/ti/trend/snapshot-period. Keeping a single source of truth
+// for the cascade guarantees that frozen snapshots match what users saw on
+// the live row at the moment of period close.
+export async function resolveLiveCascade(
+  env: Bindings,
+  view: ViewKind,
+  liveAsOf: string,
+  pricesData: Record<string, any>,
+): Promise<{
+  liveSnapshot: LiveSnapshot
+  anchorSnapshot: AnchorSnapshot
+  fallbackSubs: string[]
+  d1LookupMs: number
+}> {
   // Compute the live row's anchor date — most recently CLOSED period boundary
   // before today. For WoW this is the prior Friday close; if today is itself
   // a Friday we go back one more week (today is in-progress). For MoM/QoQ
@@ -670,19 +666,15 @@ app.get('/api/ti/trend/series', async (c) => {
     fri.setUTCDate(fri.getUTCDate() - delta)
     anchorTargetDate = fri.toISOString().slice(0, 10)
   } else if (view === 'mom') {
-    // Last day of the prior month.
     const prev = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 0))
     anchorTargetDate = prev.toISOString().slice(0, 10)
   } else {
-    // Last day of the prior quarter.
     const m = today.getUTCMonth()
     const qStart = Math.floor(m / 3) * 3
     const prev = new Date(Date.UTC(today.getUTCFullYear(), qStart, 0))
     anchorTargetDate = prev.toISOString().slice(0, 10)
   }
   const monthStart = `${liveAsOf.slice(0, 7)}-01`
-  // Day after the prior closed Friday — start of the current ISO-Saturday week.
-  // Used by the WoW Step 0 cascade as "first own capture in current week".
   let weekStart: string | null = null
   if (view === 'wow') {
     const ws = new Date(`${anchorTargetDate}T00:00:00Z`)
@@ -690,21 +682,12 @@ app.get('/api/ti/trend/series', async (c) => {
     weekStart = ws.toISOString().slice(0, 10)
   }
 
-  // ── Parallel D1 read phase ──────────────────────────────────────────────
-  // Each subcategory needs up to 4 D1 queries. Firing them sequentially
-  // across 28 subs adds up to ~10s in production. Promise.all over the
-  // whole batch finishes in roughly the slowest single query (~200-400ms).
-  const d1 = c.env.TI_INVENTORY_HISTORY_DB ?? null
+  const d1 = env.TI_INVENTORY_HISTORY_DB ?? null
   const d1LookupStart = Date.now()
 
   type SubResolved = {
     canonicalId: string
     mapping: typeof SUB_TO_BASELINE[keyof typeof SUB_TO_BASELINE]
-    /** SKU actually used for all D1 lookups in this resolution. Picked by
-     *  scanning PART_MAP[legacyId].parts in order and taking the first one
-     *  with an at-or-before liveAsOf row. Falls back to parts[0] if none of
-     *  the candidates have data, so the prices_fallback path can still
-     *  produce a sensible representativePartUsed for the receipt. */
     repPart: string
     candidatesChecked: string[]
     todayPoint: TiInventoryPoint | null
@@ -726,18 +709,6 @@ app.get('/api/ti/trend/series', async (c) => {
     subEntries.push({ canonicalId, mapping, candidates })
   }
 
-  // Two-phase D1 read.
-  //
-  // Phase 1 — for each sub, fire a `getTiInventoryAt(sku, liveAsOf)` for
-  // every candidate SKU in PART_MAP[id].parts. The first candidate with a
-  // non-null row becomes the representative SKU for this request. Order
-  // preserves PART_MAP intent.
-  //
-  // Phase 2 — for each sub's picked SKU (or parts[0] if none had data),
-  // fire the 4 remaining queries: monthStart-first, weekStart-first,
-  // anchorAt, splice-first. Same SKU is used consistently across all
-  // queries so today's USD and the anchor USD live on the same price
-  // scale.
   const phase1: { todayByCandidate: (TiInventoryPoint | null)[] }[] = await Promise.all(
     subEntries.map(async ({ candidates }) => {
       const todayByCandidate = await Promise.all(
@@ -750,9 +721,8 @@ app.get('/api/ti/trend/series', async (c) => {
   const subResolutions: SubResolved[] = await Promise.all(
     subEntries.map(async ({ canonicalId, mapping, candidates }, idx) => {
       const { todayByCandidate } = phase1[idx]
-      // Pick the first candidate with a today row (preserves PART_MAP order).
       let pickedIdx = todayByCandidate.findIndex(p => p && p.priceUSD > 0)
-      if (pickedIdx === -1) pickedIdx = 0 // fallback: keep parts[0] for the receipt label
+      if (pickedIdx === -1) pickedIdx = 0
       const repPart = candidates[pickedIdx]
       const todayPoint = todayByCandidate[pickedIdx] ?? null
 
@@ -778,12 +748,6 @@ app.get('/api/ti/trend/series', async (c) => {
 
   const d1LookupMs = Date.now() - d1LookupStart
 
-  // ── Synchronous post-processing ─────────────────────────────────────────
-  // Build the live snapshot. Per-SKU preference:
-  //   1. Own captured TI inventory data (ti_inventory_price_snapshot)
-  //   2. /api/prices distributor mirror (only when no TI inventory row exists)
-  // The chosen source is recorded as `latestSource` for internal verification;
-  // the receipt UI never renders this field.
   const liveSnapshot = buildLiveSnapshot(pricesData, liveAsOf)
   const fallbackSubs: string[] = []
   for (const r of subResolutions) {
@@ -804,15 +768,10 @@ app.get('/api/ti/trend/series', async (c) => {
     }
   }
 
-  // Resolve the anchor cascade per subcategory. Per revised spec: NO Feb-27
-  // fallback for live rows. Subcategories without a resolvable anchor are
-  // intentionally absent from anchorSnapshot — their live cells render blank
-  // in the UI.
   const anchorSnapshot: AnchorSnapshot = {}
   for (const r of subResolutions) {
     let resolved: { anchorUSD: number; anchorDate: string; anchorLabel: 'TI capture' | 'Historical baseline' } | null = null
 
-    // Step 0 (MoM only): first own TI capture on/after start of current month.
     if (view === 'mom' && r.monthStartFirstPoint && r.monthStartFirstPoint.priceUSD > 0) {
       resolved = {
         anchorUSD: r.monthStartFirstPoint.priceUSD,
@@ -821,10 +780,6 @@ app.get('/api/ti/trend/series', async (c) => {
       }
     }
 
-    // Step 0 (WoW only): first own TI capture on/after start of current week.
-    // Mirrors the MoM Step 0 — anchors WTD on real captured data from this
-    // week rather than the prior Friday's close (which often falls back to
-    // a historical baseline pre-May).
     if (!resolved && view === 'wow' && r.weekStartFirstPoint && r.weekStartFirstPoint.priceUSD > 0) {
       resolved = {
         anchorUSD: r.weekStartFirstPoint.priceUSD,
@@ -833,7 +788,6 @@ app.get('/api/ti/trend/series', async (c) => {
       }
     }
 
-    // Step 1: own TI capture at-or-before the period anchor target.
     if (!resolved && r.anchorAtPoint && r.anchorAtPoint.priceUSD > 0) {
       resolved = {
         anchorUSD: r.anchorAtPoint.priceUSD,
@@ -842,9 +796,6 @@ app.get('/api/ti/trend/series', async (c) => {
       }
     }
 
-    // Step 2: historical baseline (series subs only). Convert the historical
-    // index at the period anchor to USD using a splice calibration:
-    //   anchorUSD = firstLiveUSD × (historicalAnchorIndex / historicalSpliceIndex)
     if (!resolved && r.mapping.kind === 'series') {
       const histAnchor = resolveHistoricalPoint(r.canonicalId, anchorTargetDate)
       if (histAnchor) {
@@ -872,12 +823,52 @@ app.get('/api/ti/trend/series', async (c) => {
       }
     }
 
-    // Step 3: no anchor — leave the entry absent. Live cell renders blank.
-
     if (resolved) anchorSnapshot[r.canonicalId] = resolved
   }
 
-  const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot)
+  return { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs }
+}
+
+// Resolve `pricesData` + `liveAsOf` from cache → KV → empty. Shared between
+// the request handler and snapshot writer so both see the same live data.
+async function resolveLivePricesContext(env: Bindings): Promise<{
+  pricesData: Record<string, any>
+  liveAsOf: string
+}> {
+  let pricesData: Record<string, any> = {}
+  let liveAsOf: string = new Date().toISOString().slice(0, 10)
+  try {
+    const cached = await caches.default.match(CACHE_KEY)
+    if (cached) {
+      const data: any = await cached.json()
+      pricesData = data._results ?? {}
+      if (data._cachedAt) liveAsOf = String(data._cachedAt).slice(0, 10)
+    }
+  } catch {}
+  if (Object.keys(pricesData).length === 0) {
+    const persisted = await readPersistedPriceSnapshot(env.SOURCE_SNAPSHOTS_KV)
+    if (persisted) {
+      pricesData = persisted.data ?? {}
+      if (persisted.fetchedAt) liveAsOf = String(persisted.fetchedAt).slice(0, 10)
+    }
+  }
+  return { pricesData, liveAsOf }
+}
+
+app.get('/api/ti/trend/series', async (c) => {
+  const serverStart = Date.now()
+  const rawView = (c.req.query('view') ?? 'qoq').toLowerCase()
+  const view: ViewKind = rawView === 'wow' || rawView === 'mom' ? rawView as ViewKind : 'qoq'
+
+  const { pricesData, liveAsOf } = await resolveLivePricesContext(c.env)
+
+  const [cascade, snapshotByPeriodCanonical] = await Promise.all([
+    resolveLiveCascade(c.env, view, liveAsOf, pricesData),
+    readSnapshotsByView(c.env.TI_INVENTORY_HISTORY_DB, view),
+  ])
+  const { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs } = cascade
+
+  const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot, snapshotByPeriodCanonical)
   // Internal/debug counts — used during verification, not shown in customer UI.
   const sourceCounts = { ti_inventory: 0, prices_fallback: 0 }
   for (const entry of Object.values(liveSnapshot)) {
@@ -910,6 +901,132 @@ app.get('/api/ti/trend/series', async (c) => {
       },
     },
   )
+})
+
+// Phase 26 — compute the live row's cascade output for a single view at
+// `periodEndDate` and persist it as the frozen snapshot for that period.
+// Runs the SAME cascade the live row uses, then derives one snapshot row
+// per subcategory that resolved to an anchor.
+//
+// Returns counts so the manual endpoint + cron can report what happened.
+async function computeAndPersistSnapshot(
+  env: Bindings,
+  view: ViewKind,
+  periodEndDate: string,
+): Promise<{
+  view: ViewKind
+  periodEndDate: string
+  rowsConsidered: number
+  rowsWritten: number
+  rowsSkippedNoAnchor: number
+  rowsSkippedNoLive: number
+  writeErrors: string[]
+  d1LookupMs: number
+}> {
+  // Use the live /api/prices payload from cache/KV so prices_fallback subs
+  // still resolve. The cascade prefers TI inventory captures over fallback,
+  // so passing today's pricesData for a historical liveAsOf is acceptable
+  // for the small set of subs that don't have own captures.
+  const { pricesData } = await resolveLivePricesContext(env)
+  const { liveSnapshot, anchorSnapshot, d1LookupMs } =
+    await resolveLiveCascade(env, view, periodEndDate, pricesData)
+
+  const now = new Date().toISOString()
+  const rowsToWrite: SnapshotRow[] = []
+  let rowsSkippedNoAnchor = 0
+  let rowsSkippedNoLive = 0
+  const allCanonicalIds = new Set<string>([
+    ...Object.keys(liveSnapshot),
+    ...Object.keys(anchorSnapshot),
+  ])
+  for (const canonicalId of allCanonicalIds) {
+    const live = liveSnapshot[canonicalId]
+    const anchor = anchorSnapshot[canonicalId]
+    if (!live || !(live.liveUSD > 0)) { rowsSkippedNoLive++; continue }
+    if (!anchor || !(anchor.anchorUSD > 0)) { rowsSkippedNoAnchor++; continue }
+    const pct = ((live.liveUSD - anchor.anchorUSD) / anchor.anchorUSD) * 100
+    rowsToWrite.push({
+      view,
+      periodEndDate,
+      canonicalId,
+      todayUSD: live.liveUSD,
+      todayDate: live.liveDate,
+      anchorUSD: anchor.anchorUSD,
+      anchorDate: anchor.anchorDate,
+      anchorLabel: anchor.anchorLabel,
+      pct,
+      representativePart: live.representativePartUsed ?? null,
+      latestSource: live.latestSource ?? null,
+      snapshottedAt: now,
+    })
+  }
+
+  const writeResult = await writeSnapshotsBatch(
+    env.TI_INVENTORY_HISTORY_DB,
+    rowsToWrite,
+  )
+  return {
+    view,
+    periodEndDate,
+    rowsConsidered: allCanonicalIds.size,
+    rowsWritten: writeResult.written,
+    rowsSkippedNoAnchor,
+    rowsSkippedNoLive,
+    writeErrors: writeResult.errors,
+    d1LookupMs,
+  }
+}
+
+// POST /api/ti/trend/snapshot-period — freeze the live row's values as the
+// historical snapshot for one or more periods. Gated by SNAPSHOT_CAPTURE_SECRET
+// (same shared secret used by /api/snapshots/capture and the other
+// GitHub-Actions-driven endpoints).
+//
+// Modes:
+//   • No body / `{}`            → auto-detect today's closing views (Friday
+//                                  → WoW; last-of-month → MoM; last-of-quarter
+//                                  → QoQ). Used by the daily GH Action.
+//   • `{ views: ['wow'], date: '2026-05-15' }` → snapshot specific period(s).
+//                                                Used for backfill or testing.
+app.post('/api/ti/trend/snapshot-period', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({ success: false, status: 'capture_secret_not_configured' })
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  const expected = (env.SNAPSHOT_CAPTURE_SECRET || '').trim()
+  if (!provided || !expected || provided !== expected) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  if (!env.TI_INVENTORY_HISTORY_DB) {
+    return c.json({ success: false, status: 'd1_not_configured' })
+  }
+
+  let body: { views?: ('wow' | 'mom' | 'qoq')[]; date?: string } = {}
+  try { body = await c.req.json() } catch {}
+
+  const todayUTC = new Date()
+  const todayISO = todayUTC.toISOString().slice(0, 10)
+  const dateISO = body.date ?? todayISO
+  const targetDate = new Date(`${dateISO}T00:00:00Z`)
+  const views: ('wow' | 'mom' | 'qoq')[] =
+    body.views && body.views.length > 0 ? body.views : viewsClosingOn(targetDate)
+
+  if (views.length === 0) {
+    return c.json({
+      success: true,
+      status: 'no_period_closing',
+      date: dateISO,
+      message: `No WoW/MoM/QoQ period closes on ${dateISO}; nothing to snapshot.`,
+      runs: [],
+    })
+  }
+
+  const runs = []
+  for (const view of views) {
+    runs.push(await computeAndPersistSnapshot(env, view, dateISO))
+  }
+  return c.json({ success: true, date: dateISO, runs })
 })
 
 // Reverse map for handler use only — canonical id → legacy id (for PART_MAP).
@@ -6750,6 +6867,23 @@ export default {
           cumulativeRowsInserted: (state.cumulativeRowsInserted || 0) + (record.rowsInsertedToHistory || 0),
         }
         await writeScheduledState(env.SOURCE_SNAPSHOTS_KV, next)
+      }
+
+      // Phase 26 — freeze closed-period WoW/MoM/QoQ rows. Fires only when
+      // today is a Friday (WoW), last-of-month (MoM), or last-of-quarter
+      // (QoQ). No-op on other days. Idempotent (INSERT OR REPLACE).
+      // GitHub Action POST /api/ti/trend/snapshot-period is the primary
+      // path; this Workers-style scheduled handler runs only if the
+      // operator wires a Pages dashboard cron trigger.
+      try {
+        const today = new Date(controller.scheduledTime || Date.now())
+        const closingViews = viewsClosingOn(today)
+        const dateISO = today.toISOString().slice(0, 10)
+        for (const view of closingViews) {
+          await computeAndPersistSnapshot(env, view, dateISO)
+        }
+      } catch {
+        // Snapshot failures must not crash the inventory capture leg.
       }
     }
     ctx.waitUntil(work())
