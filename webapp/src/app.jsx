@@ -84,6 +84,18 @@ const STATIC_LEGACY_TO_CANONICAL = {
   dc_hswap: 'dc_hotswap',
   dc_tps: 'dc_tps536xx_ai_power',
 };
+// All 28 canonical subcategory IDs, mirroring TI_TAXONOMY_FLAT in
+// src/data/tiTaxonomy.ts. Used to seed the subcategory-visibility filter.
+const ALL_CANONICAL_IDS = [
+  'power_ldo','power_acdc_switching','power_dcdc_switching','power_supervisor_reset','power_battery_mgmt',
+  'amp_opamps','amp_instrumentation','amp_audio',
+  'conv_adc','conv_dac',
+  'interface_can','interface_lin','interface_ethernet_phy',
+  'isolation_digital','isolation_reinforced',
+  'mcu_msp430','mcu_c2000','mcu_mspm0','mcu_simplelink','mcu_sitara',
+  'gan_lmg342x','gan_lmg3650','gan_lmg5200',
+  'dc_48v_bus','dc_smart_power_stages','dc_efuses','dc_hotswap','dc_tps536xx_ai_power',
+];
 const HIST = {
   "Jun-22":{pm_ldo:1.3,pm_acdc:0.5,pm_dcdc:0.5,pm_super:1.6,pm_batt:-1.4,amp_op:0.4,amp_instr:0.8,amp_audio:-0.1,dac_adc:0.0,dac_dac:0.1,if_can:0.8,if_lin:-0.4,if_eth:1.1,iso_dig:1.0,iso_rein:2.2,mcu_msp:1.3,mcu_c2k:2.7,mcu_m0:2.4,mcu_cc:1.7,mcu_sit:0.2,gan_342:3.0,gan_365:0.7,gan_520:-0.5,dc_48v:1.1,dc_sps:2.6,dc_efuse:1.7,dc_hswap:1.6,dc_tps:3.1},
   "Sep-22":{pm_ldo:-0.2,pm_acdc:-0.4,pm_dcdc:-0.4,pm_super:0.8,pm_batt:-0.9,amp_op:-0.4,amp_instr:-1.0,amp_audio:-1.0,dac_adc:-0.6,dac_dac:-0.6,if_can:-1.5,if_lin:-0.8,if_eth:-0.7,iso_dig:-0.1,iso_rein:-0.7,mcu_msp:1.4,mcu_c2k:1.4,mcu_m0:1.4,mcu_cc:3.5,mcu_sit:2.8,gan_342:0.1,gan_365:0.6,gan_520:-2.8,dc_48v:0.1,dc_sps:-2.4,dc_efuse:1.5,dc_hswap:-0.3,dc_tps:-0.3},
@@ -181,6 +193,27 @@ function writePersistedLiveData(snapshot) {
   if (typeof window === 'undefined') return;
   try {
     window.localStorage.setItem(LIVE_DATA_LS_KEY, JSON.stringify(snapshot));
+  } catch {}
+}
+
+// Persist user's hidden subcategories across page reloads. We store the set
+// of HIDDEN canonical ids (not visible) so the default state is "all
+// visible" with an empty set, and any new subcategory added to the
+// taxonomy later automatically defaults to visible without a migration.
+const HIDDEN_SUB_LS_KEY = 'tip-ti-trend-hidden-sub-v1';
+function readPersistedHiddenSub() {
+  if (typeof window === 'undefined') return new Set();
+  try {
+    const raw = window.localStorage.getItem(HIDDEN_SUB_LS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return new Set(Array.isArray(parsed) ? parsed : []);
+  } catch { return new Set(); }
+}
+function writePersistedHiddenSub(set) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(HIDDEN_SUB_LS_KEY, JSON.stringify([...set]));
   } catch {}
 }
 
@@ -2512,7 +2545,7 @@ function UniversePanel({ initialFilter, onClearFilter }) {
 // /api/ti/trend/series and render rows for every period the data covers.
 // The most recent row is the live to-date row (WTD / MTD / QTD), highlighted
 // in gold. Cells are colored green/red by % change vs prior period.
-function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }){
+function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited, fetchedAt, GC, CATS, B }){
   const [view, setView] = useState('qoq');     // 'wow' | 'mom' | 'qoq'
   const [data, setData] = useState(null);      // { columns, rows, liveAsOf }
   const [loading, setLoading] = useState(true);
@@ -2528,6 +2561,29 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
   // Shape: { subLabel, periodLabel, viewLive, breakdown, anchorXY:{top,left} }
   const [receipt, setReceipt] = useState(null);
   const receiptRef = useRef(null);
+
+  // Subcategory picker popover. Holds the group label of the currently-open
+  // popover (or null) plus the anchor rect captured at click time.
+  const [openPopover, setOpenPopover] = useState(null); // group label | null
+  const [popoverAnchor, setPopoverAnchor] = useState(null); // DOMRect
+  const popoverRef = useRef(null);
+
+  // Click-outside + Escape dismissal for the subcategory popover.
+  useEffect(() => {
+    if (!openPopover) return;
+    const onDocClick = (e) => {
+      if (popoverRef.current && popoverRef.current.contains(e.target)) return;
+      setOpenPopover(null);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') setOpenPopover(null); };
+    const t = setTimeout(() => document.addEventListener('click', onDocClick), 0);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('click', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [openPopover]);
 
   // Click-outside dismissal for the receipt popover.
   useEffect(() => {
@@ -2574,12 +2630,14 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
     return () => { alive = false; };
   }, [view]);
 
-  // Visible columns honoring the parent-group toggle (vis from parent App).
+  // Visible columns honoring both the parent-group toggle (vis) and the
+  // per-subcategory hide set (hiddenSub). A column shows iff its group is
+  // toggled on AND its canonicalId is not in hiddenSub.
   const visCanonical = useMemo(() => {
     if (!data) return [];
     const visGroupLabels = new Set([...vis]);
-    return data.columns.filter(c => visGroupLabels.has(c.groupLabel));
-  }, [data, vis]);
+    return data.columns.filter(c => visGroupLabels.has(c.groupLabel) && !hiddenSub.has(c.canonicalId));
+  }, [data, vis, hiddenSub]);
 
   // Group spans for the top header row.
   const grpSpans = useMemo(() => {
@@ -2643,15 +2701,94 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
         })}
       </div>
 
-      {/* ── Group toggles (mirror of legacy panel) ── */}
-      <div style={{display:'flex',gap:5,padding:'7px 16px',borderBottom:`1px solid ${B}`,flexWrap:'wrap',alignItems:'center',background:'#050810'}}>
+      {/* ── Group toggles with per-subcategory split-button picker ── */}
+      <div style={{display:'flex',gap:5,padding:'7px 16px',borderBottom:`1px solid ${B}`,flexWrap:'wrap',alignItems:'center',background:'#050810',position:'relative'}}>
         <span style={{fontSize:'0.57rem',color:'#2d4a6b',letterSpacing:'0.1em'}}>SHOW:</span>
-        {Object.keys(GC).map(g=>{const on=vis.has(g),c=GC[g];return(
-          <button key={g} onClick={()=>setVis(prev=>{const n=new Set(prev);n.has(g)?n.delete(g):n.add(g);return n;})} style={{background:on?c+'22':'none',border:`1px solid ${on?c:B}`,borderRadius:3,padding:'2px 8px',fontSize:'0.62rem',color:on?c:'#2d4a6b',cursor:'pointer',transition:'all 0.15s'}}>
-            {g} <span style={{opacity:.6,fontSize:'0.52rem'}}>({CATS.filter(x=>x.g===g).length})</span>
-          </button>);
+        {Object.keys(GC).map(g => {
+          const c = GC[g];
+          // Derive pill state from data.columns (NOT TI_TAXONOMY_FLAT) so
+          // counts reflect what the table can actually render.
+          const subsInGroup = data?.columns.filter(x => x.groupLabel === g) ?? [];
+          const total = subsInGroup.length || (CATS.filter(x => x.g === g).length);
+          const onCount = subsInGroup.filter(x => !hiddenSub.has(x.canonicalId)).length;
+          const groupOn = vis.has(g);
+          const state = !groupOn || onCount === 0 ? 'off' : onCount === total ? 'on' : 'partial';
+          const bg = state === 'on' ? c + '22'
+                   : state === 'partial' ? c + '11'
+                   : 'none';
+          const border = state === 'on' ? `1px solid ${c}`
+                       : state === 'partial' ? `1px dashed ${c}`
+                       : `1px solid ${B}`;
+          const textColor = state === 'off' ? '#2d4a6b'
+                          : state === 'partial' ? c + 'cc'
+                          : c;
+          const countText = state === 'partial' ? `(${onCount}/${total})` : `(${total})`;
+          const popOpen = openPopover === g;
+          return (
+            <span key={g} style={{display:'inline-flex',alignItems:'stretch',background:bg,border,borderRadius:3,transition:'all 0.15s'}}>
+              <button
+                onClick={() => {
+                  const subs = subsInGroup;
+                  if (state === 'on') {
+                    // Hide whole group: drop from vis AND mark all subs hidden.
+                    setVis(prev => { const n = new Set(prev); n.delete(g); return n; });
+                    setHiddenSub(prev => { const n = new Set(prev); subs.forEach(s => n.add(s.canonicalId)); return n; });
+                  } else {
+                    // Show all in group: add to vis AND clear all subs from hidden.
+                    setVis(prev => { const n = new Set(prev); n.add(g); return n; });
+                    setHiddenSub(prev => { const n = new Set(prev); subs.forEach(s => n.delete(s.canonicalId)); return n; });
+                  }
+                }}
+                style={{background:'none',border:'none',padding:'2px 4px 2px 8px',fontSize:'0.62rem',color:textColor,cursor:'pointer',fontFamily:'inherit'}}
+                title={state === 'on' ? `Hide ${g}` : `Show all of ${g}`}
+              >
+                {g} <span style={{opacity:.6,fontSize:'0.52rem'}}>{countText}</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (popOpen) { setOpenPopover(null); return; }
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setPopoverAnchor(rect);
+                  setOpenPopover(g);
+                }}
+                style={{
+                  background:'none',
+                  border:'none',
+                  borderLeft: popOpen ? `1px solid ${c}66` : '1px solid transparent',
+                  padding:'2px 6px 2px 4px',
+                  fontSize:'0.55rem',
+                  color:textColor,
+                  cursor:'pointer',
+                  display:'inline-flex',
+                  alignItems:'center',
+                  transition:'border-color 0.15s',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.borderLeft = `1px solid ${c}66`; }}
+                onMouseLeave={(e) => { if (!popOpen) e.currentTarget.style.borderLeft = '1px solid transparent'; }}
+                aria-label={`Pick subcategories for ${g}`}
+                aria-expanded={popOpen}
+                title={`Choose subcategories in ${g}`}
+              >▾</button>
+            </span>
+          );
         })}
       </div>
+
+      {openPopover && data && (
+        <SubcategoryPopover
+          group={openPopover}
+          color={GC[openPopover] || '#888'}
+          columns={data.columns.filter(c => c.groupLabel === openPopover)}
+          hiddenSub={hiddenSub}
+          setHiddenSub={setHiddenSub}
+          setVis={setVis}
+          onClose={() => setOpenPopover(null)}
+          anchorRect={popoverAnchor}
+          popoverRef={popoverRef}
+          B={B}
+        />
+      )}
 
       {/* ── Legend ── */}
       <div style={{display:'flex',gap:18,padding:'7px 16px',borderBottom:`1px solid #0d1520`,fontSize:'0.62rem',color:'#7a96b8',flexWrap:'wrap',background:'#050810',alignItems:'center'}}>
@@ -2769,6 +2906,146 @@ function TrendSeriesPanel({ vis, setVis, isRateLimited, fetchedAt, GC, CATS, B }
 }
 
 // Renders the math receipt: subcategory, period, two USD lines, formula.
+// Subcategory picker popover — opens when the ▾ caret on a category pill is
+// clicked. Lists every subcategory in the group with a checkbox; the user
+// can toggle individual subcategories, or use "Show all" / "Hide all" for
+// bulk control. Updates `hiddenSub`; also keeps `vis` in sync so that when
+// the last subcategory in a group is hidden, the parent pill flips off
+// (and vice-versa) — this keeps the legacy CSV-export path consistent.
+function SubcategoryPopover({ group, color, columns, hiddenSub, setHiddenSub, setVis, onClose, anchorRect, popoverRef, B }){
+  const [pos, setPos] = useState(null);
+  useEffect(() => {
+    if (!popoverRef.current || !anchorRect) return;
+    const rect = popoverRef.current.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const EDGE = 8;
+    let top = anchorRect.bottom + 6;
+    if (top + rect.height > vh - EDGE) {
+      // Not enough room below — flip above the pill.
+      top = Math.max(EDGE, anchorRect.top - rect.height - 6);
+    }
+    // Horizontally align the popover's right edge with the caret's right edge
+    // so it visually descends from the affordance the user just clicked.
+    let left = anchorRect.right - rect.width;
+    left = Math.max(EDGE, Math.min(left, vw - rect.width - EDGE));
+    setPos({ top, left });
+  }, [anchorRect, columns.length]);
+
+  const total = columns.length;
+  const onCount = columns.filter(c => !hiddenSub.has(c.canonicalId)).length;
+
+  const applyHidden = (nextHiddenSub) => {
+    setHiddenSub(nextHiddenSub);
+    // Keep vis in lockstep: if all subs in this group are now hidden, drop
+    // the group from vis; otherwise ensure it's in vis.
+    const allHidden = columns.every(c => nextHiddenSub.has(c.canonicalId));
+    setVis(prev => {
+      const n = new Set(prev);
+      if (allHidden) n.delete(group); else n.add(group);
+      return n;
+    });
+  };
+
+  const toggleOne = (canonicalId) => {
+    const n = new Set(hiddenSub);
+    if (n.has(canonicalId)) n.delete(canonicalId); else n.add(canonicalId);
+    applyHidden(n);
+  };
+  const showAll = () => {
+    const n = new Set(hiddenSub);
+    columns.forEach(c => n.delete(c.canonicalId));
+    applyHidden(n);
+  };
+  const hideAll = () => {
+    const n = new Set(hiddenSub);
+    columns.forEach(c => n.add(c.canonicalId));
+    applyHidden(n);
+  };
+
+  return (
+    <div
+      ref={popoverRef}
+      style={{
+        position: 'fixed',
+        top: pos?.top ?? -9999,
+        left: pos?.left ?? -9999,
+        visibility: pos ? 'visible' : 'hidden',
+        background: '#0c1220',
+        border: `1px solid ${B}`,
+        borderRadius: 6,
+        padding: '10px 0 6px 0',
+        fontFamily: 'inherit',
+        boxShadow: '0 6px 24px rgba(0,0,0,0.6)',
+        zIndex: 1000,
+        minWidth: 240,
+        maxWidth: 280,
+        maxHeight: 360,
+        overflowY: 'auto',
+      }}
+      role="dialog"
+      aria-label={`Subcategories in ${group}`}
+    >
+      <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',padding:'0 12px 8px 12px',borderBottom:`1px solid ${B}`,gap:8}}>
+        <div style={{minWidth:0,flex:1}}>
+          <div style={{fontSize:'0.7rem',fontWeight:'bold',color,letterSpacing:'0.02em',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{group}</div>
+          <div style={{fontSize:'0.55rem',color:'#7a96b8',marginTop:2}}>{onCount} of {total} shown</div>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:2,alignItems:'flex-end',flexShrink:0}}>
+          <button
+            onClick={(e) => { e.stopPropagation(); showAll(); }}
+            disabled={onCount === total}
+            style={{background:'none',border:'none',color: onCount === total ? '#3a4d65' : '#7a96b8',fontSize:'0.55rem',cursor: onCount === total ? 'default' : 'pointer',padding:'1px 0',fontFamily:'inherit'}}
+            onMouseEnter={(e) => { if (onCount !== total) e.currentTarget.style.color = color; }}
+            onMouseLeave={(e) => { if (onCount !== total) e.currentTarget.style.color = '#7a96b8'; }}
+          >Show all</button>
+          <button
+            onClick={(e) => { e.stopPropagation(); hideAll(); }}
+            disabled={onCount === 0}
+            style={{background:'none',border:'none',color: onCount === 0 ? '#3a4d65' : '#7a96b8',fontSize:'0.55rem',cursor: onCount === 0 ? 'default' : 'pointer',padding:'1px 0',fontFamily:'inherit'}}
+            onMouseEnter={(e) => { if (onCount !== 0) e.currentTarget.style.color = color; }}
+            onMouseLeave={(e) => { if (onCount !== 0) e.currentTarget.style.color = '#7a96b8'; }}
+          >Hide all</button>
+        </div>
+      </div>
+      <div style={{padding:'4px 0'}}>
+        {columns.map(c => {
+          const visible = !hiddenSub.has(c.canonicalId);
+          return (
+            <label
+              key={c.canonicalId}
+              onClick={(e) => e.stopPropagation()}
+              style={{display:'flex',alignItems:'center',gap:8,padding:'5px 12px',cursor:'pointer',fontSize:'0.65rem',color: visible ? '#c4d4e8' : '#7a96b8',transition:'background 0.1s'}}
+              onMouseEnter={(e) => { e.currentTarget.style.background = '#11192a'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+            >
+              <span style={{position:'relative',display:'inline-flex',alignItems:'center',justifyContent:'center',width:12,height:12,flexShrink:0}}>
+                <input
+                  type="checkbox"
+                  checked={visible}
+                  onChange={() => toggleOne(c.canonicalId)}
+                  style={{
+                    appearance:'none',
+                    WebkitAppearance:'none',
+                    width:12,
+                    height:12,
+                    border:`1px solid ${visible ? color : '#3a4d65'}`,
+                    background: visible ? color : 'transparent',
+                    borderRadius:2,
+                    cursor:'pointer',
+                    margin:0,
+                  }}
+                />
+                {visible && <span style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'0.7rem',color:'#050810',fontWeight:'bold',pointerEvents:'none',lineHeight:1}}>✓</span>}
+              </span>
+              <span style={{flex:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{c.label}</span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ReceiptPopover({ receipt, onClose, popoverRef, B }){
   const { subLabel, periodLabel, breakdown, anchorXY } = receipt;
   const fmtUSD = (v) => `$${Number(v).toFixed(4)}`;
@@ -2865,6 +3142,9 @@ function App(){
   const [src,setSrc]=useState(persistedSnapshot?.src || '');
   const [fetchCount,setFetchCount]=useState(persistedSnapshot?.fetchCount || null);
   const [vis,setVis]=useState(new Set(Object.keys(GC)));
+  // Per-subcategory hidden set (canonical IDs). Persisted across reloads.
+  const [hiddenSub,setHiddenSub]=useState(readPersistedHiddenSub);
+  useEffect(()=>{ writePersistedHiddenSub(hiddenSub); }, [hiddenSub]);
   const [tooltip,setTooltip]=useState(null);
   // Phase 24C.4 — tooltip position state (initially "below cursor", flipped
   // above when it would clip past the viewport bottom). Measured via a ref
@@ -3493,7 +3773,7 @@ function App(){
         })}
       </div>
 
-      {activeTab==='prices'&&<TrendSeriesPanel vis={vis} setVis={setVis} isRateLimited={isRateLimited} fetchedAt={fetchedAt} GC={GC} CATS={CATS} B={B} />}
+      {activeTab==='prices'&&<TrendSeriesPanel vis={vis} setVis={setVis} hiddenSub={hiddenSub} setHiddenSub={setHiddenSub} isRateLimited={isRateLimited} fetchedAt={fetchedAt} GC={GC} CATS={CATS} B={B} />}
       {false&&<>
       {/* ── Legacy panel (replaced by TrendSeriesPanel) ── */}
       <div style={{display:'none'}}>
