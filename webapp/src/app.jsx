@@ -3153,6 +3153,11 @@ function App(){
   // Per-subcategory hidden set (canonical IDs). Persisted across reloads.
   const [hiddenSub,setHiddenSub]=useState(readPersistedHiddenSub);
   useEffect(()=>{ writePersistedHiddenSub(hiddenSub); }, [hiddenSub]);
+  // UBS Compare — independent filter state. Ephemeral on purpose so the
+  // clone always starts with all groups + subcategories visible and never
+  // inherits the Prices tab's persisted localStorage hidden set.
+  const [ubsVis,setUbsVis]=useState(new Set(Object.keys(GC)));
+  const [ubsHiddenSub,setUbsHiddenSub]=useState(new Set());
   const [tooltip,setTooltip]=useState(null);
   // Phase 24C.4 — tooltip position state (initially "below cursor", flipped
   // above when it would clip past the viewport bottom). Measured via a ref
@@ -3815,6 +3820,7 @@ function App(){
           {id:'inventory', label:'Supply'},
           {id:'universe', label:'Universe'},
           {id:'insights', label:'Insights'},
+          {id:'ubs', label:'UBS Compare'},
         ].map(t=>{
           const on=activeTab===t.id;
           return(
@@ -3839,6 +3845,17 @@ function App(){
       </div>
 
       {activeTab==='prices'&&<TrendSeriesPanel vis={vis} setVis={setVis} hiddenSub={hiddenSub} setHiddenSub={setHiddenSub} isRateLimited={isRateLimited} fetchedAt={fetchedAt} GC={GC} CATS={CATS} B={B} />}
+      {activeTab==='ubs'&&(
+        <div className="ubs-compare-scope">
+          <TrendSeriesPanel
+            vis={ubsVis} setVis={setUbsVis}
+            hiddenSub={ubsHiddenSub} setHiddenSub={setUbsHiddenSub}
+            isRateLimited={isRateLimited}
+            fetchedAt={fetchedAt}
+            GC={GC} CATS={CATS} B={B}
+          />
+        </div>
+      )}
       {false&&<>
       {/* ── Legacy panel (replaced by TrendSeriesPanel) ── */}
       <div style={{display:'none'}}>

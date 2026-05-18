@@ -28,6 +28,19 @@
     .toast-bar{position:absolute;bottom:0;left:0;height:2px;border-radius:0 0 8px 8px}
     .progress-bar-outer{background:#0d1520;border-radius:4px;height:4px;overflow:hidden;margin-top:6px}
     .progress-bar-inner{height:100%;border-radius:4px;transition:width 0.4s ease;background:linear-gradient(90deg,#1565c0,#3d8ef0)}
+    /* ── UBS Compare clone — temporary scoped light theme for verification.
+       Nukes dark backgrounds/borders and forces a default dark text color,
+       then allow-lists the four semantic price-change colors used by
+       pctColor() / fmt() so green/red cell coloring survives on white. */
+    .ubs-compare-scope, .ubs-compare-scope *{background-color:#ffffff !important;background-image:none !important;border-color:#c8c8c8 !important;box-shadow:none !important;color:#1a1a1a !important}
+    .ubs-compare-scope button{background-color:#f3f4f6 !important}
+    /* Browsers serialize inline style="color:#xxx" → "color: rgb(r, g, b)" on
+       the element's style attribute, so the attribute selector must match the
+       rgb() form. Both hex and rgb forms are listed for safety. */
+    .ubs-compare-scope [style*="rgb(77, 255, 195)"],.ubs-compare-scope [style*="color:#4dffc3"],.ubs-compare-scope [style*="color: #4dffc3"]{color:#006b44 !important}
+    .ubs-compare-scope [style*="rgb(0, 201, 167)"],.ubs-compare-scope [style*="color:#00c9a7"],.ubs-compare-scope [style*="color: #00c9a7"]{color:#008060 !important}
+    .ubs-compare-scope [style*="rgb(255, 117, 117)"],.ubs-compare-scope [style*="color:#ff7575"],.ubs-compare-scope [style*="color: #ff7575"]{color:#a00018 !important}
+    .ubs-compare-scope [style*="rgb(240, 92, 92)"],.ubs-compare-scope [style*="color:#f05c5c"],.ubs-compare-scope [style*="color: #f05c5c"]{color:#c8231a !important}
   </style>
 </head>
 <body>
