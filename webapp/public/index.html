@@ -41,6 +41,19 @@
     .ubs-compare-scope [style*="rgb(0, 201, 167)"],.ubs-compare-scope [style*="color:#00c9a7"],.ubs-compare-scope [style*="color: #00c9a7"]{color:#008060 !important}
     .ubs-compare-scope [style*="rgb(255, 117, 117)"],.ubs-compare-scope [style*="color:#ff7575"],.ubs-compare-scope [style*="color: #ff7575"]{color:#a00018 !important}
     .ubs-compare-scope [style*="rgb(240, 92, 92)"],.ubs-compare-scope [style*="color:#f05c5c"],.ubs-compare-scope [style*="color: #f05c5c"]{color:#c8231a !important}
+    /* UBS Compare — preserve parent-group accent colors on the SHOW pills and
+       the active WoW/MoM/QoQ sub-tab. Selectors match only the rgba tinted
+       backgrounds and "color: rgb(...)" text fragments, so cell borders /
+       cell text are not affected. */
+    .ubs-compare-scope [style*="rgba(61, 142, 240, 0.133)"]{background-color:rgba(61, 142, 240, 0.14) !important;border-color:#2563eb !important}
+    .ubs-compare-scope [style*="rgba(0, 201, 167, 0.133)"]{background-color:rgba(0, 201, 167, 0.14) !important;border-color:#008060 !important}
+    .ubs-compare-scope [style*="rgba(240, 168, 78, 0.133)"]{background-color:rgba(240, 168, 78, 0.20) !important;border-color:#c2410c !important}
+    .ubs-compare-scope [style*="rgba(106, 240, 212, 0.133)"]{background-color:rgba(106, 240, 212, 0.25) !important;border-color:#0d9488 !important}
+    .ubs-compare-scope [style*="color: rgb(61, 142, 240)"]{color:#1d4ed8 !important}
+    .ubs-compare-scope [style*="color: rgb(240, 168, 78)"]{color:#b45309 !important}
+    .ubs-compare-scope [style*="color: rgb(106, 240, 212)"]{color:#0d9488 !important}
+    .ubs-compare-scope [style*="rgb(10, 18, 32)"]{background-color:rgba(61, 142, 240, 0.10) !important}
+    .ubs-compare-scope [style*="border-bottom: 2px solid rgb(61, 142, 240)"]{border-bottom-color:#2563eb !important}
   </style>
 </head>
 <body>
