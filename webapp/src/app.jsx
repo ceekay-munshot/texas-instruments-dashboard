@@ -3410,11 +3410,20 @@ function App(){
   const [hiddenSub,setHiddenSub]=useState(readPersistedHiddenSub);
   useEffect(()=>{ writePersistedHiddenSub(hiddenSub); }, [hiddenSub]);
   // UBS Compare — independent filter state. Ephemeral on purpose so the
-  // clone always starts with all groups + subcategories visible and never
+  // clone always starts with the default visibility set below and never
   // inherits the Prices tab's persisted localStorage hidden set. The default
-  // visible set is keyed by UBS_GC (4 UBS parents), not GC (8 TI groups).
+  // visible group set is keyed by UBS_GC (4 UBS parents), not GC (8 TI groups).
+  // The default hidden-sub set hides the three columns that don't yet have
+  // enough capture history to be informative on first load (Comparators is
+  // newly added, Other and 8-bit have no TI source). Users can reveal them
+  // via the subcategory popover; once we accumulate enough Comparators
+  // capture data, remove its id from the default set.
   const [ubsVis,setUbsVis]=useState(new Set(Object.keys(UBS_GC)));
-  const [ubsHiddenSub,setUbsHiddenSub]=useState(new Set());
+  const [ubsHiddenSub,setUbsHiddenSub]=useState(new Set([
+    'ubs_amp_comparators',
+    'ubs_conv_other',
+    'ubs_mcu_8bit',
+  ]));
   const [tooltip,setTooltip]=useState(null);
   // Phase 24C.4 — tooltip position state (initially "below cursor", flipped
   // above when it would clip past the viewport bottom). Measured via a ref
