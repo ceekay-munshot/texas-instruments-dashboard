@@ -2539,15 +2539,108 @@ function UniversePanel({ initialFilter, onClearFilter }) {
   );
 }
 
+// ── UBS Evidence Lab category mapping ──────────────────────────────────────
+// Used by the UBS Compare tab to reshape the /api/ti/trend/series response
+// from TI's 28-subcategory taxonomy into UBS's 13-leaf format. Pure data
+// transform — no UI logic, no backend change. Passed to TrendSeriesPanel via
+// the optional `dataTransform` prop; the Prices tab passes nothing and stays
+// identity. Aggregated buckets use a simple mean of valid source pcts; 1:1
+// buckets pass the source cell through verbatim so single-source receipts
+// still work. Empty-source buckets render as permanent dashes.
+const UBS_GC = {
+  'Amplifiers': '#3d8ef0',
+  'Data Converters': '#00c9a7',
+  'Power Management Chips': '#f0a84e',
+  'Microcontrollers': '#6af0d4',
+};
+
+const UBS_GROUPS = [
+  { groupLabel: 'Amplifiers', subs: [
+    { canonicalId: 'ubs_amp_audio',       label: 'Audio',       sources: ['amp_audio'] },
+    { canonicalId: 'ubs_amp_comparators', label: 'Comparators', sources: [] },
+    { canonicalId: 'ubs_amp_operational', label: 'Operational', sources: ['amp_opamps'] },
+  ]},
+  { groupLabel: 'Data Converters', subs: [
+    { canonicalId: 'ubs_conv_adc',   label: 'ADC',   sources: ['conv_adc'] },
+    { canonicalId: 'ubs_conv_dac',   label: 'DAC',   sources: ['conv_dac'] },
+    { canonicalId: 'ubs_conv_other', label: 'Other', sources: [] },
+  ]},
+  { groupLabel: 'Power Management Chips', subs: [
+    { canonicalId: 'ubs_power_linear',    label: 'Linear Voltage Regulators',    sources: ['power_ldo'] },
+    { canonicalId: 'ubs_power_switching', label: 'Switching Voltage Regulators', sources: ['power_acdc_switching', 'power_dcdc_switching'] },
+    { canonicalId: 'ubs_power_other',     label: 'Other Power Management Circuits', sources: [
+      'power_supervisor_reset',
+      'power_battery_mgmt',
+      'dc_48v_bus',
+      'dc_smart_power_stages',
+      'dc_efuses',
+      'dc_hotswap',
+      'dc_tps536xx_ai_power',
+    ]},
+  ]},
+  { groupLabel: 'Microcontrollers', subs: [
+    { canonicalId: 'ubs_mcu_16bit', label: '16 bit General Purpose', sources: ['mcu_msp430'] },
+    { canonicalId: 'ubs_mcu_32bit', label: '32 bit General Purpose', sources: ['mcu_c2000', 'mcu_mspm0', 'mcu_simplelink'] },
+    { canonicalId: 'ubs_mcu_8bit',  label: '8 bit General Purpose',  sources: [] },
+    { canonicalId: 'ubs_mcu_other', label: 'Other Microcontrollers', sources: ['mcu_sitara'] },
+  ]},
+];
+
+// CATS-shaped fallback used by TrendSeriesPanel's pill-count path before
+// /api/ti/trend/series resolves. Once data loads, the panel prefers
+// data.columns and this only affects the first paint.
+const UBS_CATS = UBS_GROUPS.flatMap(g => g.subs.map(s => ({
+  id: s.canonicalId, g: g.groupLabel, l: s.label,
+})));
+
+function tiSeriesToUbs(data) {
+  if (!data) return data;
+  const columns = UBS_GROUPS.flatMap(g => g.subs.map(s => ({
+    canonicalId: s.canonicalId,
+    label: s.label,
+    groupId: 'ubs_' + g.groupLabel.toLowerCase().replace(/\s+/g, '_'),
+    groupLabel: g.groupLabel,
+  })));
+  const subToSources = new Map();
+  UBS_GROUPS.forEach(g => g.subs.forEach(s => subToSources.set(s.canonicalId, s.sources)));
+  const rows = data.rows.map(r => {
+    const cells = {};
+    for (const col of columns) {
+      const sources = subToSources.get(col.canonicalId) || [];
+      if (sources.length === 0) { cells[col.canonicalId] = { index: null, pct: null }; continue; }
+      if (sources.length === 1) {
+        const src = r.cells[sources[0]];
+        if (!src) { cells[col.canonicalId] = { index: null, pct: null }; }
+        else {
+          cells[col.canonicalId] = src.breakdown
+            ? { index: src.index ?? null, pct: src.pct ?? null, breakdown: src.breakdown }
+            : { index: src.index ?? null, pct: src.pct ?? null };
+        }
+        continue;
+      }
+      // Multi-source aggregate: simple mean of valid pcts; no breakdown yet.
+      const pcts = sources.map(s => r.cells[s]?.pct).filter(p => p != null && isFinite(p));
+      cells[col.canonicalId] = pcts.length === 0
+        ? { index: null, pct: null }
+        : { index: null, pct: pcts.reduce((a, b) => a + b, 0) / pcts.length };
+    }
+    return { ...r, cells };
+  });
+  return { ...data, columns, rows };
+}
+
 // ── TrendSeriesPanel — UBS-format 28-column WoW/MoM/QoQ price-movement table ─
 //
 // Replaces the legacy Prices table. Three sub-tabs (WoW / MoM / QoQ) hit
 // /api/ti/trend/series and render rows for every period the data covers.
 // The most recent row is the live to-date row (WTD / MTD / QTD), highlighted
 // in gold. Cells are colored green/red by % change vs prior period.
-function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited, fetchedAt, GC, CATS, B }){
+function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited, fetchedAt, GC, CATS, B, dataTransform }){
   const [view, setView] = useState('qoq');     // 'wow' | 'mom' | 'qoq'
-  const [data, setData] = useState(null);      // { columns, rows, liveAsOf }
+  // Cached raw payload from /api/ti/trend/series. The downstream `data` value
+  // applied to the table is derived via useMemo: identity for the Prices tab
+  // (no dataTransform prop), reshaped by tiSeriesToUbs for UBS Compare.
+  const [rawData, setRawData] = useState(null); // { columns, rows, liveAsOf }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   // Per-view cache. Keyed by 'wow' | 'mom' | 'qoq'. When the user switches
@@ -2605,7 +2698,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
     const isFresh = cached && (now - cached.fetchedAt) < CACHE_FRESH_MS;
     if (cached) {
       // Render cached data immediately — no spinner flash on tab switch.
-      setData(cached.data);
+      setRawData(cached.data);
       setError(null);
       setLoading(false);
       if (isFresh) return; // Skip refetch entirely when cache is fresh.
@@ -2618,7 +2711,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
       .then(j => {
         if (!alive) return;
         cacheRef.current[view] = { data: j, fetchedAt: Date.now() };
-        setData(j);
+        setRawData(j);
         setLoading(false);
       })
       .catch(e => {
@@ -2629,6 +2722,13 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
       });
     return () => { alive = false; };
   }, [view]);
+
+  // Apply the optional dataTransform prop (used by UBS Compare to reshape
+  // TI columns/cells into UBS taxonomy). Prices passes no transform → identity.
+  const data = useMemo(() => {
+    if (!rawData) return null;
+    return dataTransform ? dataTransform(rawData) : rawData;
+  }, [rawData, dataTransform]);
 
   // Visible columns honoring both the parent-group toggle (vis) and the
   // per-subcategory hide set (hiddenSub). A column shows iff its group is
@@ -2854,7 +2954,13 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                     const pct = cell?.pct;
                     const hasBreakdown = !!cell?.breakdown;
                     const isLiveCell = live && hasBreakdown;
-                    const isLiveBlank = live && !hasBreakdown;
+                    // "Blank" means the live cell has no value to show, not
+                    // merely no breakdown. UBS Compare's aggregated buckets
+                    // intentionally carry a pct without a breakdown — they
+                    // must render the value (no click). For TI/Prices, pct
+                    // and breakdown are always set/unset together on live
+                    // rows, so this is a no-op there.
+                    const isLiveBlank = live && (cell?.pct == null);
                     // Closed (historical) rows with a snapshotted breakdown are
                     // also clickable — they show the same receipt as the live
                     // row but with frozen values from the moment of close.
@@ -3155,8 +3261,9 @@ function App(){
   useEffect(()=>{ writePersistedHiddenSub(hiddenSub); }, [hiddenSub]);
   // UBS Compare — independent filter state. Ephemeral on purpose so the
   // clone always starts with all groups + subcategories visible and never
-  // inherits the Prices tab's persisted localStorage hidden set.
-  const [ubsVis,setUbsVis]=useState(new Set(Object.keys(GC)));
+  // inherits the Prices tab's persisted localStorage hidden set. The default
+  // visible set is keyed by UBS_GC (4 UBS parents), not GC (8 TI groups).
+  const [ubsVis,setUbsVis]=useState(new Set(Object.keys(UBS_GC)));
   const [ubsHiddenSub,setUbsHiddenSub]=useState(new Set());
   const [tooltip,setTooltip]=useState(null);
   // Phase 24C.4 — tooltip position state (initially "below cursor", flipped
@@ -3852,7 +3959,8 @@ function App(){
             hiddenSub={ubsHiddenSub} setHiddenSub={setUbsHiddenSub}
             isRateLimited={isRateLimited}
             fetchedAt={fetchedAt}
-            GC={GC} CATS={CATS} B={B}
+            GC={UBS_GC} CATS={UBS_CATS} B={B}
+            dataTransform={tiSeriesToUbs}
           />
         </div>
       )}
