@@ -2557,7 +2557,8 @@ const UBS_GC = {
 const UBS_GROUPS = [
   { groupLabel: 'Amplifiers', subs: [
     { canonicalId: 'ubs_amp_audio',       label: 'Audio',       sources: ['amp_audio'] },
-    { canonicalId: 'ubs_amp_comparators', label: 'Comparators', sources: ['amp_comparators'] },
+    { canonicalId: 'ubs_amp_comparators', label: 'Comparators', sources: ['amp_comparators'],
+      description: "TI's standalone comparator line — LM393/LM2903 family (anchor-only basket; no long historical series yet)." },
     { canonicalId: 'ubs_amp_operational', label: 'Operational', sources: ['amp_opamps'] },
   ]},
   { groupLabel: 'Data Converters', subs: [
@@ -2566,7 +2567,8 @@ const UBS_GROUPS = [
     { canonicalId: 'ubs_conv_other', label: 'Other', sources: [] },
   ]},
   { groupLabel: 'Power Management Chips', subs: [
-    { canonicalId: 'ubs_power_linear',    label: 'Linear Voltage Regulators',    sources: ['power_ldo'] },
+    { canonicalId: 'ubs_power_linear',    label: 'Linear Voltage Regulators',    sources: ['power_ldo'],
+      description: "TI's LDO (low-dropout) linear regulators." },
     { canonicalId: 'ubs_power_switching', label: 'Switching Voltage Regulators', sources: ['power_acdc_switching', 'power_dcdc_switching'] },
     { canonicalId: 'ubs_power_other',     label: 'Other Power Management Circuits', sources: [
       'power_supervisor_reset',
@@ -2579,12 +2581,22 @@ const UBS_GROUPS = [
     ]},
   ]},
   { groupLabel: 'Microcontrollers', subs: [
-    { canonicalId: 'ubs_mcu_16bit', label: '16 bit General Purpose', sources: ['mcu_msp430'] },
+    { canonicalId: 'ubs_mcu_16bit', label: '16 bit General Purpose', sources: ['mcu_msp430'],
+      description: "TI's MSP430 family — TI's only 16-bit MCU line." },
     { canonicalId: 'ubs_mcu_32bit', label: '32 bit General Purpose', sources: ['mcu_c2000', 'mcu_mspm0', 'mcu_simplelink'] },
     { canonicalId: 'ubs_mcu_8bit',  label: '8 bit General Purpose',  sources: [] },
-    { canonicalId: 'ubs_mcu_other', label: 'Other Microcontrollers', sources: ['mcu_sitara'] },
+    { canonicalId: 'ubs_mcu_other', label: 'Other Microcontrollers', sources: ['mcu_sitara'],
+      description: "TI's Sitara MPU line — ARM Cortex-A application processors (AM335x, AM437x, AM57x, AM62x, AM64x, AM65x). UBS bins these under MCU → Other because they're MPUs, not 8/16/32-bit general-purpose MCUs. Tracked daily on Mouser via AM3352BZCZD80 and AM3359BZCZD80." },
   ]},
 ];
+
+// canonicalId → description, used by the receipt popovers in the UBS Compare
+// tab so a click on a bucket explains which TI products feed it.
+const UBS_LEAF_DESCRIPTION = new Map(
+  UBS_GROUPS.flatMap(g => g.subs)
+    .filter(s => s.description)
+    .map(s => [s.canonicalId, s.description])
+);
 
 // CATS-shaped fallback used by TrendSeriesPanel's pill-count path before
 // /api/ti/trend/series resolves. Once data loads, the panel prefers
@@ -3366,9 +3378,11 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                       ? (e) => {
                           e.stopPropagation();
                           const rect = e.currentTarget.getBoundingClientRect();
+                          const description = UBS_LEAF_DESCRIPTION.get(c.canonicalId);
                           setReceipt({
                             subLabel: c.label,
                             periodLabel: r.label,
+                            ...(description ? { description } : {}),
                             ...(hasComposite ? { composite: cell.composite } : { breakdown: cell.breakdown }),
                             anchorXY: { x: rect.left + rect.width / 2, y: rect.bottom },
                           });
@@ -3552,7 +3566,7 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
   if (receipt.composite) {
     return <CompositeReceiptPopover receipt={receipt} onClose={onClose} popoverRef={popoverRef} B={B} />;
   }
-  const { subLabel, periodLabel, breakdown, anchorXY } = receipt;
+  const { subLabel, periodLabel, breakdown, anchorXY, description } = receipt;
   const fmtUSD = (v) => `$${Number(v).toFixed(4)}`;
   const today = breakdown.todayUSD;
   const anchor = breakdown.anchorUSD;
@@ -3612,7 +3626,12 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
       }} aria-label="close">×</button>
 
       <div style={{fontSize:'0.85rem',fontWeight:'bold',color:'#3d8ef0',marginBottom:2}}>{subLabel}</div>
-      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom:12,letterSpacing:'0.04em'}}>{periodLabel}</div>
+      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom: description ? 8 : 12,letterSpacing:'0.04em'}}>{periodLabel}</div>
+      {description && (
+        <div style={{fontSize:'0.65rem',color:'#7a96b8',marginBottom:12,lineHeight:1.5,fontStyle:'italic',paddingBottom:10,borderBottom:`1px solid ${B}`}}>
+          {description}
+        </div>
+      )}
 
       <div style={{display:'grid',gridTemplateColumns:'auto auto',rowGap:6,columnGap:18,marginBottom:12}}>
         <div style={{color:'#7a96b8'}}>{breakdown.todayLabel} ({fmtDate(breakdown.todayDate)})</div>
@@ -3640,7 +3659,7 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
 // Shares the same popover chrome (background, border, position math,
 // dismiss-on-click-outside via popoverRef) as ReceiptPopover.
 function CompositeReceiptPopover({ receipt, onClose, popoverRef, B }){
-  const { subLabel, periodLabel, composite, anchorXY } = receipt;
+  const { subLabel, periodLabel, composite, anchorXY, description } = receipt;
   const { items, mean } = composite;
   const validCount = items.filter(it => it.pct != null && isFinite(it.pct)).length;
 
@@ -3687,7 +3706,12 @@ function CompositeReceiptPopover({ receipt, onClose, popoverRef, B }){
       }} aria-label="close">×</button>
 
       <div style={{fontSize:'0.85rem',fontWeight:'bold',color:'#3d8ef0',marginBottom:2}}>{subLabel}</div>
-      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom:10,letterSpacing:'0.04em'}}>{periodLabel}</div>
+      <div style={{fontSize:'0.62rem',color:'#7a96b8',marginBottom: description ? 8 : 10,letterSpacing:'0.04em'}}>{periodLabel}</div>
+      {description && (
+        <div style={{fontSize:'0.65rem',color:'#7a96b8',marginBottom:10,lineHeight:1.5,fontStyle:'italic',paddingBottom:8,borderBottom:`1px solid ${B}`}}>
+          {description}
+        </div>
+      )}
 
       <div style={{display:'grid',gridTemplateColumns:'auto auto',rowGap:4,columnGap:18,marginBottom:10}}>
         {items.map((it, i) => (
@@ -4188,7 +4212,7 @@ function App(){
         XLSX.utils.book_append_sheet(wb, ws, `UBS · ${v.short}`);
       });
 
-      const filename = `ti_prices_${new Date().toISOString().slice(0,10)}.xlsx`;
+      const filename = `Ti_Prices_MunshotAI_${new Date().toISOString().slice(0,10)}.xlsx`;
       if (fflate) {
         // Post-patch the zip to add freeze panes (xlsx-js-style strips them).
         const patched = xlsxApplyFreezePanes(XLSX, fflate, wb);
