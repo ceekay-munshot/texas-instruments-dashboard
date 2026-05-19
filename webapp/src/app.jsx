@@ -2671,6 +2671,320 @@ function averageVisiblePct(row, visCanonical) {
   return pcts.reduce((a, b) => a + b, 0) / pcts.length;
 }
 
+// ─── XLSX export style helpers (Phase 27) ───────────────────────────────
+// Module-scope so cell-style objects can be shared by reference across
+// many cells without bloating the workbook. xlsx-js-style takes raw hex
+// (no '#' prefix) on every color.
+const XLSX_PALETTE = {
+  darkBg:'080C14', panelBg:'0D1422', period:'1A2740',
+  border:'2D4A6B', live:'3D2A00', banded:'0A0F1A',
+  white:'E8F1FF', muted:'7A96B8', text:'D6E1F0', gold:'FFD700',
+  amp:'3D8EF0', dac:'00C9A7', pwr:'F0A84E', mcu:'6AF0D4',
+};
+const XLSX_NUM_FMT = '[Green]+0.00"%";[Red]\\-0.00"%";0.00"%"';
+const XLSX_FONT_BODY = 'Consolas';
+const XLSX_FONT_TITLE = 'Calibri';
+const UBS_BANNER_FILLS = {
+  'Amplifiers':             XLSX_PALETTE.amp,
+  'Data Converters':        XLSX_PALETTE.dac,
+  'Power Management Chips': XLSX_PALETTE.pwr,
+  'Microcontrollers':       XLSX_PALETTE.mcu,
+};
+function xlsxBorder(rgb){
+  return {
+    top:    { style:'thin', color:{ rgb } },
+    bottom: { style:'thin', color:{ rgb } },
+    left:   { style:'thin', color:{ rgb } },
+    right:  { style:'thin', color:{ rgb } },
+  };
+}
+const _XLSX_BORDER = xlsxBorder(XLSX_PALETTE.border);
+const XLSX_STYLES = {
+  titleBanner: {
+    font:      { name: XLSX_FONT_TITLE, sz: 16, bold: true, color: { rgb: XLSX_PALETTE.white } },
+    fill:      { fgColor: { rgb: XLSX_PALETTE.amp } },
+    alignment: { horizontal: 'left', vertical: 'center' },
+  },
+  sectionHeader: {
+    font:      { name: XLSX_FONT_TITLE, sz: 11, bold: true, color: { rgb: XLSX_PALETTE.gold } },
+    alignment: { horizontal: 'left', vertical: 'center' },
+  },
+  metaLabel: {
+    font:      { name: XLSX_FONT_BODY, sz: 10, bold: true, color: { rgb: XLSX_PALETTE.muted } },
+    alignment: { horizontal: 'left', vertical: 'center' },
+  },
+  metaValue: {
+    font:      { name: XLSX_FONT_BODY, sz: 10, color: { rgb: XLSX_PALETTE.text } },
+    alignment: { horizontal: 'left', vertical: 'center' },
+  },
+  header: {
+    font:      { name: XLSX_FONT_BODY, sz: 10, bold: true, color: { rgb: XLSX_PALETTE.white } },
+    fill:      { fgColor: { rgb: XLSX_PALETTE.panelBg } },
+    alignment: { horizontal: 'center', vertical: 'center' },
+    border:    _XLSX_BORDER,
+  },
+  period: {
+    font:      { name: XLSX_FONT_BODY, sz: 10, bold: true, color: { rgb: XLSX_PALETTE.white } },
+    fill:      { fgColor: { rgb: XLSX_PALETTE.period } },
+    alignment: { horizontal: 'left',   vertical: 'center' },
+    border:    _XLSX_BORDER,
+  },
+  periodLive: {
+    font:      { name: XLSX_FONT_BODY, sz: 10, bold: true, color: { rgb: XLSX_PALETTE.gold } },
+    fill:      { fgColor: { rgb: XLSX_PALETTE.live } },
+    alignment: { horizontal: 'left',   vertical: 'center' },
+    border:    _XLSX_BORDER,
+  },
+};
+// Memoize banner / data / empty styles so identical cells share a single
+// object reference — keeps the workbook small (xlsx-js-style serializes
+// per-cell, so 2.5k unique style objects inflate the file ~50×).
+const _xlsxBannerCache = {};
+function xlsxGroupBannerStyle(fillRgb){
+  if (_xlsxBannerCache[fillRgb]) return _xlsxBannerCache[fillRgb];
+  return _xlsxBannerCache[fillRgb] = {
+    font:      { name: XLSX_FONT_TITLE, sz: 11, bold: true, color: { rgb: '04140F' } },
+    fill:      { fgColor: { rgb: fillRgb } },
+    alignment: { horizontal: 'center', vertical: 'center' },
+    border:    xlsxBorder(fillRgb),
+  };
+}
+const _xlsxDataCache = {};
+function xlsxDataCellStyle({ banded, isLive, bold }){
+  const key = `${banded?1:0}|${isLive?1:0}|${bold?1:0}`;
+  if (_xlsxDataCache[key]) return _xlsxDataCache[key];
+  const fillRgb = isLive ? XLSX_PALETTE.live : (banded ? XLSX_PALETTE.banded : XLSX_PALETTE.darkBg);
+  return _xlsxDataCache[key] = {
+    font:      { name: XLSX_FONT_BODY, sz: 10, bold: !!(isLive || bold), color: { rgb: XLSX_PALETTE.white } },
+    fill:      { fgColor: { rgb: fillRgb } },
+    alignment: { horizontal: 'right', vertical: 'center' },
+    border:    _XLSX_BORDER,
+    numFmt:    XLSX_NUM_FMT,
+  };
+}
+const _xlsxEmptyCache = {};
+function xlsxEmptyCellStyle({ banded, isLive }){
+  const key = `${banded?1:0}|${isLive?1:0}`;
+  if (_xlsxEmptyCache[key]) return _xlsxEmptyCache[key];
+  const fillRgb = isLive ? XLSX_PALETTE.live : (banded ? XLSX_PALETTE.banded : XLSX_PALETTE.darkBg);
+  return _xlsxEmptyCache[key] = {
+    fill:   { fgColor: { rgb: fillRgb } },
+    border: _XLSX_BORDER,
+  };
+}
+function xlsxFmtPctText(v){
+  if (v == null || !isFinite(v)) return '—';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toFixed(2)}%`;
+}
+
+// Builds a single styled WoW/MoM/QoQ trend sheet. Pass isUbs=true to emit
+// the two-row header (group banner + leaf labels), an Average column on
+// the right, and composite-cell hover comments listing the TI sources
+// each UBS bucket aggregates.
+function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs }){
+  const merges = [];
+  const headerRowCount = isUbs ? 2 : 1;
+  // ── Row 0: group banner (UBS only) ──
+  const bannerRow = isUbs ? [''] : null;
+  if (isUbs) {
+    let col = 1;
+    UBS_GROUPS.forEach(g => {
+      const groupCols = columns.filter(c => c.groupLabel === g.groupLabel);
+      if (groupCols.length === 0) return;
+      const startCol = col;
+      groupCols.forEach(() => { bannerRow.push(g.groupLabel); col++; });
+      const endCol = col - 1;
+      if (endCol > startCol) merges.push({ s: { r: 0, c: startCol }, e: { r: 0, c: endCol } });
+    });
+    bannerRow.push('');
+  }
+  // ── Header row: Period | leaf labels | Average? ──
+  const headerRow = ['Period', ...columns.map(c => c.label)];
+  if (isUbs) headerRow.push('Average');
+  const aoaHeader = isUbs ? [bannerRow, headerRow] : [headerRow];
+  // ── Data rows (newest-first to match the on-screen reversed display) ──
+  const reversedRows = [...rows].reverse();
+  const dataAoa = reversedRows.map(row => {
+    const r = [row.label];
+    columns.forEach(c => {
+      const cell = row.cells[c.canonicalId];
+      const pct = cell?.pct;
+      r.push((pct == null || !isFinite(pct)) ? null : pct);
+    });
+    if (isUbs) {
+      const avg = averageVisiblePct(row, columns);
+      r.push((avg == null || !isFinite(avg)) ? null : avg);
+    }
+    return r;
+  });
+  const aoa = [...aoaHeader, ...dataAoa];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const totalCols = headerRow.length;
+  const encode = XLSX.utils.encode_cell;
+  // Ensure a cell exists so we can style it even when aoa_to_sheet skipped a null.
+  function ensure(ref){
+    if (!ws[ref]) ws[ref] = { t: 'z' };
+    return ws[ref];
+  }
+  // ── Style banner row (UBS only) ──
+  if (isUbs) {
+    ensure(encode({ r: 0, c: 0 })).s = XLSX_STYLES.header;
+    let col = 1;
+    UBS_GROUPS.forEach(g => {
+      const groupCols = columns.filter(c => c.groupLabel === g.groupLabel);
+      if (groupCols.length === 0) return;
+      const fillRgb = UBS_BANNER_FILLS[g.groupLabel] || XLSX_PALETTE.amp;
+      const bannerStyle = xlsxGroupBannerStyle(fillRgb);
+      groupCols.forEach(() => {
+        ensure(encode({ r: 0, c: col })).s = bannerStyle;
+        col++;
+      });
+    });
+    ensure(encode({ r: 0, c: totalCols - 1 })).s = XLSX_STYLES.header;
+  }
+  // ── Style leaf-label header row ──
+  const headerRowIdx = isUbs ? 1 : 0;
+  for (let c = 0; c < totalCols; c++) {
+    ensure(encode({ r: headerRowIdx, c })).s = XLSX_STYLES.header;
+  }
+  // ── Style data rows ──
+  reversedRows.forEach((row, i) => {
+    const wsRowIdx = headerRowCount + i;
+    const isLive = row.liveToDate === true;
+    const banded = i % 2 === 1;
+    // Period cell
+    ensure(encode({ r: wsRowIdx, c: 0 })).s = isLive ? XLSX_STYLES.periodLive : XLSX_STYLES.period;
+    // Leaf cells
+    columns.forEach((col, ci) => {
+      const ref = encode({ r: wsRowIdx, c: ci + 1 });
+      const cell = row.cells[col.canonicalId];
+      const pct = cell?.pct;
+      const hasVal = (pct != null && isFinite(pct) && !cell?.noSource);
+      const wsCell = ensure(ref);
+      if (hasVal) {
+        wsCell.s = xlsxDataCellStyle({ banded, isLive });
+      } else {
+        wsCell.s = xlsxEmptyCellStyle({ banded, isLive });
+      }
+      // Composite (multi-source UBS aggregate) → cell hover comment.
+      if (cell?.composite?.items) {
+        const lines = cell.composite.items.map(it =>
+          `  - ${it.label}: ${xlsxFmtPctText(it.pct)}`
+        );
+        const mean = cell.composite.mean;
+        wsCell.c = [{
+          a: 'TI Dashboard',
+          t: `Composite mean ${xlsxFmtPctText(mean)} of:\n${lines.join('\n')}`,
+        }];
+        wsCell.c.hidden = true;
+      }
+    });
+    // Average cell (UBS only)
+    if (isUbs) {
+      const ref = encode({ r: wsRowIdx, c: totalCols - 1 });
+      const avg = averageVisiblePct(row, columns);
+      const hasAvg = (avg != null && isFinite(avg));
+      const wsCell = ensure(ref);
+      if (hasAvg) {
+        wsCell.s = xlsxDataCellStyle({ banded, isLive, bold: true });
+      } else {
+        wsCell.s = xlsxEmptyCellStyle({ banded, isLive });
+      }
+    }
+  });
+  // ── Layout properties ──
+  const cols = [{ wch: 22 }];
+  for (let i = 0; i < columns.length; i++) cols.push({ wch: 16 });
+  if (isUbs) cols.push({ wch: 18 });
+  ws['!cols'] = cols;
+  const rowsMeta = [];
+  if (isUbs) rowsMeta.push({ hpt: 22 });
+  rowsMeta.push({ hpt: 22 });
+  for (let i = 0; i < reversedRows.length; i++) rowsMeta.push({ hpt: 18 });
+  ws['!rows'] = rowsMeta;
+  if (merges.length > 0) ws['!merges'] = merges;
+  // Refresh the worksheet ref since we may have inserted cells past the AoA range.
+  const lastRow = headerRowCount + reversedRows.length - 1;
+  const lastCol = totalCols - 1;
+  ws['!ref'] = `${encode({ r: 0, c: 0 })}:${encode({ r: lastRow, c: lastCol })}`;
+  // Freeze panes are applied post-write via xlsxApplyFreezePanes — xlsx-js-style
+  // doesn't serialize them itself, so we patch the worksheet XML after zip.
+  ws['!xlsxFreezeRows'] = headerRowCount;
+  return ws;
+}
+
+// Patch each worksheet XML inside the written .xlsx buffer to inject a
+// frozen <pane> element under <sheetView>. xlsx-js-style strips this
+// information on write, so we unzip → string-replace → re-zip with fflate.
+function xlsxApplyFreezePanes(XLSX, fflate, wb){
+  const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const u8 = new Uint8Array(buf);
+  const entries = fflate.unzipSync(u8);
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  wb.SheetNames.forEach((name, i) => {
+    const ySplit = wb.Sheets[name]?.['!xlsxFreezeRows'];
+    if (!ySplit) return;
+    const path = `xl/worksheets/sheet${i+1}.xml`;
+    if (!entries[path]) return;
+    let xml = dec.decode(entries[path]);
+    const topLeftRow = ySplit + 1;
+    const pane = `<pane xSplit="1" ySplit="${ySplit}" topLeftCell="B${topLeftRow}" activePane="bottomRight" state="frozen"/>`;
+    const selection = `<selection pane="bottomRight" activeCell="B${topLeftRow}" sqref="B${topLeftRow}"/>`;
+    xml = xml.replace(
+      /<sheetView workbookViewId="0"\/>/,
+      `<sheetView workbookViewId="0">${pane}${selection}</sheetView>`
+    );
+    entries[path] = enc.encode(xml);
+  });
+  return fflate.zipSync(entries);
+}
+
+// Builds the cover/Overview sheet — title banner, metadata block,
+// WoW/MoM/QoQ definitions, and a table of contents for the other sheets.
+function xlsxBuildOverviewSheet(XLSX, meta){
+  const titleText = 'Texas Instruments — Price Movement Export';
+  const aoa = [
+    [titleText, '', '', '', ''],
+    [],
+    ['Generated',    meta.generatedAt],
+    ['Live as of',   meta.liveAsOf || '—'],
+    ['Source',       'Texas Instruments inventory snapshots'],
+    [],
+    ['Definitions'],
+    ['WoW',          'Week-over-week — current week vs prior week'],
+    ['MoM',          'Month-over-month — current month vs prior month'],
+    ['QoQ',          'Quarter-over-quarter — current quarter vs prior quarter'],
+    [],
+    ['Notes'],
+    ['',             'Cell values are the % change in the inventory-weighted price index.'],
+    ['',             'UBS multi-source aggregates show the arithmetic mean of constituent TI subcategories — see the cell hover comment for the breakdown.'],
+    ['',             'Empty UBS cells indicate no underlying TI source mapping for that leaf.'],
+    ['',             'The newest row in each sheet is the live week/month/quarter to-date — highlighted gold.'],
+    [],
+    ['Sheets'],
+    ...meta.sheetTitles.map(t => ['', t]),
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  // Title banner row, merged across 5 columns.
+  if (ws['A1']) ws['A1'].s = XLSX_STYLES.titleBanner;
+  ws['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 4 } }];
+  // Section headers.
+  ['A7', 'A12', 'A18'].forEach(r => { if (ws[r]) ws[r].s = XLSX_STYLES.sectionHeader; });
+  // Metadata labels.
+  ['A3','A4','A5','A8','A9','A10'].forEach(r => { if (ws[r]) ws[r].s = XLSX_STYLES.metaLabel; });
+  // Metadata values + notes + sheet list.
+  ['B3','B4','B5','B8','B9','B10','B13','B14','B15','B16'].forEach(r => { if (ws[r]) ws[r].s = XLSX_STYLES.metaValue; });
+  for (let i = 0; i < meta.sheetTitles.length; i++) {
+    const ref = `B${19 + i}`;
+    if (ws[ref]) ws[ref].s = XLSX_STYLES.metaValue;
+  }
+  ws['!cols'] = [{ wch: 14 }, { wch: 78 }, { wch: 4 }, { wch: 4 }, { wch: 4 }];
+  ws['!rows'] = [{ hpt: 30 }];
+  return ws;
+}
+
 function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited, fetchedAt, GC, CATS, B, dataTransform, showAverageColumn }){
   const [view, setView] = useState('qoq');     // 'wow' | 'mom' | 'qoq'
   // Cached raw payload from /api/ti/trend/series. The downstream `data` value
@@ -3491,6 +3805,7 @@ function App(){
   const [tiStatus,setTiStatus]=useState(null);
   const { toasts, push, dismiss } = useToasts();
   const [exporting, setExporting] = useState(false);
+  const [xlsxHover, setXlsxHover] = useState(false);
   const rateLimitToastId = useRef(null);
   const retryTimer = useRef(null);
   const loadingRef = useRef(false);
@@ -3785,58 +4100,108 @@ function App(){
     if (window.XLSX) return Promise.resolve(window.XLSX);
     return new Promise((resolve, reject) => {
       const script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+      script.src = 'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js';
       script.async = true;
       script.onload = () => window.XLSX ? resolve(window.XLSX) : reject(new Error('XLSX failed to initialize'));
       script.onerror = () => reject(new Error('Failed to load XLSX library from CDN'));
       document.head.appendChild(script);
     });
   }
+  // Lazy-load fflate (used to post-patch freeze panes into the xlsx zip,
+  // since xlsx-js-style's writer ignores ws['!views']).
+  function loadFflateLib(){
+    if (window.fflate) return Promise.resolve(window.fflate);
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js';
+      script.async = true;
+      script.onload = () => window.fflate ? resolve(window.fflate) : reject(new Error('fflate failed to initialize'));
+      script.onerror = () => reject(new Error('Failed to load fflate from CDN'));
+      document.head.appendChild(script);
+    });
+  }
 
-  // Export the WoW / MoM / QoQ trend tables as a single .xlsx workbook with
-  // three named sheets (one per view), mirroring what the user sees in
-  // TrendSeriesPanel. Honors both `vis` (group) and `hiddenSub`
-  // (per-subcategory) filters. Cell values are raw numbers so spreadsheet
-  // math works directly; missing data is left blank.
-  async function exportCSV(){
+  // Export TI Prices + UBS Compare WoW/MoM/QoQ trend tables as a single
+  // styled .xlsx workbook (Overview + 3 TI sheets + 3 UBS sheets).
+  // Honors `vis`/`hiddenSub` for TI sheets and `ubsVis`/`ubsHiddenSub` for
+  // UBS sheets — exported columns mirror what's visible on screen. Cell
+  // values are raw numbers (with percent-conditional Excel number format)
+  // so spreadsheet math works directly; empty cells stay blank.
+  async function exportXLSX(){
     if (exporting) return;
     setExporting(true);
     try {
       const views = [
-        { key: 'wow', title: 'Week on Week' },
-        { key: 'mom', title: 'Month on Month' },
-        { key: 'qoq', title: 'Quarter on Quarter' },
+        { key: 'wow', short: 'WoW', label: 'Week on Week' },
+        { key: 'mom', short: 'MoM', label: 'Month on Month' },
+        { key: 'qoq', short: 'QoQ', label: 'Quarter on Quarter' },
       ];
-      const [XLSX, ...datasets] = await Promise.all([
+      const [XLSX, fflate, ...datasets] = await Promise.all([
         loadXLSXLib(),
+        loadFflateLib().catch(() => null),
         ...views.map(v => fetch(`/api/ti/trend/series?view=${v.key}`).then(r => {
-          if (!r.ok) throw new Error(`${v.title}: HTTP ${r.status}`);
+          if (!r.ok) throw new Error(`${v.label}: HTTP ${r.status}`);
           return r.json();
         })),
       ]);
 
       const wb = XLSX.utils.book_new();
+      const sheetTitles = [
+        ...views.map(v => `TI · ${v.short}`),
+        ...views.map(v => `UBS · ${v.short}`),
+      ];
+      const liveAsOf = datasets.find(d => d?.liveAsOf)?.liveAsOf || null;
+
+      // Overview cover sheet.
+      const overview = xlsxBuildOverviewSheet(XLSX, {
+        generatedAt: new Date().toISOString(),
+        liveAsOf,
+        sheetTitles,
+      });
+      XLSX.utils.book_append_sheet(wb, overview, 'Overview');
+
+      // TI sheets — honor the Prices tab's visibility state.
       views.forEach((v, i) => {
         const dataset = datasets[i];
         const visibleCols = dataset.columns.filter(c =>
           vis.has(c.groupLabel) && !hiddenSub.has(c.canonicalId)
         );
-        const rows = [
-          ['Period', ...visibleCols.map(c => c.label)],
-          // Newest-first to match the table's reversed display order.
-          ...[...dataset.rows].reverse().map(row => [
-            row.label,
-            ...visibleCols.map(c => {
-              const pct = row.cells[c.canonicalId]?.pct;
-              return pct == null ? null : pct;
-            }),
-          ]),
-        ];
-        const ws = XLSX.utils.aoa_to_sheet(rows);
-        XLSX.utils.book_append_sheet(wb, ws, v.title);
+        const ws = xlsxBuildTrendSheet(XLSX, {
+          columns: visibleCols,
+          rows: dataset.rows,
+          isUbs: false,
+        });
+        XLSX.utils.book_append_sheet(wb, ws, `TI · ${v.short}`);
       });
 
-      XLSX.writeFile(wb, `ti_prices_${new Date().toISOString().slice(0,10)}.xlsx`);
+      // UBS sheets — reshape via tiSeriesToUbs, honor UBS tab's visibility state.
+      views.forEach((v, i) => {
+        const ubsDataset = tiSeriesToUbs(datasets[i]);
+        const visibleCols = ubsDataset.columns.filter(c =>
+          ubsVis.has(c.groupLabel) && !ubsHiddenSub.has(c.canonicalId)
+        );
+        const ws = xlsxBuildTrendSheet(XLSX, {
+          columns: visibleCols,
+          rows: ubsDataset.rows,
+          isUbs: true,
+        });
+        XLSX.utils.book_append_sheet(wb, ws, `UBS · ${v.short}`);
+      });
+
+      const filename = `ti_prices_${new Date().toISOString().slice(0,10)}.xlsx`;
+      if (fflate) {
+        // Post-patch the zip to add freeze panes (xlsx-js-style strips them).
+        const patched = xlsxApplyFreezePanes(XLSX, fflate, wb);
+        const blob = new Blob([patched], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } else {
+        // Fallback if fflate CDN failed — file ships without freeze panes.
+        XLSX.writeFile(wb, filename);
+      }
     } catch (e) {
       push(`Export failed: ${e.message || e}`, 'error');
     } finally {
@@ -4060,7 +4425,24 @@ function App(){
           </div>}
         </div>
         <div style={{display:'flex',gap:6,alignItems:'center',flexWrap:'wrap'}}>
-          <button onClick={exportCSV} disabled={exporting} style={{background:'none',border:`1px solid ${B}`,borderRadius:4,padding:'5px 10px',fontSize:'0.67rem',color: exporting ? '#2d4a6b' : '#4a6480',cursor: exporting ? 'default' : 'pointer'}}>{exporting ? 'Exporting…' : '↓ XLSX'}</button>
+          <button
+            onClick={exportXLSX}
+            disabled={exporting}
+            onMouseEnter={()=>setXlsxHover(true)}
+            onMouseLeave={()=>setXlsxHover(false)}
+            title="Download a styled .xlsx workbook with TI Prices + UBS Compare (WoW / MoM / QoQ)"
+            style={{
+              background: exporting ? '#1a2740' : (xlsxHover ? '#4dffc3' : '#00c9a7'),
+              border:'none', borderRadius:4,
+              padding:'6px 14px', fontSize:'0.72rem', fontWeight:600,
+              color: exporting ? '#7a96b8' : '#04140f',
+              cursor: exporting ? 'default' : 'pointer',
+              display:'flex', alignItems:'center', gap:6,
+              transition:'background 0.15s ease',
+            }}>
+            {exporting && <span style={{width:7,height:7,border:'1.5px solid #04140f',borderTopColor:'transparent',borderRadius:'50%',display:'inline-block',animation:'spin 0.7s linear infinite'}}/>}
+            {exporting ? 'Exporting…' : '⬇ Download XLSX'}
+          </button>
           <button
             onClick={()=>fetchLive(true)}
             disabled={loading || isRateLimited}
