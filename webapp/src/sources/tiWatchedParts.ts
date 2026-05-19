@@ -858,6 +858,36 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     validationStatus: 'validated',
   },
 
+  // ── Comparators additions (2) — pending until staged-validate confirms ───
+  // Layer 2 of the amp_comparators basket: gives the daily TI Store capture
+  // a path into D1's ti_inventory_price_snapshot for LM393/LM2903, which the
+  // trend cascade then uses as the source of truth for real WoW/MoM/QoQ
+  // anchors. Until validated, these stay out of getWatchedPartsCaptureInputs.
+  {
+    genericPartNumber: 'LM393',
+    preferredOrderablePartNumber: 'LM393DR',
+    displayName: 'LM393 Dual Comparator',
+    basket: 'analog_signal_chain',
+    subcategory: 'Comparators',
+    dashboardPriority: 'medium',
+    thesisReason: 'Industry-workhorse dual differential comparator; commodity analog franchise read across industrial and automotive control.',
+    demandProxyType: 'analog_franchise',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+  {
+    genericPartNumber: 'LM2903',
+    preferredOrderablePartNumber: 'LM2903DR',
+    displayName: 'LM2903 Auto-Grade Dual Comparator',
+    basket: 'analog_signal_chain',
+    subcategory: 'Comparators',
+    dashboardPriority: 'low',
+    thesisReason: 'Q-grade dual comparator companion to LM393; automotive design-in corroboration for the comparator sub-bucket.',
+    demandProxyType: 'auto_volume',
+    confidence: 'high',
+    validationStatus: 'pending',
+  },
+
   // ── Motor Drivers additions (9) ──────────────────────────────────────────
   {
     genericPartNumber: 'DRV8870',
