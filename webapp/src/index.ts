@@ -738,9 +738,7 @@ export async function resolveLiveCascade(
           ? getTiInventoryFirstAfter(d1, repPart, weekStart)
           : Promise.resolve(null),
         getTiInventoryAt(d1, repPart, anchorTargetDate),
-        mapping.kind === 'series'
-          ? getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE)
-          : Promise.resolve(null),
+        getTiInventoryFirstAfter(d1, repPart, OWN_CAPTURE_FIRST_DATE),
       ])
       return {
         canonicalId, mapping, repPart,
@@ -827,12 +825,27 @@ export async function resolveLiveCascade(
       }
     }
 
+    // QoQ anchor fallback for anchor-kind subs whose prior-quarter close
+    // predates our TI Direct capture history (Q2-26 only — Mar 31 is before
+    // captures began May 2). Uses the first captured price, same convention
+    // as MoM's monthStartFirstPoint branch. Self-heals from Q3-26 onward
+    // once Jun-30 falls inside our capture window and anchorAtPoint resolves
+    // above.
+    if (
+      !resolved && view === 'qoq' && r.mapping.kind === 'anchor'
+      && r.spliceFirstPoint && r.spliceFirstPoint.priceUSD > 0
+    ) {
+      resolved = {
+        anchorUSD: r.spliceFirstPoint.priceUSD,
+        anchorDate: String(r.spliceFirstPoint.capturedAt).slice(0, 10),
+        anchorLabel: 'TI capture',
+      }
+    }
+
     // Floor fallback for anchor-kind subs with no D1 capture history yet
     // (e.g. brand-new comparator basket on day 1). Uses the canonical
     // anchorUSD as the floor anchor so the live row shows 0% on first
-    // capture and real deltas accumulate as D1 history fills in. Has no
-    // effect on existing anchor-kind subs that already have D1 captures —
-    // they resolve via anchorAtPoint above.
+    // capture and real deltas accumulate as D1 history fills in.
     if (!resolved && r.mapping.kind === 'anchor' && r.mapping.anchorUSD > 0) {
       resolved = {
         anchorUSD: r.mapping.anchorUSD,
