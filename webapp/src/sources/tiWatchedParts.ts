@@ -873,7 +873,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Industry-workhorse dual differential comparator; commodity analog franchise read across industrial and automotive control.',
     demandProxyType: 'analog_franchise',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
   {
     genericPartNumber: 'LM2903',
@@ -885,7 +885,7 @@ export const TI_WATCHED_PARTS: WatchedPart[] = [
     thesisReason: 'Q-grade dual comparator companion to LM393; automotive design-in corroboration for the comparator sub-bucket.',
     demandProxyType: 'auto_volume',
     confidence: 'high',
-    validationStatus: 'pending',
+    validationStatus: 'validated',
   },
 
   // ── Motor Drivers additions (9) ──────────────────────────────────────────
