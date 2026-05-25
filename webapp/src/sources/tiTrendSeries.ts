@@ -415,10 +415,22 @@ export function buildTrendView(
         ? { index, pct, breakdown }
         : { index, pct }
     }
+    // WTD label uses the CURRENT OPEN Sat-Fri week (anchored on the
+    // upcoming Friday close), matching the calendar week convention used
+    // by closed rows. fmtWeek(today) would render a rolling 7-day window
+    // (e.g. "May 19-25" for today=Mon May 25), which doesn't align with
+    // the closed rows (May 16-22, May 23-29 …) and confuses users.
+    const wtdEnd = (() => {
+      const d = new Date(today)
+      const dow = d.getUTCDay() // 0=Sun..5=Fri..6=Sat
+      const daysToFriday = (5 - dow + 7) % 7
+      d.setUTCDate(d.getUTCDate() + daysToFriday)
+      return d
+    })()
     rows.push({
       periodEnd: isoDate(today),
       label:
-        view === 'wow' ? `WTD · ${fmtWeek(today)}`
+        view === 'wow' ? `WTD · ${fmtWeek(wtdEnd)}`
         : view === 'mom' ? `MTD · ${fmtMonthShort(today)}`
         : `QTD · ${fmtQuarter(today)}`,
       liveToDate: true,
