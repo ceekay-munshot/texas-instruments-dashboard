@@ -843,13 +843,31 @@ export async function resolveLiveCascade(
     }
 
     // Floor fallback for anchor-kind subs with no D1 capture history yet
-    // (e.g. brand-new comparator basket on day 1). Uses the canonical
-    // anchorUSD as the floor anchor so the live row shows 0% on first
-    // capture and real deltas accumulate as D1 history fills in.
+    // (e.g. brand-new comparator basket on day 1, or sparse coverage for
+    // an SKU whose only live price comes via the Mouser qty=1 fallback).
+    // Uses the canonical anchorUSD as the floor. anchorDate stamps the
+    // labeled period START so the receipt reads "Historical baseline
+    // (May 16)" for a May 16-22 WoW row — the user-visible window start —
+    // rather than re-using liveAsOf, which would be the period END and
+    // makes no sense as a baseline date.
     if (!resolved && r.mapping.kind === 'anchor' && r.mapping.anchorUSD > 0) {
+      let floorAnchorDate = liveAsOf
+      if (view === 'wow') {
+        // WoW labels run liveAsOf−6 days through liveAsOf (e.g. "May 16-22"
+        // for periodEnd=May 22, "May 19-25" for WTD at today=May 25).
+        const d = new Date(`${liveAsOf}T00:00:00Z`)
+        d.setUTCDate(d.getUTCDate() - 6)
+        floorAnchorDate = d.toISOString().slice(0, 10)
+      } else if (view === 'mom') {
+        floorAnchorDate = monthStart
+      } else if (view === 'qoq') {
+        const d = new Date(`${liveAsOf}T00:00:00Z`)
+        const qMonth = Math.floor(d.getUTCMonth() / 3) * 3
+        floorAnchorDate = `${d.getUTCFullYear()}-${String(qMonth + 1).padStart(2, '0')}-01`
+      }
       resolved = {
         anchorUSD: r.mapping.anchorUSD,
-        anchorDate: liveAsOf,
+        anchorDate: floorAnchorDate,
         anchorLabel: 'Historical baseline',
       }
     }
