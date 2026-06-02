@@ -5,8 +5,10 @@
 -- every in-stock, priced OPN in the canonical subcategory — i.e. UBS's
 -- `Dollar Inventory / Unit Inventory`. It replaces the single
 -- representative-part price the trend index reads today (e.g. LDO shows
--- one $7.21 part; the real stock-weighted ASP across 2,447 LDO parts is
--- ~$0.72, matching UBS's $0.73).
+-- one $7.21 representative part, whereas the stock-weighted ASP across
+-- the full 2,447-part power_ldo basket is ~$0.33 — dominated by cheap
+-- high-volume LDOs). NOTE: the earlier ~$0.72 figure was the narrower
+-- TPS7A-only slice (471 parts), NOT the full power_ldo basket.
 --
 -- Additive ALTERs only. SQLite ADD COLUMN defaults existing rows to
 -- NULL; the next rollup rebuild populates ti_catalog_rollup_latest, and

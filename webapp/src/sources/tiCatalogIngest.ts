@@ -1017,16 +1017,39 @@ export async function pendingSubcategoryPredicates(d1: CatalogD1): Promise<Subca
  *
  *  Errors from any step roll into the returned errors[] but do not
  *  abort later steps — partial enrichment is better than no row. */
-// Phase 27 — basket-hygiene cap for the stock-weighted ASP. Parts priced
-// above this are excluded from asp_stock_weighted (numerator AND
-// denominator) so eval boards / data-acquisition modules / multi-kit
-// SKUs (which can list at $1k–$60k+) don't distort a category's price.
-// Stock-weighting already down-weights them, but a few high-stock
-// outliers can still pull a category up (e.g. ADC: $30.80 uncapped vs
-// $11.28 with parts > $100 excluded; UBS = $17.71). $1000 removes the
-// gross eval/module outliers while keeping every legitimate IC; per-
-// subcategory tuning against the UBS overlap window is a follow-up.
-const ASP_OUTLIER_PRICE_CAP_USD = 1000
+// Phase 27.1 — two-layer basket hygiene for the stock-weighted ASP.
+//
+// Layer 1 (keyword exclusion, ASP_NON_IC_EXCLUSION_SQL): drop eval boards
+// / modules / kits / DAQ bundles by part-number + description, applied to
+// BOTH the numerator and denominator. These are genuine non-IC SKUs (e.g.
+// DAC12DL3200EVM) that don't belong in a component ASP at any price.
+//
+// Layer 2 (per-subcategory price cap): the old single $1000 global cap
+// wrongly excluded legitimate high-end DAC ICs (rad-tolerant / QMLV /
+// RF-sampling DACs), pulling conv_dac to $9.33 vs $11.49 uncapped (UBS
+// $11.60). DAC's real dollar-inventory lives in those parts, so it gets a
+// very high cap; ADC keeps $1000 (real $60k+ DAQ outliers exist there);
+// everything else defaults to $1000. Tune per-subcategory vs UBS overlap.
+const ASP_DEFAULT_PRICE_CAP_USD = 1000
+const ASP_PRICE_CAP_BY_SUBCATEGORY: Record<string, number> = {
+  conv_dac: 100000, // legit precision / rad-hard / RF DACs run into the $1k–$50k range
+  conv_adc: 1000,
+}
+
+// Shared non-IC keyword exclusion (no leading AND). Identical text reused
+// by the asp_stock_weighted numerator and denominator so excluded SKUs
+// vanish from both. COALESCE makes a NULL description safe (NULL would
+// otherwise poison the CASE and silently drop the row); UPPER makes the
+// match case-insensitive. References the FROM-table columns directly, so
+// no alias rewrite is needed.
+const ASP_NON_IC_EXCLUSION_SQL =
+  `NOT (UPPER(ti_part_number) LIKE '%EVM%'` +
+  ` OR UPPER(COALESCE(description,'')) LIKE '%EVALUATION%'` +
+  ` OR UPPER(COALESCE(description,'')) LIKE '%MODULE%'` +
+  ` OR UPPER(COALESCE(description,'')) LIKE '%BOARD%'` +
+  ` OR UPPER(COALESCE(description,'')) LIKE '%KIT%'` +
+  ` OR UPPER(COALESCE(description,'')) LIKE '%BUNDLE%'` +
+  ` OR UPPER(COALESCE(description,'')) LIKE '%DAQ%')`
 
 export async function rebuildOneSubcategory(
   d1: CatalogD1,
@@ -1103,6 +1126,16 @@ export async function rebuildOneSubcategory(
     return `CASE\n             ${whens}\n             ELSE 'unknown'\n           END`
   })()
 
+  // Phase 27.1 — per-subcategory price cap + shared non-IC exclusion,
+  // composed once and reused by the asp_stock_weighted numerator and
+  // denominator so they stay byte-identical.
+  const aspCap = ASP_PRICE_CAP_BY_SUBCATEGORY[predicate.canonicalSubcategory] ?? ASP_DEFAULT_PRICE_CAP_USD
+  const aspInclude =
+    `quantity IS NOT NULL AND quantity > 0` +
+    ` AND normalized_unit_price IS NOT NULL` +
+    ` AND normalized_unit_price <= ${aspCap}` +
+    ` AND ${ASP_NON_IC_EXCLUSION_SQL}`
+
   // Step 2 — main aggregates upsert. INSERT OR REPLACE so re-running a
   // step over a previously-completed subcategory just reasserts the
   // same row.
@@ -1126,18 +1159,13 @@ export async function rebuildOneSubcategory(
          SUM(CASE WHEN quantity = 0 THEN 1 ELSE 0 END),
          ROUND(SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 2),
          SUM(COALESCE(quantity, 0)),
-         -- Phase 27 — stock-weighted ASP = SUM(price*qty)/SUM(qty) over
-         -- in-stock, priced OPNs within the basket-hygiene cap. UBS's
-         -- Dollar Inventory / Unit Inventory.
+         -- Phase 27.1 — stock-weighted ASP = SUM(price*qty)/SUM(qty) over
+         -- in-stock, priced OPNs after 2-layer hygiene (per-subcat price
+         -- cap + non-IC keyword exclusion, both folded into aspInclude).
+         -- UBS Dollar Inventory / Unit Inventory.
          ROUND(
-           SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0
-                     AND normalized_unit_price IS NOT NULL
-                     AND normalized_unit_price <= ${ASP_OUTLIER_PRICE_CAP_USD}
-                    THEN normalized_unit_price * quantity ELSE 0 END)
-           / NULLIF(SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0
-                              AND normalized_unit_price IS NOT NULL
-                              AND normalized_unit_price <= ${ASP_OUTLIER_PRICE_CAP_USD}
-                             THEN quantity ELSE 0 END), 0), 4),
+           SUM(CASE WHEN ${aspInclude} THEN normalized_unit_price * quantity ELSE 0 END)
+           / NULLIF(SUM(CASE WHEN ${aspInclude} THEN quantity ELSE 0 END), 0), 4),
          NULL,
          MIN(normalized_unit_price),
          MAX(normalized_unit_price),
