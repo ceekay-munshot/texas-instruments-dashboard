@@ -1017,6 +1017,17 @@ export async function pendingSubcategoryPredicates(d1: CatalogD1): Promise<Subca
  *
  *  Errors from any step roll into the returned errors[] but do not
  *  abort later steps — partial enrichment is better than no row. */
+// Phase 27 — basket-hygiene cap for the stock-weighted ASP. Parts priced
+// above this are excluded from asp_stock_weighted (numerator AND
+// denominator) so eval boards / data-acquisition modules / multi-kit
+// SKUs (which can list at $1k–$60k+) don't distort a category's price.
+// Stock-weighting already down-weights them, but a few high-stock
+// outliers can still pull a category up (e.g. ADC: $30.80 uncapped vs
+// $11.28 with parts > $100 excluded; UBS = $17.71). $1000 removes the
+// gross eval/module outliers while keeping every legitimate IC; per-
+// subcategory tuning against the UBS overlap window is a follow-up.
+const ASP_OUTLIER_PRICE_CAP_USD = 1000
+
 export async function rebuildOneSubcategory(
   d1: CatalogD1,
   predicate: SubcategoryPredicate,
@@ -1052,12 +1063,12 @@ export async function rebuildOneSubcategory(
            canonical_subcategory, canonical_group,
            opn_count, gpn_count, priced_opn_count,
            stocked_opn_count, out_of_stock_opn_count, stocked_pct,
-           total_quantity,
+           total_quantity, asp_stock_weighted,
            median_normalized_unit_price, min_normalized_unit_price, max_normalized_unit_price,
            cheapest_opn, highest_inventory_opn,
            lifecycle_summary, mapping_confidence_summary,
            latest_captured_at)
-         VALUES (?, ?, 0, 0, 0, 0, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)`,
+         VALUES (?, ?, 0, 0, 0, 0, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)`,
       ).bind(predicate.canonicalSubcategory, predicate.canonicalGroup, emptyAt).run()
       return {
         canonicalGroup: predicate.canonicalGroup,
@@ -1101,7 +1112,7 @@ export async function rebuildOneSubcategory(
          canonical_subcategory, canonical_group,
          opn_count, gpn_count, priced_opn_count,
          stocked_opn_count, out_of_stock_opn_count, stocked_pct,
-         total_quantity,
+         total_quantity, asp_stock_weighted,
          median_normalized_unit_price, min_normalized_unit_price, max_normalized_unit_price,
          cheapest_opn, highest_inventory_opn,
          lifecycle_summary, mapping_confidence_summary,
@@ -1115,6 +1126,18 @@ export async function rebuildOneSubcategory(
          SUM(CASE WHEN quantity = 0 THEN 1 ELSE 0 END),
          ROUND(SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 2),
          SUM(COALESCE(quantity, 0)),
+         -- Phase 27 — stock-weighted ASP = SUM(price*qty)/SUM(qty) over
+         -- in-stock, priced OPNs within the basket-hygiene cap. UBS's
+         -- Dollar Inventory / Unit Inventory.
+         ROUND(
+           SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0
+                     AND normalized_unit_price IS NOT NULL
+                     AND normalized_unit_price <= ${ASP_OUTLIER_PRICE_CAP_USD}
+                    THEN normalized_unit_price * quantity ELSE 0 END)
+           / NULLIF(SUM(CASE WHEN quantity IS NOT NULL AND quantity > 0
+                              AND normalized_unit_price IS NOT NULL
+                              AND normalized_unit_price <= ${ASP_OUTLIER_PRICE_CAP_USD}
+                             THEN quantity ELSE 0 END), 0), 4),
          NULL,
          MIN(normalized_unit_price),
          MAX(normalized_unit_price),
@@ -1352,7 +1375,7 @@ export async function appendCurrentRollupsToHistory(
          canonical_subcategory, canonical_group,
          opn_count, gpn_count, priced_opn_count,
          stocked_opn_count, out_of_stock_opn_count, stocked_pct,
-         total_quantity, median_normalized_unit_price,
+         total_quantity, asp_stock_weighted, median_normalized_unit_price,
          min_normalized_unit_price, max_normalized_unit_price,
          cheapest_opn, highest_inventory_opn,
          lifecycle_summary, mapping_confidence_summary)
@@ -1360,7 +1383,7 @@ export async function appendCurrentRollupsToHistory(
               l.canonical_subcategory, l.canonical_group,
               l.opn_count, l.gpn_count, l.priced_opn_count,
               l.stocked_opn_count, l.out_of_stock_opn_count, l.stocked_pct,
-              l.total_quantity, l.median_normalized_unit_price,
+              l.total_quantity, l.asp_stock_weighted, l.median_normalized_unit_price,
               l.min_normalized_unit_price, l.max_normalized_unit_price,
               l.cheapest_opn, l.highest_inventory_opn,
               l.lifecycle_summary, l.mapping_confidence_summary

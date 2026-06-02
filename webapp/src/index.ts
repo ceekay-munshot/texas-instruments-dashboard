@@ -4092,7 +4092,7 @@ app.get('/api/ti/universe/catalog/rollups/latest', async (c) => {
     `SELECT canonical_group, canonical_subcategory,
             opn_count, gpn_count, priced_opn_count,
             stocked_opn_count, out_of_stock_opn_count, stocked_pct,
-            total_quantity, median_normalized_unit_price,
+            total_quantity, asp_stock_weighted, median_normalized_unit_price,
             min_normalized_unit_price, max_normalized_unit_price,
             cheapest_opn, highest_inventory_opn,
             lifecycle_summary, mapping_confidence_summary,
@@ -4108,6 +4108,7 @@ app.get('/api/ti/universe/catalog/rollups/latest', async (c) => {
     opn_count: number; gpn_count: number; priced_opn_count: number;
     stocked_opn_count: number; out_of_stock_opn_count: number;
     stocked_pct: number | null; total_quantity: number | null;
+    asp_stock_weighted: number | null;
     median_normalized_unit_price: number | null;
     min_normalized_unit_price: number | null;
     max_normalized_unit_price: number | null;
@@ -4140,6 +4141,7 @@ app.get('/api/ti/universe/catalog/rollups/latest', async (c) => {
       outOfStockOpnCount: r.out_of_stock_opn_count,
       stockedPct: r.stocked_pct,
       totalQuantity: r.total_quantity,
+      aspStockWeighted: r.asp_stock_weighted,
       medianNormalizedUnitPrice: r.median_normalized_unit_price,
       minNormalizedUnitPrice: r.min_normalized_unit_price,
       maxNormalizedUnitPrice: r.max_normalized_unit_price,
