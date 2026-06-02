@@ -70,6 +70,27 @@ export const SUB_TO_BASELINE: Record<string, BaselineMapping> = {
   amp_comparators:        { kind: 'anchor', anchorUSD: 0.2566 },
 }
 
+// Phase 27.3 — handoff weighted-ASP seed. The stock-weighted ASP
+// (ti_catalog_rollup_latest.asp_stock_weighted) captured at the May-2026
+// handoff. It is the SPLICE REFERENCE that bridges the UBS-derived
+// historical series to the live weighted-ASP series, so the weighted
+// engine reads the real (small) move instead of the single-SKU artifact.
+// Fixed seed; the live value reads current rollup_latest and diverges
+// from this as the weekly catalog history lands. gan_lmg5200 is absent
+// (no weighted value) → the weighted engine leaves it on the legacy path.
+export const HANDOFF_WEIGHTED_ASP: Record<string, number> = {
+  conv_adc: 19.4019, conv_dac: 11.4599, mcu_sitara: 10.5398,
+  gan_lmg3650: 6.99, gan_lmg342x: 6.8772, mcu_c2000: 6.6708,
+  isolation_digital: 6.4403, interface_ethernet_phy: 3.3334, mcu_simplelink: 2.9411,
+  mcu_msp430: 2.7261, isolation_reinforced: 2.6213, dc_smart_power_stages: 2.514,
+  dc_tps536xx_ai_power: 2.3363, dc_48v_bus: 1.8186, dc_hotswap: 1.7426,
+  power_battery_mgmt: 1.5918, amp_audio: 1.5536, amp_instrumentation: 1.4791,
+  amp_opamps: 1.4433, interface_can: 1.1776, interface_lin: 0.8176,
+  dc_efuses: 0.7777, power_dcdc_switching: 0.771, mcu_mspm0: 0.7603,
+  power_acdc_switching: 0.6569, power_supervisor_reset: 0.6002, power_ldo: 0.3257,
+  amp_comparators: 0.2136,
+}
+
 // Resolve the historical index value for a subcategory at a given date
 // (calendar date in YYYY-MM-DD form). Returns null if the date predates the
 // subcategory's first available baseline.

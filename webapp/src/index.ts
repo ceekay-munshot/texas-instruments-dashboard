@@ -32,6 +32,7 @@ import {
   SUB_TO_BASELINE,
   OWN_CAPTURE_FIRST_DATE,
   resolveHistoricalPoint,
+  HANDOFF_WEIGHTED_ASP,
 } from './data/historicalBaseline'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
@@ -650,6 +651,9 @@ export async function resolveLiveCascade(
   view: ViewKind,
   liveAsOf: string,
   pricesData: Record<string, any>,
+  // Phase 27.3 — opt into the stock-weighted engine. Off by default so the
+  // live (legacy single-SKU) path is byte-for-byte unchanged until verified.
+  useWeighted: boolean = false,
 ): Promise<{
   liveSnapshot: LiveSnapshot
   anchorSnapshot: AnchorSnapshot
@@ -875,6 +879,52 @@ export async function resolveLiveCascade(
     if (resolved) anchorSnapshot[r.canonicalId] = resolved
   }
 
+  // Phase 27.3 — weighted-ASP engine (flagged, off by default). Replaces the
+  // single-SKU live value with the broad stock-weighted ASP and chain-links it
+  // onto the historical baseline at the handoff seed — killing the single-SKU
+  // outliers (+188%) and the cross-base +10% step. The legacy path above is
+  // untouched unless the caller opts in via useWeighted.
+  if (useWeighted && d1) {
+    const wNow: Record<string, number> = {}
+    try {
+      const res: any = await (d1 as any)
+        .prepare('SELECT canonical_subcategory AS sub, asp_stock_weighted AS asp FROM ti_catalog_rollup_latest WHERE asp_stock_weighted IS NOT NULL')
+        .all()
+      for (const row of res?.results ?? []) {
+        if (typeof row.asp === 'number' && row.asp > 0) wNow[row.sub] = row.asp
+      }
+    } catch { /* leave wNow empty → no override, legacy cells stand */ }
+    for (const r of subResolutions) {
+      const sub = r.canonicalId
+      const now = wNow[sub]
+      const seed = HANDOFF_WEIGHTED_ASP[sub]
+      if (!now || now <= 0 || !seed || seed <= 0) continue // no weighted data → keep legacy cell
+      liveSnapshot[sub] = {
+        canonicalId: sub,
+        liveUSD: now,
+        liveDate: liveAsOf,
+        latestSource: 'ti_inventory',
+        representativePartUsed: 'Stock-weighted ASP (catalog)',
+        candidatePartsChecked: [],
+      }
+      // Anchor = handoff seed chain-linked onto the historical baseline for
+      // series subs (carries the real UBS-derived move up to the handoff);
+      // flat seed for anchor subs (no historical series to chain through).
+      let anchorUSD = seed
+      const mapping = SUB_TO_BASELINE[sub]
+      if (mapping?.kind === 'series') {
+        const hA = resolveHistoricalPoint(sub, anchorTargetDate)
+        const hH = resolveHistoricalPoint(sub, OWN_CAPTURE_FIRST_DATE)
+        if (hA && hH && hH.index > 0) anchorUSD = seed * (hA.index / hH.index)
+      }
+      anchorSnapshot[sub] = {
+        anchorUSD,
+        anchorDate: anchorTargetDate,
+        anchorLabel: 'Historical baseline',
+      }
+    }
+  }
+
   return { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs }
 }
 
@@ -913,11 +963,15 @@ app.get('/api/ti/trend/series', async (c) => {
   const serverStart = Date.now()
   const rawView = (c.req.query('view') ?? 'qoq').toLowerCase()
   const view: ViewKind = rawView === 'wow' || rawView === 'mom' ? rawView as ViewKind : 'qoq'
+  // Phase 27.3 — ?weighted=1 opts into the stock-weighted engine for the live
+  // row, so we can A/B the new numbers against the live ones before flipping
+  // the tabs over. Default (no param) is the unchanged legacy path.
+  const useWeighted = c.req.query('weighted') === '1'
 
   const { pricesData, liveAsOf } = await resolveLivePricesContext(c.env)
 
   const [cascade, snapshotByPeriodCanonical] = await Promise.all([
-    resolveLiveCascade(c.env, view, liveAsOf, pricesData),
+    resolveLiveCascade(c.env, view, liveAsOf, pricesData, useWeighted),
     readSnapshotsByView(c.env.TI_INVENTORY_HISTORY_DB, view),
   ])
   const { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs } = cascade
@@ -967,6 +1021,7 @@ async function computeAndPersistSnapshot(
   env: Bindings,
   view: ViewKind,
   periodEndDate: string,
+  useWeighted: boolean = false,
 ): Promise<{
   view: ViewKind
   periodEndDate: string
@@ -983,7 +1038,7 @@ async function computeAndPersistSnapshot(
   // for the small set of subs that don't have own captures.
   const { pricesData } = await resolveLivePricesContext(env)
   const { liveSnapshot, anchorSnapshot, d1LookupMs } =
-    await resolveLiveCascade(env, view, periodEndDate, pricesData)
+    await resolveLiveCascade(env, view, periodEndDate, pricesData, useWeighted)
 
   const now = new Date().toISOString()
   const rowsToWrite: SnapshotRow[] = []
@@ -1056,7 +1111,7 @@ app.post('/api/ti/trend/snapshot-period', async (c) => {
     return c.json({ success: false, status: 'd1_not_configured' })
   }
 
-  let body: { views?: ('wow' | 'mom' | 'qoq')[]; date?: string } = {}
+  let body: { views?: ('wow' | 'mom' | 'qoq')[]; date?: string; weighted?: boolean } = {}
   try { body = await c.req.json() } catch {}
 
   const todayUTC = new Date()
@@ -1076,11 +1131,15 @@ app.post('/api/ti/trend/snapshot-period', async (c) => {
     })
   }
 
+  // Phase 27.3 — weighted=true recomputes the frozen row with the stock-weighted
+  // engine (used to repair the May single-SKU artifact rows). Defaults to the
+  // legacy single-SKU path so existing automated freezes stay unchanged.
+  const useWeighted = body.weighted === true || c.req.query('weighted') === '1'
   const runs = []
   for (const view of views) {
-    runs.push(await computeAndPersistSnapshot(env, view, dateISO))
+    runs.push(await computeAndPersistSnapshot(env, view, dateISO, useWeighted))
   }
-  return c.json({ success: true, date: dateISO, runs })
+  return c.json({ success: true, date: dateISO, weighted: useWeighted, runs })
 })
 
 // Reverse map for handler use only — canonical id → legacy id (for PART_MAP).
