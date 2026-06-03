@@ -35,6 +35,7 @@ import {
   HANDOFF_WEIGHTED_ASP,
 } from './data/historicalBaseline'
 import { buildWeightedSeries, applyWeightedSeriesOverride } from './sources/weightedSeries'
+import { buildBroadLfl, applyBroadLflOverride, snapshotOpnPriceHistory } from './sources/likeForLikeSeries'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -968,6 +969,12 @@ app.get('/api/ti/trend/series', async (c) => {
   // row, so we can A/B the new numbers against the live ones before flipping
   // the tabs over. Default (no param) is the unchanged legacy path.
   const useWeighted = c.req.query('weighted') === '1'
+  // Phase 28 — ?lfl=1 overlays the broad like-for-like (constant-basket) index
+  // on top of the stock-weighted view: each covered cell flips from "ASP incl.
+  // mix" to "pure price" as the 72k part-level history accumulates. Implies the
+  // weighted overlay so uncovered cells still show the broad ASP move, not the
+  // legacy single-SKU number.
+  const useLfl = c.req.query('lfl') === '1'
 
   const { pricesData, liveAsOf } = await resolveLivePricesContext(c.env)
 
@@ -982,9 +989,17 @@ app.get('/api/ti/trend/series', async (c) => {
   // the move between its two period boundaries, read from rollup_history. The
   // weekly capture appends a point automatically, so this fills in on its own.
   // Rows whose start predates the series keep their historical value.
-  if (useWeighted) {
+  if (useWeighted || useLfl) {
     const series = await buildWeightedSeries(c.env.TI_INVENTORY_HISTORY_DB as any)
     applyWeightedSeriesOverride(result, series, liveAsOf)
+  }
+  // Phase 28 — like-for-like overlay (pure price). Runs AFTER the weighted
+  // overlay so it upgrades covered cells from ASP-incl-mix to constant-basket
+  // price; cells it can't cover yet keep the weighted value. Self-fills as the
+  // 72k part-level history grows (lfl/snapshot appends a point per capture).
+  if (useLfl) {
+    const lfl = await buildBroadLfl(c.env.TI_INVENTORY_HISTORY_DB as any)
+    applyBroadLflOverride(result, lfl, liveAsOf)
   }
   // Internal/debug counts — used during verification, not shown in customer UI.
   const sourceCounts = { ti_inventory: 0, prices_fallback: 0 }
@@ -4117,6 +4132,61 @@ app.get('/api/ti/universe/catalog/rollups/history/status', async (c) => {
     ...status,
     note: 'Phase 26C — hasBaseline = at least one history row exists; hasTrendReady = at least one canonical subcategory has ≥2 stored snapshots in the last 30 days.',
   })
+})
+
+// Phase 28 — POST /api/ti/universe/catalog/lfl/snapshot
+// Appends a part-level price snapshot of the CURRENT ti_catalog_latest_opn into
+// ti_catalog_opn_price_history, stamped with one date, so the broad
+// like-for-like (constant-basket) index can compute pure-price moves between
+// captures. Gated by SNAPSHOT_CAPTURE_SECRET. The catalog ingest workflow calls
+// this once after finalize; safe to call manually to seed. Idempotent per date.
+app.post('/api/ti/universe/catalog/lfl/snapshot', async (c) => {
+  const env = c.env
+  if (!env.SNAPSHOT_CAPTURE_SECRET) {
+    return c.json({ success: false, status: 'not_configured', message: 'Set SNAPSHOT_CAPTURE_SECRET.' }, 503)
+  }
+  const provided = (c.req.header('x-capture-secret') || c.req.query('secret') || '').trim()
+  if (provided !== (env.SNAPSHOT_CAPTURE_SECRET || '').trim()) {
+    return c.json({ success: false, status: 'unauthorized' }, 401)
+  }
+  const d1 = env.TI_INVENTORY_HISTORY_DB
+  if (!d1) return c.json({ success: false, status: 'd1_not_bound' }, 503)
+  // Stamp all parts with ONE date: explicit ?date=YYYY-MM-DD, else the latest
+  // capture date present in ti_catalog_latest_opn (so a fresh full capture seeds
+  // a clean single-date point; a partial/mixed capture still collapses to its
+  // newest date, and the next clean capture INSERT-OR-REPLACEs it).
+  let date = (c.req.query('date') || '').trim()
+  if (!date) {
+    try {
+      const r: any = await d1.prepare('SELECT substr(MAX(latest_captured_at),1,10) AS d FROM ti_catalog_latest_opn').first()
+      date = (r?.d as string) || new Date().toISOString().slice(0, 10)
+    } catch { date = new Date().toISOString().slice(0, 10) }
+  }
+  const out = await snapshotOpnPriceHistory(d1 as any, date)
+  return c.json({ success: out.errors.length === 0, date, ...out })
+})
+
+// GET /api/ti/universe/catalog/lfl/status — public, sanitized. Confirms the
+// part-level price history is accumulating capture-by-capture.
+app.get('/api/ti/universe/catalog/lfl/status', async (c) => {
+  const d1 = c.env.TI_INVENTORY_HISTORY_DB
+  if (!d1) return c.json({ success: false, status: 'd1_not_bound' }, 503)
+  try {
+    const tot: any = await d1.prepare(
+      `SELECT COUNT(*) AS rows, COUNT(DISTINCT captured_date) AS dates,
+              COUNT(DISTINCT canonical_subcategory) AS subs,
+              MIN(captured_date) AS first_date, MAX(captured_date) AS last_date
+         FROM ti_catalog_opn_price_history`,
+    ).first()
+    const perDate: any = await d1.prepare(
+      `SELECT captured_date AS date, COUNT(*) AS parts,
+              COUNT(DISTINCT canonical_subcategory) AS subs
+         FROM ti_catalog_opn_price_history GROUP BY captured_date ORDER BY captured_date`,
+    ).all()
+    return c.json({ success: true, total: tot, perDate: perDate?.results ?? [] })
+  } catch (e: any) {
+    return c.json({ success: false, error: String(e?.message || e), hint: 'table may not exist until first snapshot' })
+  }
 })
 
 // GET /api/ti/universe/catalog/rollups/latest — public, sanitized.
