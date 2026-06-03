@@ -79,26 +79,36 @@ export function applyWeightedSeriesOverride(
 ): { overridden: number } {
   let overridden = 0
   for (const col of result.columns) {
-    const pts = series[col.canonicalId]
-    if (!pts || pts.length < 1) continue
+    const sub = col.canonicalId
+    const pts = series[sub]
+    const hasSeries = !!(pts && pts.length)
     for (let i = 0; i < result.rows.length; i++) {
       const row = result.rows[i]
       const endDate = row.liveToDate ? liveAsOf : row.periodEnd
       const startDate = i > 0 ? result.rows[i - 1].periodEnd : null
       if (!startDate) continue
-      const e = weightedAt(pts, endDate)
-      const s = weightedAt(pts, startDate)
-      if (!e || !s || s.asp <= 0) continue // a boundary predates the series → keep existing value
-      row.cells[col.canonicalId] = {
-        ...row.cells[col.canonicalId],
-        pct: ((e.asp - s.asp) / s.asp) * 100,
-        breakdown: {
-          todayUSD: e.asp, todayDate: e.date, todayLabel: 'Latest capture',
-          anchorUSD: s.asp, anchorDate: s.date, anchorLabel: 'Historical baseline',
-          latestSource: 'ti_inventory', representativePartUsed: 'Stock-weighted ASP (72k catalog)',
-        },
+      if (hasSeries) {
+        const e = weightedAt(pts, endDate)
+        const s = weightedAt(pts, startDate)
+        if (!e || !s || s.asp <= 0) continue // a boundary predates the series → keep existing value
+        row.cells[sub] = {
+          ...row.cells[sub],
+          pct: ((e.asp - s.asp) / s.asp) * 100,
+          breakdown: {
+            todayUSD: e.asp, todayDate: e.date, todayLabel: 'Latest capture',
+            anchorUSD: s.asp, anchorDate: s.date, anchorLabel: 'Historical baseline',
+            latestSource: 'ti_inventory', representativePartUsed: 'Stock-weighted ASP (72k catalog)',
+          },
+        }
+        overridden += 1
+      } else if (endDate >= HANDOFF_DATE) {
+        // No broad weighted series for this subcategory (e.g. a lone GaN SKU
+        // the hygiene filter leaves unpriced). Its post-handoff cells come from
+        // the untrustworthy single-part path — blank them ("—") rather than
+        // surface a single SKU's step as a category move. Pre-handoff rows keep
+        // their historical value.
+        row.cells[sub] = { ...row.cells[sub], pct: null, breakdown: undefined }
       }
-      overridden += 1
     }
   }
   return { overridden }
