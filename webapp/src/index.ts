@@ -34,11 +34,6 @@ import {
   resolveHistoricalPoint,
   HANDOFF_WEIGHTED_ASP,
 } from './data/historicalBaseline'
-import {
-  buildDailyWeightedSeries,
-  buildWeeklyWeightedSeries,
-  applyWeightedSeriesOverride,
-} from './sources/weightedSeries'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -982,18 +977,6 @@ app.get('/api/ti/trend/series', async (c) => {
   const { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs } = cascade
 
   const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot, snapshotByPeriodCanonical)
-  // Phase 27.4 — replace the single-anchor stopgap with a weighted-ASP TIME
-  // SERIES: each cell's % is the move between its two period boundaries, read
-  // from the daily 74-part panel (now) and auto-switched to the weekly 72k
-  // catalog series once it has >= 2 points. Rows whose start predates the
-  // series keep their historical (UBS-derived) value, so the blend is seamless.
-  if (useWeighted) {
-    const [daily, weekly] = await Promise.all([
-      buildDailyWeightedSeries(c.env.TI_INVENTORY_HISTORY_DB as any),
-      buildWeeklyWeightedSeries(c.env.TI_INVENTORY_HISTORY_DB as any),
-    ])
-    applyWeightedSeriesOverride(result, daily, weekly, liveAsOf)
-  }
   // Internal/debug counts — used during verification, not shown in customer UI.
   const sourceCounts = { ti_inventory: 0, prices_fallback: 0 }
   for (const entry of Object.values(liveSnapshot)) {
