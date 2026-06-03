@@ -3068,7 +3068,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
       setLoading(true);
       setError(null);
     }
-    fetch(`/api/ti/trend/series?view=${view}&weighted=1`)
+    fetch(`/api/ti/trend/series?view=${view}&lfl=1`)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
       .then(j => {
         if (!alive) return;
@@ -4163,7 +4163,7 @@ function App(){
       const [XLSX, fflate, ...datasets] = await Promise.all([
         loadXLSXLib(),
         loadFflateLib().catch(() => null),
-        ...views.map(v => fetch(`/api/ti/trend/series?view=${v.key}&weighted=1`).then(r => {
+        ...views.map(v => fetch(`/api/ti/trend/series?view=${v.key}&lfl=1`).then(r => {
           if (!r.ok) throw new Error(`${v.label}: HTTP ${r.status}`);
           return r.json();
         })),
