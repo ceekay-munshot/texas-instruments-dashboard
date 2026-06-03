@@ -712,6 +712,24 @@ jobs:
             "${BASE_URL}/api/ti/universe/catalog/finalize" \
             | jq -c .
 
+      - name: Snapshot part-level prices for like-for-like index (real_catalog only)
+        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
+        run: |
+          set -uo pipefail
+          # Phase 28 — append one part-level price point per OPN to
+          # ti_catalog_opn_price_history, stamped with this capture's date, so
+          # the broad like-for-like (constant-basket) index can compute
+          # pure-price moves between captures. Non-fatal: a failure here must
+          # not fail the capture.
+          snap_date="${CAPTURED_AT:0:10}"
+          curl -sS -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            "${BASE_URL}/api/ti/universe/catalog/lfl/snapshot?date=${snap_date}" \
+            | jq -c . || true
+
       - name: Read /catalog/status + validate + close ledger (real_catalog only)
         if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
