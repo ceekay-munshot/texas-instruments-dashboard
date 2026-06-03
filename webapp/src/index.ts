@@ -34,6 +34,7 @@ import {
   resolveHistoricalPoint,
   HANDOFF_WEIGHTED_ASP,
 } from './data/historicalBaseline'
+import { buildWeightedSeries, applyWeightedSeriesOverride } from './sources/weightedSeries'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -977,6 +978,14 @@ app.get('/api/ti/trend/series', async (c) => {
   const { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs } = cascade
 
   const result = buildTrendView(view, liveSnapshot, liveAsOf, anchorSnapshot, snapshotByPeriodCanonical)
+  // Phase 27.6 — overlay the broad 72k weighted-ASP series: each cell's % is
+  // the move between its two period boundaries, read from rollup_history. The
+  // weekly capture appends a point automatically, so this fills in on its own.
+  // Rows whose start predates the series keep their historical value.
+  if (useWeighted) {
+    const series = await buildWeightedSeries(c.env.TI_INVENTORY_HISTORY_DB as any)
+    applyWeightedSeriesOverride(result, series, liveAsOf)
+  }
   // Internal/debug counts — used during verification, not shown in customer UI.
   const sourceCounts = { ti_inventory: 0, prices_fallback: 0 }
   for (const entry of Object.values(liveSnapshot)) {
