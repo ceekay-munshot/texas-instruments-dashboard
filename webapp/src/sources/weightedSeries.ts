@@ -106,29 +106,32 @@ function aspAtOrBefore(pts: { date: string; asp: number }[] | undefined, date: s
 
 type Move = { pct: number; startUSD: number; endUSD: number }
 
-// Like-for-like move over the daily panel: fixed (start-date) weights, only
-// parts priced at BOTH boundaries. Returns null if the basket is empty.
+// Like-for-like move over the thin daily panel. The panel is dominated by a
+// few expensive parts, so we EQUAL-WEIGHT per part (mean of each part's price
+// relative) — a 20% move in a $2 part counts the same as in an $800 part. Two
+// guards keep the thin basket honest:
+//   • per-part outlier cap (±50%): a single part's implausible jump (list
+//     reset / capture glitch) is excluded, not allowed to define the category.
+//   • require ≥2 like-for-like parts: single-part subcategories (e.g. a lone
+//     GaN SKU) fall through to the stopgap instead of showing a raw step.
 function dailyMove(sub: Record<string, PricePoint[]> | undefined, startDate: string, endDate: string): Move | null {
   if (!sub) return null
-  let wNum = 0, wDen = 0, wTot = 0   // stock-weighted: Σ(p·w)
-  let eStart = 0, eEnd = 0, n = 0    // equal-weight fallback: mean price
+  const rels: number[] = []
+  let startPriceSum = 0
   for (const part of Object.keys(sub)) {
     const a = pointAtOrBefore(sub[part], startDate)
     const b = pointAtOrBefore(sub[part], endDate)
-    if (!a || !b) continue // like-for-like: must exist at both ends
-    const w = a.qty // FIXED weight = stock at the start boundary
-    if (w > 0) { wNum += b.price * w; wDen += a.price * w; wTot += w }
-    eStart += a.price; eEnd += b.price; n += 1
+    if (!a || !b || a.price <= 0) continue // like-for-like: priced at both ends
+    const rel = b.price / a.price
+    if (rel < 0.5 || rel > 1.5) continue // per-part outlier guard
+    rels.push(rel)
+    startPriceSum += a.price
   }
-  if (wTot > 0 && wDen > 0) {
-    const endUSD = wNum / wTot, startUSD = wDen / wTot
-    return { pct: (endUSD - startUSD) / startUSD * 100, startUSD, endUSD }
-  }
-  if (n > 0 && eStart > 0) {
-    const startUSD = eStart / n, endUSD = eEnd / n
-    return { pct: (endUSD - startUSD) / startUSD * 100, startUSD, endUSD }
-  }
-  return null
+  if (rels.length < 2) return null // need ≥2 parts; else keep the stopgap
+  const meanRel = rels.reduce((s, r) => s + r, 0) / rels.length
+  const startUSD = startPriceSum / rels.length
+  const endUSD = startUSD * meanRel // keeps the receipt's (end−start)/start == pct
+  return { pct: (meanRel - 1) * 100, startUSD, endUSD }
 }
 
 // Weekly broad move: raw ASP diff (mix-affected until per-OPN history exists).
