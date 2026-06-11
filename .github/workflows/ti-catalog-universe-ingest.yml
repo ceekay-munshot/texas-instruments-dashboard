@@ -902,9 +902,10 @@ jobs:
             echo "Issue already filed today — not duplicating."
             exit 0
           fi
+          body="Scheduled run failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="${body}"$'\n\n'"The backup crons (Mon/Wed 07:47 UTC) will retry automatically while the last capture is >4 days old."
+          body="${body}"$'\n\n'"If this issue keeps appearing, the pipeline needs attention — common causes: TI quota 429 (check /api/ti/universe/catalog/quota/status), expired TI_CLIENT_ID/TI_CLIENT_SECRET, or Cloudflare deploy issues."
           gh issue create --repo "${GITHUB_REPOSITORY}" \
             --title "${title}" \
-            --body "Scheduled run failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-
-The backup crons (Mon/Wed 07:47 UTC) will retry automatically while the last capture is >4 days old. If this issue keeps appearing, the pipeline needs attention — common causes: TI quota 429 (check /api/ti/universe/catalog/quota/status), expired TI_CLIENT_ID/TI_CLIENT_SECRET, or Cloudflare deploy issues." \
+            --body "${body}" \
             || echo "::warning::Could not create issue (permissions?)."
