@@ -3382,6 +3382,7 @@ function TrendSeriesPanel({ vis, setVis, hiddenSub, setHiddenSub, isRateLimited,
                           setReceipt({
                             subLabel: c.label,
                             periodLabel: r.label,
+                            cellPct: pct,
                             ...(description ? { description } : {}),
                             ...(hasComposite ? { composite: cell.composite } : { breakdown: cell.breakdown }),
                             anchorXY: { x: rect.left + rect.width / 2, y: rect.bottom },
@@ -3566,13 +3567,18 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
   if (receipt.composite) {
     return <CompositeReceiptPopover receipt={receipt} onClose={onClose} popoverRef={popoverRef} B={B} />;
   }
-  const { subLabel, periodLabel, breakdown, anchorXY, description } = receipt;
+  const { subLabel, periodLabel, breakdown, anchorXY, description, cellPct } = receipt;
   const fmtUSD = (v) => `$${Number(v).toFixed(4)}`;
   const today = breakdown.todayUSD;
   const anchor = breakdown.anchorUSD;
-  const pct = ((today - anchor) / anchor) * 100;
+  // Index-based cells (like-for-like panel / constant-basket) carry no single
+  // dollar level — todayUSD/anchorUSD are null by design. Without this guard
+  // the popover fabricated "$0.0000" out of the null and "computed" −100.00%,
+  // contradicting the (correct) cell value. Percent-first rendering instead.
+  const hasLevels = today != null && anchor != null && Number(anchor) > 0;
+  const pct = hasLevels ? ((today - anchor) / anchor) * 100 : (cellPct ?? null);
   const sign = pct > 0 ? '+' : '';
-  const pctText = `${sign}${pct.toFixed(2)}%`;
+  const pctText = pct == null ? '—' : `${sign}${pct.toFixed(2)}%`;
 
   // Position: pinned just below the clicked cell, viewport-clamped.
   const [pos, setPos] = useState(null);
@@ -3635,14 +3641,19 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
 
       <div style={{display:'grid',gridTemplateColumns:'auto auto',rowGap:6,columnGap:18,marginBottom:12}}>
         <div style={{color:'#7a96b8'}}>{breakdown.todayLabel} ({fmtDate(breakdown.todayDate)})</div>
-        <div style={{textAlign:'right',color:'#c4d4e8',fontWeight:'bold'}}>{fmtUSD(today)}</div>
+        <div style={{textAlign:'right',color:'#c4d4e8',fontWeight:'bold'}}>{hasLevels ? fmtUSD(today) : '—'}</div>
         <div style={{color:'#7a96b8'}}>{breakdown.anchorLabel} ({fmtDate(breakdown.anchorDate)})</div>
-        <div style={{textAlign:'right',color:'#c4d4e8',fontWeight:'bold'}}>{fmtUSD(anchor)}</div>
+        <div style={{textAlign:'right',color:'#c4d4e8',fontWeight:'bold'}}>{hasLevels ? fmtUSD(anchor) : '—'}</div>
       </div>
 
       <div style={{borderTop:`1px solid ${B}`,paddingTop:10,fontSize:'0.7rem'}}>
+        {!hasLevels && breakdown.representativePartUsed && (
+          <div style={{color:'#7a96b8',marginBottom:6,lineHeight:1.5}}>{breakdown.representativePartUsed}</div>
+        )}
         <span style={{color:'#7a96b8'}}>
-          ({fmtUSD(today)} − {fmtUSD(anchor)}) / {fmtUSD(anchor)} × 100 =
+          {hasLevels
+            ? <>({fmtUSD(today)} − {fmtUSD(anchor)}) / {fmtUSD(anchor)} × 100 =</>
+            : <>Change over period =</>}
         </span>
         <span style={{
           marginLeft: 6,

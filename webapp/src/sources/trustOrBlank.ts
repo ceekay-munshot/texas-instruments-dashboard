@@ -53,12 +53,18 @@ export function applyTrustOrBlank(
         const mv = panelLflMove(panel, sub, HANDOFF_DATE, liveAsOf)
         if (seed > 0 && anchorUSD > 0 && mv) {
           const histLeg = seed / anchorUSD - 1
+          const pctVal = ((1 + histLeg) * (1 + mv.pct / 100) - 1) * 100
           row.cells[sub] = {
             ...row.cells[sub],
-            pct: ((1 + histLeg) * (1 + mv.pct / 100) - 1) * 100,
+            pct: pctVal,
             breakdown: {
               ...row.cells[sub]?.breakdown,
-              todayUSD: null, todayDate: liveAsOf, todayLabel: 'Latest daily capture',
+              // The implied level (= May-4 seed × the panel's pure-price move,
+              // i.e. today's weighted ASP with the basket mix held constant).
+              // Gives the click-receipt real, internally consistent arithmetic
+              // — a null here rendered as "$0.0000 → −100.00%" in the popover.
+              todayUSD: anchorUSD * (1 + pctVal / 100),
+              todayDate: liveAsOf, todayLabel: 'Implied level · mix held constant',
               latestSource: 'ti_inventory',
               representativePartUsed: `Hist baseline × Like-for-like · ${mv.n} daily-tracked parts`,
             },
