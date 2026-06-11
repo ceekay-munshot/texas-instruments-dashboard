@@ -63,9 +63,12 @@ on:
   # Lands ~Monday 03:47 Hong Kong / Sunday late-morning San Francisco, with
   # ~47 minutes of runtime so the full universe is fresh before the
   # Hong Kong 05:00 Monday read. workflow_dispatch is preserved below so
-  # operators can still trigger an out-of-band run. Scheduled runs use the
-  # workflow_dispatch input defaults (real_catalog, chunk_size 100,
-  # dry_run false, expected_opn_count 72139).
+  # operators can still trigger an out-of-band run. NOTE: on schedule events
+  # the `inputs` context is EMPTY (GitHub does not apply workflow_dispatch
+  # defaults), so every real_catalog condition also accepts
+  # github.event_name == 'schedule', and TEST_MODE / CHUNK_SIZE fall back to
+  # 'real_catalog' / '100' via `||`. Before this, every Sunday run skipped all
+  # steps and exited green in ~6s without capturing anything.
   schedule:
     - cron: '47 19 * * 0'
   workflow_dispatch:
@@ -124,7 +127,7 @@ jobs:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           TI_CLIENT_ID: ${{ secrets.TI_CLIENT_ID }}
           TI_CLIENT_SECRET: ${{ secrets.TI_CLIENT_SECRET }}
-          TEST_MODE: ${{ inputs.test_mode }}
+          TEST_MODE: ${{ inputs.test_mode || 'real_catalog' }}
         run: |
           if [ -z "${CAPTURE_SECRET:-}" ]; then
             echo "::error::Repo secret SNAPSHOT_CAPTURE_SECRET is not set."
@@ -394,7 +397,7 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
 
       - name: Quota preflight (real_catalog only)
-        if: ${{ inputs.test_mode == 'real_catalog' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') }}
         id: preflight
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
@@ -434,7 +437,7 @@ jobs:
           echo "run_id=${run_id}"          >> "$GITHUB_OUTPUT"
 
       - name: Fetch TI OAuth token (real_catalog only)
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: token
         env:
           TI_CLIENT_ID: ${{ secrets.TI_CLIENT_ID }}
@@ -474,7 +477,7 @@ jobs:
           echo "Token acquired (value masked)."
 
       - name: Fetch TI catalog (one shot) (real_catalog only)
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: fetch
         env:
           TI_TOKEN: ${{ steps.token.outputs.ti_token }}
@@ -537,10 +540,10 @@ jobs:
           echo "total_products=${total}" >> "$GITHUB_OUTPUT"
 
       - name: Split catalog into chunks (real_catalog only)
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' }}
         id: split
         env:
-          CHUNK_SIZE: ${{ inputs.chunk_size }}
+          CHUNK_SIZE: ${{ inputs.chunk_size || '100' }}
           RUN_ID: ${{ steps.preflight.outputs.run_id }}
         run: |
           set -uo pipefail
@@ -592,7 +595,7 @@ jobs:
 
       - name: POST each chunk to Worker (real_catalog only)
         id: post_chunks
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           TOTAL_CHUNKS: ${{ steps.split.outputs.total_chunks }}
@@ -693,7 +696,7 @@ jobs:
           echo "sql_statements=${TOTAL_STMTS}"              >> "$GITHUB_OUTPUT"
 
       - name: Finalize (rebuild GPN aggregates + insert snapshot run row)
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
@@ -713,7 +716,7 @@ jobs:
             | jq -c .
 
       - name: Snapshot part-level prices for like-for-like index (real_catalog only)
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
@@ -731,7 +734,7 @@ jobs:
             | jq -c . || true
 
       - name: Read /catalog/status + validate + close ledger (real_catalog only)
-        if: ${{ inputs.test_mode == 'real_catalog' && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
+        if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           RUN_ID: ${{ steps.preflight.outputs.run_id }}
@@ -805,7 +808,7 @@ jobs:
             "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c .
 
       - name: Upload tiny diagnostic artifacts (failure only)
-        if: failure() && inputs.test_mode == 'real_catalog'
+        if: failure() && (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog')
         uses: actions/upload-artifact@v4
         with:
           name: ti-catalog-diagnostics

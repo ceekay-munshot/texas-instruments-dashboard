@@ -979,7 +979,10 @@ app.get('/api/ti/trend/series', async (c) => {
   const { pricesData, liveAsOf } = await resolveLivePricesContext(c.env)
 
   const [cascade, snapshotByPeriodCanonical] = await Promise.all([
-    resolveLiveCascade(c.env, view, liveAsOf, pricesData, useWeighted),
+    // ?lfl=1 implies the weighted live-row cascade too — without this, rows the
+    // series overlay can't reach (QoQ live row starts pre-series) fall back to
+    // the legacy single-representative-part math (the +126%/-22.7% artifacts).
+    resolveLiveCascade(c.env, view, liveAsOf, pricesData, useWeighted || useLfl),
     readSnapshotsByView(c.env.TI_INVENTORY_HISTORY_DB, view),
   ])
   const { liveSnapshot, anchorSnapshot, fallbackSubs, d1LookupMs } = cascade
