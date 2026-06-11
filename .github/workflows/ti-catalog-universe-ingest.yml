@@ -420,7 +420,10 @@ jobs:
               parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_json")
               if [ -n "$last_capture" ] && [ "$parsed_ok" = "1" ]; then
                 age_days=$(( ( $(date -u +%s) - $(date -u -d "${last_capture}" +%s) ) / 86400 ))
-                if [ "$age_days" -lt 4 ]; then
+                # <5 days (not <4): a Wednesday capture is exactly 4.04d old at the
+                # following Monday 07:47 slot — <4 missed the skip by 63 minutes and
+                # burned a TI quota call on healthy data.
+                if [ "$age_days" -lt 5 ]; then
                   echo "::notice::Catalog already captured ${age_days}d ago (${last_capture}) — backup slot not needed."
                   echo "skip_real_catalog=true" >> "$GITHUB_OUTPUT"
                   exit 0
@@ -896,10 +899,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          title="TI catalog scheduled capture failed ($(date -u +%F))"
+          # Undated title so the dedupe holds across days — a dated title would
+          # file a fresh issue every failing day (audit finding: issue spam).
+          title="TI catalog scheduled capture is failing"
           existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title \"${title}\"" --json number --jq 'length' || echo 0)
           if [ "${existing}" != "0" ]; then
-            echo "Issue already filed today — not duplicating."
+            echo "Open issue already exists — not duplicating."
             exit 0
           fi
           body="Scheduled run failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

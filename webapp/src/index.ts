@@ -37,6 +37,7 @@ import {
 import { buildWeightedSeries, applyWeightedSeriesOverride } from './sources/weightedSeries'
 import { buildBroadLfl, applyBroadLflOverride, snapshotOpnPriceHistory } from './sources/likeForLikeSeries'
 import { buildPanelLfl, applyPanelGapOverride } from './sources/panelLflSeries'
+import { applyTrustOrBlank } from './sources/trustOrBlank'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -1003,6 +1004,12 @@ app.get('/api/ti/trend/series', async (c) => {
     // / MTD Jun" before this). Self-retires as weekly broad points accumulate.
     const panel = await buildPanelLfl(c.env.TI_INVENTORY_HISTORY_DB as any)
     applyPanelGapOverride(result, panel, series, liveAsOf)
+    // Phase 28.3 — post-handoff cells neither trusted source can measure show
+    // "—" instead of a stale zero, a mix-contaminated broad move, or an old
+    // frozen artifact. The QoQ live chain row composes hist × panel L4L. Runs
+    // BEFORE the broad-L4L overlay so accumulated 72k part-level history
+    // overwrites blanks automatically as it grows.
+    applyTrustOrBlank(result, series, panel, liveAsOf)
   }
   // Phase 28 — like-for-like overlay (pure price). Runs AFTER the weighted
   // overlay so it upgrades covered cells from ASP-incl-mix to constant-basket
@@ -3802,6 +3809,31 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
   const bodyByteSize = Number.isFinite(body?.bodyByteSize) ? Math.trunc(body.bodyByteSize) : null
 
   const errors: string[] = []
+  // Phase 28.3 — purge delisted "zombie" OPNs BEFORE the rebuilds, so GPN
+  // aggregates, rollups, history and the L4L snapshot all see only parts that
+  // exist in TI's catalog today. Without this, INSERT OR REPLACE accumulates
+  // stale-price rows forever (181 after 5 weeks): they pollute the weighted
+  // ASP, get re-stamped into the L4L history as fake permanent 0%-change
+  // pairs, and make the workflow's opnCount==parsedProducts validation fail
+  // every week. Safety floor: only purge when this capture actually landed a
+  // full universe (≥60k fresh rows) — a partial capture must never mass-delete.
+  let zombiesPurged = 0
+  try {
+    const freshRow: any = await (env.TI_INVENTORY_HISTORY_DB as any).prepare(
+      'SELECT COUNT(*) AS n FROM ti_catalog_latest_opn WHERE latest_captured_at >= ?',
+    ).bind(capturedAt).first()
+    const fresh = Number(freshRow?.n ?? 0) || 0
+    if (fresh >= 60000) {
+      const del: any = await (env.TI_INVENTORY_HISTORY_DB as any).prepare(
+        'DELETE FROM ti_catalog_latest_opn WHERE latest_captured_at < ?',
+      ).bind(capturedAt).run()
+      zombiesPurged = Number(del?.meta?.changes ?? 0) || 0
+    } else {
+      errors.push(`zombie_purge_skipped:fresh_rows=${fresh}<60000`)
+    }
+  } catch (e: any) {
+    errors.push(`zombie_purge:${(e?.message || 'failed').slice(0, 140)}`)
+  }
   const gpnRowsUpserted = await rebuildGpnFromOpn(env.TI_INVENTORY_HISTORY_DB as any, capturedAt, errors)
   // Phase 24A.1 — chain the enrichment rebuild so future captures land
   // with cheapest_opn / highest_inventory_opn / lifecycle_summary / median
@@ -3851,6 +3883,7 @@ app.post('/api/ti/universe/catalog/finalize', async (c) => {
     success: errors.length === 0,
     capturedAt,
     source,
+    zombiesPurged,
     gpnRowsUpserted,
     enrichment: {
       enrichedGpns: enrichment.enrichedGpns,

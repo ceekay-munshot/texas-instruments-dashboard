@@ -21,13 +21,12 @@
 // the 72k catalog going forward", panel only bridges the bootstrap gap.
 
 import { mapOpnToCanonical } from './tiCatalogMapping'
-import { weightedAt, type WeightedSeries } from './weightedSeries'
+import { broadOwnsRow, type WeightedSeries } from './weightedSeries'
 
 type D1Like = { prepare: (sql: string) => any } | null
 
 const PANEL_EARLIEST = '2026-04-25' // read a little before the first capture (May-2)
 const START_SNAP_DAYS = 5 // a row-start ≤5d before the panel's first price may snap forward to it
-const BROAD_SLACK_DAYS = 8 // broad point within 8d of a boundary = broad dates this row fine
 const MIN_PARTS = 2
 
 export type PanelPoint = { date: string; price: number }
@@ -122,13 +121,7 @@ export function applyPanelGapOverride(
       const endDate = row.liveToDate ? liveAsOf : row.periodEnd
       const startDate = result.rows[i - 1].periodEnd
       if (!startDate || !endDate) continue
-      const bs = weightedAt(broad[sub], startDate)
-      const be = weightedAt(broad[sub], endDate)
-      const broadDatesThisRow =
-        !!bs && !!be &&
-        daysBetween(bs.date, startDate) <= BROAD_SLACK_DAYS &&
-        daysBetween(be.date, endDate) <= BROAD_SLACK_DAYS
-      if (broadDatesThisRow) continue // broad owns the row — panel never second-guesses it
+      if (broadOwnsRow(broad[sub], startDate, endDate)) continue // broad owns the row — panel never second-guesses it
       const mv = panelLflMove(panel, sub, startDate, endDate)
       if (!mv) continue
       row.cells[sub] = {

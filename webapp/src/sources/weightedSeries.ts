@@ -37,11 +37,17 @@ export async function buildWeightedSeries(d1: D1Like): Promise<WeightedSeries> {
   const byDate: Record<string, Record<string, number>> = {}
   if (d1) {
     try {
+      // Phase 28.3 — only history points BACKED BY A SUCCESSFUL CAPTURE count.
+      // The 2026-06-03 point was rebuilt from a timed-out partial capture
+      // (mostly stale May-4 prices, no snapshot_run row) and smeared 5 weeks
+      // of moves into whichever row straddled it. parsed_ok runs only.
       const res: any = await d1.prepare(
         `SELECT canonical_subcategory AS sub, substr(captured_at,1,10) AS date,
                 asp_stock_weighted AS asp
            FROM ti_catalog_rollup_history
           WHERE asp_stock_weighted IS NOT NULL
+            AND substr(captured_at,1,10) IN (
+              SELECT substr(captured_at,1,10) FROM ti_catalog_snapshot_run WHERE parsed_ok = 1)
           ORDER BY captured_at ASC`,
       ).all()
       for (const r of res?.results ?? []) {
@@ -70,6 +76,28 @@ export function weightedAt(pts: SeriesPoint[] | undefined, date: string): Series
   return ans
 }
 
+export const BROAD_SLACK_DAYS = 8 // a broad point within 8d of a boundary dates that boundary
+const dayMs = 86400000
+function daysApart(a: string, b: string): number {
+  return Math.abs(Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / dayMs))
+}
+
+/** True when the broad series can honestly MEASURE this row: a point sits
+ *  within BROAD_SLACK_DAYS of BOTH boundaries. Without this, a sparse series
+ *  attributes its whole inter-point move to whichever row straddles it (the
+ *  May-8 hike showed as "May 30–Jun 5" / "MTD Jun"; the leftover showed as
+ *  "WTD Jun 6–12"). Single source of truth for every overlay stage. */
+export function broadOwnsRow(
+  pts: SeriesPoint[] | undefined, startDate: string, endDate: string,
+): { s: SeriesPoint; e: SeriesPoint } | null {
+  const s = weightedAt(pts, startDate)
+  const e = weightedAt(pts, endDate)
+  if (!s || !e || s.asp <= 0) return null
+  if (daysApart(s.date, startDate) > BROAD_SLACK_DAYS) return null
+  if (daysApart(e.date, endDate) > BROAD_SLACK_DAYS) return null
+  return { s, e }
+}
+
 /** Override each cell's % with the broad weighted move between its two period
  *  boundaries. Cells whose period-start predates the series are left untouched. */
 export function applyWeightedSeriesOverride(
@@ -81,34 +109,27 @@ export function applyWeightedSeriesOverride(
   for (const col of result.columns) {
     const sub = col.canonicalId
     const pts = series[sub]
-    const hasSeries = !!(pts && pts.length)
-    for (let i = 0; i < result.rows.length; i++) {
+    for (let i = 1; i < result.rows.length; i++) {
       const row = result.rows[i]
       const endDate = row.liveToDate ? liveAsOf : row.periodEnd
-      const startDate = i > 0 ? result.rows[i - 1].periodEnd : null
+      const startDate = result.rows[i - 1].periodEnd
       if (!startDate) continue
-      if (hasSeries) {
-        const e = weightedAt(pts, endDate)
-        const s = weightedAt(pts, startDate)
-        if (!e || !s || s.asp <= 0) continue // a boundary predates the series → keep existing value
-        row.cells[sub] = {
-          ...row.cells[sub],
-          pct: ((e.asp - s.asp) / s.asp) * 100,
-          breakdown: {
-            todayUSD: e.asp, todayDate: e.date, todayLabel: 'Latest capture',
-            anchorUSD: s.asp, anchorDate: s.date, anchorLabel: 'Historical baseline',
-            latestSource: 'ti_inventory', representativePartUsed: 'Stock-weighted ASP (72k catalog)',
-          },
-        }
-        overridden += 1
-      } else if (endDate >= HANDOFF_DATE) {
-        // No broad weighted series for this subcategory (e.g. a lone GaN SKU
-        // the hygiene filter leaves unpriced). Its post-handoff cells come from
-        // the untrustworthy single-part path — blank them ("—") rather than
-        // surface a single SKU's step as a category move. Pre-handoff rows keep
-        // their historical value.
-        row.cells[sub] = { ...row.cells[sub], pct: null, breakdown: undefined }
+      // Phase 28.3 — only override rows the series can honestly MEASURE (a
+      // point within BROAD_SLACK_DAYS of both boundaries). Rows it can't are
+      // left for the daily-panel overlay or the trust-or-blank stage; rows
+      // whose start predates the series keep their historical value there too.
+      const own = broadOwnsRow(pts, startDate, endDate)
+      if (!own) continue
+      row.cells[sub] = {
+        ...row.cells[sub],
+        pct: ((own.e.asp - own.s.asp) / own.s.asp) * 100,
+        breakdown: {
+          todayUSD: own.e.asp, todayDate: own.e.date, todayLabel: 'Latest capture',
+          anchorUSD: own.s.asp, anchorDate: own.s.date, anchorLabel: 'Historical baseline',
+          latestSource: 'ti_inventory', representativePartUsed: 'Stock-weighted ASP (72k catalog)',
+        },
       }
+      overridden += 1
     }
   }
   return { overridden }
