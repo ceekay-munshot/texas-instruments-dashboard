@@ -25,6 +25,7 @@
 // already in the trend view — an invisible seam at the data edge.
 
 import { buildSubcategoryPredicates, type SubcategoryPredicate } from './tiCatalogMapping'
+import { dayNum, BROAD_SLACK_DAYS } from './weightedSeries'
 
 type D1Like = { prepare: (sql: string) => any } | null
 
@@ -83,14 +84,19 @@ export async function snapshotOpnPriceHistory(
   for (const p of predicates()) {
     try {
       const res: any = await d1.prepare(
+        // latest_captured_at >= captureDate keeps STALE rows out of the
+        // snapshot: on a partial capture (or pre-purge zombies) un-refreshed
+        // rows still carry an older stamp, and stamping their old prices with
+        // the new date would poison the constant-basket index permanently.
         `INSERT OR REPLACE INTO ${HIST_TABLE}
            (ti_part_number, captured_date, canonical_subcategory, normalized_unit_price, quantity)
          SELECT ti_part_number, ?, ?, normalized_unit_price, quantity
            FROM ti_catalog_latest_opn
           WHERE (${p.whereClause})
             AND normalized_unit_price IS NOT NULL AND normalized_unit_price > 0
+            AND latest_captured_at >= ?
             AND ${NON_IC_EXCLUSION}`,
-      ).bind(captureDate, p.canonicalSubcategory).run()
+      ).bind(captureDate, p.canonicalSubcategory, captureDate).run()
       inserted += Number(res?.meta?.changes ?? 0) || 0
       subcats += 1
     } catch (e: any) {
@@ -123,11 +129,17 @@ export async function buildBroadLfl(d1: D1Like): Promise<BroadLfl> {
       return out
     }
     const res: any = await d1.prepare(
+      // Snapshot dates only count when backed by a successful (parsed_ok)
+      // capture — mirrors the weighted-series filter. Without this, a partial
+      // capture that sneaks through the workflow stamps stale prices with a
+      // fresh date and permanently poisons the constant-basket index.
       `SELECT canonical_subcategory AS sub, ti_part_number AS opn,
               captured_date AS date, normalized_unit_price AS price
          FROM ${HIST_TABLE}
         WHERE canonical_subcategory IS NOT NULL
           AND normalized_unit_price IS NOT NULL AND normalized_unit_price > 0
+          AND captured_date IN (
+            SELECT substr(captured_at,1,10) FROM ti_catalog_snapshot_run WHERE parsed_ok = 1)
           AND ti_part_number IN (
             SELECT ti_part_number FROM ${HIST_TABLE}
              GROUP BY ti_part_number HAVING COUNT(DISTINCT captured_date) >= 2)
@@ -145,16 +157,21 @@ export async function buildBroadLfl(d1: D1Like): Promise<BroadLfl> {
   return out
 }
 
-/** Price of a part at-or-before `date` (points ascending). */
-function priceAt(points: LflPoint[], date: string): number | null {
-  let ans: number | null = null
-  for (const p of points) { if (p.date <= date) ans = p.price; else break }
+/** Point of a part at-or-before `date` (points ascending). */
+function pointAt(points: LflPoint[], date: string): LflPoint | null {
+  let ans: LflPoint | null = null
+  for (const p of points) { if (p.date <= date) ans = p; else break }
   return ans
 }
 
 /** Matched-pairs equal-weight geometric-mean L4L move between two dates. Only
  *  parts priced at-or-before BOTH boundaries count, so mix/stock cannot move
- *  it — only real per-part price changes. Returns null below MIN_PARTS. */
+ *  it — only real per-part price changes. Returns null below MIN_PARTS.
+ *  Boundary discipline (same ±8d rule as the weighted series): a part only
+ *  counts when its resolved snapshot points sit within BROAD_SLACK_DAYS of
+ *  BOTH boundaries — unbounded carry-forward would smear a capture-gap's
+ *  whole move into the row straddling the gap (the exact misdating bug the
+ *  weighted series fixed) and print confident 0.00% inside gaps. */
 export function broadLflMove(
   lfl: BroadLfl, sub: string, startDate: string, endDate: string,
 ): { pct: number; n: number } | null {
@@ -162,10 +179,12 @@ export function broadLflMove(
   if (!parts) return null
   let sumLn = 0, n = 0
   for (const opn of Object.keys(parts)) {
-    const s = priceAt(parts[opn], startDate)
-    const e = priceAt(parts[opn], endDate)
-    if (s == null || e == null || s <= 0 || e <= 0) continue
-    sumLn += Math.log(e / s)
+    const s = pointAt(parts[opn], startDate)
+    const e = pointAt(parts[opn], endDate)
+    if (!s || !e || s.price <= 0 || e.price <= 0) continue
+    if ((dayNum(startDate) - dayNum(s.date)) / 86400000 > BROAD_SLACK_DAYS) continue
+    if ((dayNum(endDate) - dayNum(e.date)) / 86400000 > BROAD_SLACK_DAYS) continue
+    sumLn += Math.log(e.price / s.price)
     n += 1
   }
   if (n < MIN_PARTS) return null

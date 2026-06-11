@@ -27,12 +27,14 @@ export type ViewKind = 'wow' | 'mom' | 'qoq'
  *  historical baseline), the live cell omits `breakdown` entirely and
  *  renders blank — the cell is not clickable. */
 export type LiveCellBreakdown = {
-  todayUSD: number
+  /** null for index-based cells (panel / constant-basket like-for-like) —
+   *  there is no single dollar level; the receipt renders percent-first. */
+  todayUSD: number | null
   todayDate: string
-  todayLabel: 'Latest capture'
-  anchorUSD: number
+  todayLabel: string
+  anchorUSD: number | null
   anchorDate: string
-  anchorLabel: 'TI capture' | 'Historical baseline'
+  anchorLabel: string
   /** Internal/debug-only — never rendered in the customer-facing receipt.
    *  Tells us which input fed the live USD: own captured TI inventory data
    *  (`ti_inventory`) or the /api/prices distributor mirror used when no TI
@@ -341,14 +343,21 @@ export function buildTrendView(
       // breakdown so closed rows behave like the live row.
       const snap = snapshotForRow[col.canonicalId]
       if (snap) {
+        // Index-based frozen cells (panel / constant-basket like-for-like)
+        // have no real dollar levels; the freeze stores them as a base-1
+        // index (anchor=1, today=1+pct/100) because the snapshot columns are
+        // NOT NULL. Reconstruct them as level-less so the click receipt
+        // renders percent-first instead of "$1.0000".
+        const isIndexSnap = snap.anchorUSD === 1 &&
+          String(snap.representativePartUsed || '').includes('Like-for-like')
         cells[col.canonicalId] = {
           index: cur,
           pct: snap.pct,
           breakdown: {
-            todayUSD: snap.todayUSD,
+            todayUSD: isIndexSnap ? null : snap.todayUSD,
             todayDate: snap.todayDate,
             todayLabel: 'Latest capture',
-            anchorUSD: snap.anchorUSD,
+            anchorUSD: isIndexSnap ? null : snap.anchorUSD,
             anchorDate: snap.anchorDate,
             anchorLabel: snap.anchorLabel as LiveCellBreakdown['anchorLabel'],
             latestSource: snap.latestSource as LiveCellBreakdown['latestSource'],

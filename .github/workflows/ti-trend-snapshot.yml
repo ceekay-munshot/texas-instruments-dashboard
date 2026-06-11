@@ -69,7 +69,7 @@ jobs:
         run: |
           set -uo pipefail
           tmp="$(mktemp)"
-          payload='{}'
+          payload='{"weighted": true}'
           if [ -n "${MANUAL_DATE}" ] || [ -n "${MANUAL_VIEWS}" ]; then
             views_json=''
             if [ -n "${MANUAL_VIEWS}" ]; then

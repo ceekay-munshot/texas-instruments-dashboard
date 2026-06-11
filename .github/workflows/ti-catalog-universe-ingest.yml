@@ -407,6 +407,7 @@ jobs:
         id: preflight
         env:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          SCHEDULE_EXPR: ${{ github.event.schedule }}
         run: |
           set -uo pipefail
           # Freshness gate (scheduled runs only): the Mon/Wed crons are RETRY
@@ -420,11 +421,16 @@ jobs:
               parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_json")
               if [ -n "$last_capture" ] && [ "$parsed_ok" = "1" ]; then
                 age_days=$(( ( $(date -u +%s) - $(date -u -d "${last_capture}" +%s) ) / 86400 ))
-                # <5 days (not <4): a Wednesday capture is exactly 4.04d old at the
-                # following Monday 07:47 slot — <4 missed the skip by 63 minutes and
-                # burned a TI quota call on healthy data.
-                if [ "$age_days" -lt 5 ]; then
-                  echo "::notice::Catalog already captured ${age_days}d ago (${last_capture}) — backup slot not needed."
+                # Slot-aware threshold (Phase 28.6): the Sunday 19:47 PRIMARY
+                # uses <3d so it always recaptures on a weekly cadence — a flat
+                # <5d let mid-week backup captures permanently park the cadence
+                # on the Mon/Wed slots and ride the 5-day knife-edge against the
+                # always() guard. Backups (Mon/Wed 07:47) keep <5d so they only
+                # fire when the primary actually failed.
+                threshold=5
+                if [ "${SCHEDULE_EXPR:-}" = "47 19 * * 0" ]; then threshold=3; fi
+                if [ "$age_days" -lt "$threshold" ]; then
+                  echo "::notice::Catalog already captured ${age_days}d ago (${last_capture}) — this slot (threshold ${threshold}d) not needed."
                   echo "skip_real_catalog=true" >> "$GITHUB_OUTPUT"
                   exit 0
                 fi
@@ -633,6 +639,7 @@ jobs:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
           TOTAL_CHUNKS: ${{ steps.split.outputs.total_chunks }}
           TOTAL_PRODUCTS: ${{ steps.split.outputs.total_products }}
+          RUN_ID: ${{ steps.preflight.outputs.run_id }}
         run: |
           set -uo pipefail
           FAILED_CHUNKS=0
@@ -728,6 +735,20 @@ jobs:
           echo "out_of_stock_opns=${TOTAL_OUT_OF_STOCK}"    >> "$GITHUB_OUTPUT"
           echo "sql_statements=${TOTAL_STMTS}"              >> "$GITHUB_OUTPUT"
 
+          # Phase 28.6 — FAIL FAST on a partial landing, BEFORE finalize runs.
+          # Finalize triggers the zombie purge, rollup rebuild, history append
+          # and the L4L snapshot; running those on a fresh/stale mix poisons
+          # the weighted series and the constant-basket index permanently.
+          if [ "${FAILED_CHUNKS}" != "0" ] || [ "${TOTAL_OPN_UPSERTED}" -lt "${TOTAL_PRODUCTS}" ]; then
+            echo "::error::Partial landing (${FAILED_CHUNKS} failed chunks; ${TOTAL_OPN_UPSERTED}/${TOTAL_PRODUCTS} upserted) — aborting BEFORE finalize so no purge/rollup/L4L runs on mixed data."
+            curl -sS -X POST \
+              -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+              -H 'Content-Type: application/json' \
+              --data "{\"runId\":\"${RUN_ID}\",\"status\":\"failed_chunk_write\",\"notes\":\"partial landing: ${FAILED_CHUNKS} failed chunks, ${TOTAL_OPN_UPSERTED}/${TOTAL_PRODUCTS} upserted\"}" \
+              "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true
+            exit 1
+          fi
+
       - name: Finalize (rebuild GPN aggregates + insert snapshot run row)
         if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
         env:
@@ -741,12 +762,21 @@ jobs:
             --arg source 'ti_store_v2_catalog_chunked' \
             --argjson bodyByteSize "${BODY_BYTE_SIZE}" \
             '{capturedAt: $capturedAt, source: $source, bodyByteSize: $bodyByteSize, rawR2Key: null}')
-          curl -sS -X POST \
+          resp_file="$(mktemp)"
+          http_code="$(curl -sS -o "$resp_file" -w '%{http_code}' -X POST \
             -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
             -H 'Content-Type: application/json' \
             --data "${payload}" \
-            "${BASE_URL}/api/ti/universe/catalog/finalize" \
-            | jq -c .
+            "${BASE_URL}/api/ti/universe/catalog/finalize")"
+          jq -c . < "$resp_file" || cat "$resp_file"
+          # Phase 28.6 — finalize was the only data POST with no response
+          # validation; a Worker 500 or success:false (rollup/purge errors)
+          # sailed through and the run continued to the L4L snapshot.
+          if [ "${http_code}" != "200" ] || [ "$(jq -r '.success // false' < "$resp_file")" != "true" ]; then
+            echo "::error::Finalize failed (HTTP ${http_code}); errors: $(jq -c '.summary.errors // .errors // empty' < "$resp_file" 2>/dev/null)"
+            exit 1
+          fi
+          echo "Finalize OK — zombiesPurged=$(jq -r '.zombiesPurged // 0' < "$resp_file")"
 
       - name: Snapshot part-level prices for like-for-like index (real_catalog only)
         if: ${{ (github.event_name == 'schedule' || inputs.test_mode == 'real_catalog') && steps.preflight.outputs.skip_real_catalog != 'true' && inputs.dry_run != 'true' }}
@@ -774,6 +804,7 @@ jobs:
           PARSED_PRODUCTS: ${{ steps.split.outputs.total_products }}
           FAILED_CHUNKS: ${{ steps.post_chunks.outputs.failed_chunks }}
           OPN_UPSERTED: ${{ steps.post_chunks.outputs.opn_upserted }}
+          CAPTURED_AT: ${{ steps.split.outputs.captured_at }}
         run: |
           set -uo pipefail
           status_file="$(mktemp)"
@@ -811,6 +842,13 @@ jobs:
           fi
           if [ -z "${latest_at}" ] || [ "${latest_at}" = "null" ]; then
             echo "::error::status.latestCapturedAt missing after finalize."
+            fail=1
+          fi
+          # Phase 28.6 — assert the run we validated is the run we just made:
+          # without this, a stale-but-healthy catalog from a previous capture
+          # could green-light a run whose own writes silently vanished.
+          if [ "${latest_at}" != "${CAPTURED_AT}" ]; then
+            echo "::error::status.latestCapturedAt (${latest_at}) != this run's CAPTURED_AT (${CAPTURED_AT})."
             fail=1
           fi
           if [ "${parsed_ok}" != "1" ] && [ "${parsed_ok}" != "true" ]; then
@@ -914,3 +952,22 @@ jobs:
             --title "${title}" \
             --body "${body}" \
             || echo "::warning::Could not create issue (permissions?)."
+
+      # ── Phase 28.6 — ledger sweeper ─────────────────────────────────────────
+      # A reserved in_flight quota-ledger row that never gets closed blocks
+      # EVERY future capture (readQuotaStatus has no age expiry). Leak paths:
+      # job cancelled, 90-min timeout, transport failure mid-step, dry_run
+      # (which reserves + fetches but never closes). This always() sweep closes
+      # any still-open row for THIS run; /quota/complete only touches rows in
+      # status='in_flight', so it is a no-op after a normal success/fail close.
+      - name: 'Sweep: close a leaked quota-ledger row (always)'
+        if: always() && steps.preflight.outputs.run_id != ''
+        env:
+          CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
+          RUN_ID: ${{ steps.preflight.outputs.run_id }}
+        run: |
+          curl -sS -X POST \
+            -H "X-Capture-Secret: ${CAPTURE_SECRET}" \
+            -H 'Content-Type: application/json' \
+            --data "{\"runId\":\"${RUN_ID}\",\"status\":\"failed_after_fetch\",\"notes\":\"closed by always() sweeper (cancel/timeout/mid-step failure/dry_run)\"}" \
+            "${BASE_URL}/api/ti/universe/catalog/quota/complete" | jq -c . || true

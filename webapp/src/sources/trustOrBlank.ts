@@ -46,12 +46,21 @@ export function applyTrustOrBlank(
       if (endDate < HANDOFF_DATE) continue // pre-handoff history stays as-is
       if (broadOwnsRow(series[sub], startDate, endDate)) continue // overlay 1 wrote it
       if (panelLflMove(panel, sub, startDate, endDate)) continue // overlay 2 wrote it
-      if (row.liveToDate && startDate < HANDOFF_DATE) {
-        // QoQ live chain row: hist leg × panel like-for-like leg.
+      const srcLabel = String(row.cells[sub]?.breakdown?.representativePartUsed || '')
+      // A frozen composed value (written by the period-close snapshot) IS the
+      // trusted record for a closed straddle row — without this, the Q2-26
+      // row would blank dashboard-wide the day the quarter closes.
+      if (srcLabel.startsWith('Hist baseline × Like-for-like')) continue
+      if (startDate < HANDOFF_DATE) {
+        // Straddle row (live QTD, or closed quarter pre-freeze): hist leg ×
+        // panel like-for-like leg. PROVENANCE GUARD: anchorUSD is only in
+        // weighted-ASP units when the cascade's weighted stopgap wrote it —
+        // composing the seed against a legacy single-SKU anchor would produce
+        // a confidently-wrong number, so anything else falls through to "—".
         const seed = HANDOFF_WEIGHTED_ASP[sub]
         const anchorUSD = Number(row.cells[sub]?.breakdown?.anchorUSD)
-        const mv = panelLflMove(panel, sub, HANDOFF_DATE, liveAsOf)
-        if (seed > 0 && anchorUSD > 0 && mv) {
+        const mv = panelLflMove(panel, sub, HANDOFF_DATE, endDate)
+        if (srcLabel === 'Stock-weighted ASP (catalog)' && seed > 0 && anchorUSD > 0 && mv) {
           const histLeg = seed / anchorUSD - 1
           const pctVal = ((1 + histLeg) * (1 + mv.pct / 100) - 1) * 100
           row.cells[sub] = {
@@ -64,7 +73,7 @@ export function applyTrustOrBlank(
               // Gives the click-receipt real, internally consistent arithmetic
               // — a null here rendered as "$0.0000 → −100.00%" in the popover.
               todayUSD: anchorUSD * (1 + pctVal / 100),
-              todayDate: liveAsOf, todayLabel: 'Implied level · mix held constant',
+              todayDate: endDate, todayLabel: 'Implied level · mix held constant',
               latestSource: 'ti_inventory',
               representativePartUsed: `Hist baseline × Like-for-like · ${mv.n} daily-tracked parts`,
             },

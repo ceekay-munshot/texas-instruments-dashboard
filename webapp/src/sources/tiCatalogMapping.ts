@@ -305,44 +305,52 @@ export function buildSubcategoryPredicates(): SubcategoryPredicate[] {
     ruleIds: string[]
     ownRuleSqls: string[]
     ownRuleConfidences: MappingConfidence[]
-    excludingRuleSqls: string[]
+    /** PER-RULE exclusion lists: for each own rule, the different-subcategory
+     *  rule SQLs that precede THAT rule in global order. The old design froze
+     *  ONE bucket-level list at the first own rule, so a later own rule never
+     *  excluded different-sub rules sitting between — live-verified bug: all
+     *  464 amp_instrumentation INA parts were double-counted into amp_opamps'
+     *  rollups because opamps' later catch-all rule lacked the INA exclusion. */
+    ownRuleExclSqls: string[][]
   }
   const map = new Map<string, SubcatBucket>()
-  // Maintain "rules seen so far per subcategory" so we can compute
-  // excludingRuleSqls (rules with a DIFFERENT subcategory that appear
-  // earlier in the global list) in a single pass.
   const earlierRulesGlobal: MappingRule[] = []
   for (const r of CANONICAL_MAPPING_RULES) {
     let bucket = map.get(r.canonicalSubcategory)
     if (!bucket) {
-      // First time we've seen this subcategory — its `excludingRuleSqls`
-      // are exactly the rules currently in earlierRulesGlobal that map
-      // to a DIFFERENT subcategory. We freeze that list now; later own-
-      // rules don't add to the exclusion set (they're own).
       bucket = {
         canonicalGroup: r.canonicalGroup,
         canonicalSubcategory: r.canonicalSubcategory,
         ruleIds: [],
         ownRuleSqls: [],
         ownRuleConfidences: [],
-        excludingRuleSqls: earlierRulesGlobal
-          .filter(er => er.canonicalSubcategory !== r.canonicalSubcategory)
-          .map(er => er.sql),
+        ownRuleExclSqls: [],
       }
       map.set(r.canonicalSubcategory, bucket)
     }
     bucket.ruleIds.push(r.ruleId)
     bucket.ownRuleSqls.push(r.sql)
     bucket.ownRuleConfidences.push(r.confidence)
+    // Snapshot exclusions for THIS rule: every earlier rule mapping to a
+    // different subcategory — mirrors JS first-match-wins exactly.
+    bucket.ownRuleExclSqls.push(
+      earlierRulesGlobal
+        .filter(er => er.canonicalSubcategory !== r.canonicalSubcategory)
+        .map(er => er.sql),
+    )
     earlierRulesGlobal.push(r)
   }
-  // Render per-subcategory predicates.
+  // Render per-subcategory predicates: OR of per-rule fragments, each rule
+  // carrying its own NOT(earlier different-sub rules). A row belongs to this
+  // subcategory iff its FIRST matching global rule does.
   return Array.from(map.values()).map(b => {
-    const matchClause = b.ownRuleSqls.map(s => `(${s})`).join(' OR ')
-    const excludeClause = b.excludingRuleSqls.map(s => `(${s})`).join(' OR ')
-    const whereClause = excludeClause
-      ? `(${matchClause}) AND NOT (${excludeClause})`
-      : `(${matchClause})`
+    const fragments = b.ownRuleSqls.map((s, i) => {
+      const excl = b.ownRuleExclSqls[i]
+      return excl.length
+        ? `((${s}) AND NOT (${excl.map(e => `(${e})`).join(' OR ')}))`
+        : `(${s})`
+    })
+    const whereClause = fragments.join(' OR ')
     const ownRules = b.ruleIds.map((id, i) => ({
       ruleId: id,
       sql: b.ownRuleSqls[i],

@@ -25,13 +25,24 @@ import { broadOwnsRow, dayNum, OVERLAY_EARLIEST, type WeightedSeries } from './w
 
 type D1Like = { prepare: (sql: string) => any } | null
 
-const PANEL_EARLIEST = '2026-04-25' // read a little before the first capture (May-2)
+// Panel prices are trusted from May-4 (= the HANDOFF date), not the very first
+// May-2 capture: the May-2/3 readings carried a settling artifact (live-verified:
+// TPS53688 read +21% from May-2 but +10% from May-4, pushing dc_tps536xx's May
+// to +12.65% vs the true +10.0% and breaking month×month≈quarter coherence).
+const PANEL_TRUSTED_FIRST = '2026-05-04'
 const START_SNAP_DAYS = 5 // a row-start ≤5d before the panel's first price may snap forward to it
+// If the daily capture feed dies, carried-forward prices must NOT keep
+// producing confident 0.00% rows forever — measurements whose row-end is more
+// than this many days past the last real capture return null ("—") instead.
+const PANEL_MAX_STALE_DAYS = 3
 const MIN_PARTS = 2
 const CACHE_TTL_MS = 300_000 // panel grows once a day; rebuilding per request burned WoW's CPU budget
 
 export type PanelPoint = { date: string; price: number }
-export type PanelLfl = Record<string, Record<string, PanelPoint[]>> // sub -> opn -> points asc
+export type PanelLfl = {
+  subs: Record<string, Record<string, PanelPoint[]>> // sub -> opn -> points asc
+  lastDate: string | null // most recent capture date — staleness bound for measurements
+}
 
 const dayMs = 86400000
 function daysBetween(a: string, b: string): number {
@@ -39,11 +50,11 @@ function daysBetween(a: string, b: string): number {
 }
 
 let _panelCache: { at: number; data: PanelLfl } | null = null
+const EMPTY_PANEL: PanelLfl = { subs: {}, lastDate: null }
 
 export async function buildPanelLfl(d1: D1Like): Promise<PanelLfl> {
   if (_panelCache && Date.now() - _panelCache.at < CACHE_TTL_MS) return _panelCache.data
-  const out: PanelLfl = {}
-  if (!d1) return out
+  if (!d1) return EMPTY_PANEL
   let rows: any[] = []
   try {
     const res: any = await d1.prepare(
@@ -52,23 +63,43 @@ export async function buildPanelLfl(d1: D1Like): Promise<PanelLfl> {
          FROM ti_inventory_price_snapshot
         WHERE captured_at >= ? AND normalized_unit_price IS NOT NULL AND normalized_unit_price > 0
         ORDER BY captured_at ASC`,
-    ).bind(PANEL_EARLIEST).all()
+    ).bind(PANEL_TRUSTED_FIRST).all()
     rows = res?.results ?? []
-  } catch { return out }
+  } catch { return EMPTY_PANEL }
   // Last price per (opn, date); ascending order means later captures overwrite.
   const byPart: Record<string, { gpn: string | null; days: Record<string, number> }> = {}
+  let lastDate: string | null = null
   for (const r of rows) {
     const price = Number(r.price)
     if (!r.opn || !r.date || !(price > 0)) continue
     const p = (byPart[r.opn] ||= { gpn: r.gpn ?? null, days: {} })
     p.days[r.date] = price
+    if (!lastDate || r.date > lastDate) lastDate = r.date
   }
-  for (const opn of Object.keys(byPart)) {
-    const sub = mapOpnToCanonical({ gpn: byPart[opn].gpn, opn, description: null })?.canonicalSubcategory
+  // Hydrate descriptions from the 72k catalog so the canonical mapping matches
+  // the broad pipeline exactly. The panel table has no description column, and
+  // mapping with description:null misfiled every reinforced isolator into
+  // isolation_digital (the only description-gated rule can never fire).
+  const opns = Object.keys(byPart)
+  const descByOpn: Record<string, string | null> = {}
+  if (opns.length) {
+    try {
+      const placeholders = opns.map(() => '?').join(',')
+      const dres: any = await d1.prepare(
+        `SELECT ti_part_number AS opn, description FROM ti_catalog_latest_opn
+          WHERE ti_part_number IN (${placeholders})`,
+      ).bind(...opns).all()
+      for (const r of dres?.results ?? []) descByOpn[r.opn] = r.description ?? null
+    } catch { /* descriptions unavailable → mapping falls back to gpn/opn rules */ }
+  }
+  const subs: PanelLfl['subs'] = {}
+  for (const opn of opns) {
+    const sub = mapOpnToCanonical({ gpn: byPart[opn].gpn, opn, description: descByOpn[opn] ?? null })?.canonicalSubcategory
     if (!sub) continue
     const pts = Object.keys(byPart[opn].days).sort().map(date => ({ date, price: byPart[opn].days[date] }))
-    if (pts.length) ((out[sub] ||= {})[opn] = pts)
+    if (pts.length) ((subs[sub] ||= {})[opn] = pts)
   }
+  const out: PanelLfl = { subs, lastDate }
   _panelCache = { at: Date.now(), data: out }
   return out
 }
@@ -90,12 +121,16 @@ function priceAtStart(pts: PanelPoint[], date: string): number | null {
 }
 
 /** Matched-pairs equal-weight geometric-mean move over panel parts priced at
- *  both boundaries. Mix/stock cannot move it; only real price changes do. */
+ *  both boundaries. Mix/stock cannot move it; only real price changes do.
+ *  Returns null when the panel feed is STALE for this row (row end more than
+ *  PANEL_MAX_STALE_DAYS past the last capture) — a dead daily feed must
+ *  surface as "—", never as a confident carried-forward 0.00%. */
 export function panelLflMove(
   panel: PanelLfl, sub: string, startDate: string, endDate: string,
 ): { pct: number; n: number } | null {
-  const parts = panel[sub]
-  if (!parts) return null
+  const parts = panel.subs[sub]
+  if (!parts || !panel.lastDate) return null
+  if ((dayNum(endDate) - dayNum(panel.lastDate)) / 86400000 > PANEL_MAX_STALE_DAYS) return null
   let sumLn = 0, n = 0
   for (const opn of Object.keys(parts)) {
     const s = priceAtStart(parts[opn], startDate)
@@ -120,7 +155,7 @@ export function applyPanelGapOverride(
   let overridden = 0
   for (const col of result.columns) {
     const sub = col.canonicalId
-    if (!panel[sub]) continue
+    if (!panel.subs[sub]) continue
     for (let i = 1; i < result.rows.length; i++) {
       const row = result.rows[i]
       const endDate = row.liveToDate ? liveAsOf : row.periodEnd

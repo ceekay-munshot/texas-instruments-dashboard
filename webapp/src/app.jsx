@@ -3575,7 +3575,8 @@ function ReceiptPopover({ receipt, onClose, popoverRef, B }){
   // dollar level — todayUSD/anchorUSD are null by design. Without this guard
   // the popover fabricated "$0.0000" out of the null and "computed" −100.00%,
   // contradicting the (correct) cell value. Percent-first rendering instead.
-  const hasLevels = today != null && anchor != null && Number(anchor) > 0;
+  const hasLevels = Number.isFinite(Number(today)) && Number.isFinite(Number(anchor))
+    && today != null && anchor != null && Number(anchor) > 0 && Number(today) > 0;
   const pct = hasLevels ? ((today - anchor) / anchor) * 100 : (cellPct ?? null);
   const sign = pct > 0 ? '+' : '';
   const pctText = pct == null ? '—' : `${sign}${pct.toFixed(2)}%`;

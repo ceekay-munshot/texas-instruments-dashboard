@@ -1078,40 +1078,64 @@ async function computeAndPersistSnapshot(
   writeErrors: string[]
   d1LookupMs: number
 }> {
-  // Use the live /api/prices payload from cache/KV so prices_fallback subs
-  // still resolve. The cascade prefers TI inventory captures over fallback,
-  // so passing today's pricesData for a historical liveAsOf is acceptable
-  // for the small set of subs that don't have own captures.
+  // Phase 28.6 — freeze what users SEE. The old freeze persisted the raw
+  // cascade (and with useWeighted=false, the legacy single-SKU values — the
+  // +126%/-22.7% artifact class), so the record never matched the displayed
+  // overlay-stack numbers and the Q2-26 composed values would have been lost
+  // at quarter close. Now: build the same trend view the GET handler serves
+  // (cascade + weighted + panel + trust-or-blank + broad L4L overlays) for
+  // liveAsOf = periodEndDate, locate the period's row, and persist its cells
+  // verbatim. The useWeighted flag is retained for signature compatibility
+  // but the display stack is always used.
+  void useWeighted
   const { pricesData } = await resolveLivePricesContext(env)
-  const { liveSnapshot, anchorSnapshot, d1LookupMs } =
-    await resolveLiveCascade(env, view, periodEndDate, pricesData, useWeighted)
+  const [cascade, snapshotByPeriodCanonical] = await Promise.all([
+    resolveLiveCascade(env, view, periodEndDate, pricesData, true),
+    readSnapshotsByView(env.TI_INVENTORY_HISTORY_DB, view),
+  ])
+  const { liveSnapshot, anchorSnapshot, d1LookupMs } = cascade
+  const result = buildTrendView(view, liveSnapshot, periodEndDate, anchorSnapshot, snapshotByPeriodCanonical)
+  const db = env.TI_INVENTORY_HISTORY_DB as any
+  const series = await buildWeightedSeries(db)
+  applyWeightedSeriesOverride(result, series, periodEndDate)
+  const panel = await buildPanelLfl(db)
+  applyPanelGapOverride(result, panel, series, periodEndDate)
+  applyTrustOrBlank(result, series, panel, periodEndDate)
+  const lflData = await buildBroadLfl(db)
+  applyBroadLflOverride(result, lflData, periodEndDate)
+
+  // The closing period's row: the closed row with this periodEnd, else the
+  // live row (when invoked on the close day itself the row may still be live).
+  const row =
+    result.rows.find((r: any) => !r.liveToDate && r.periodEnd === periodEndDate) ??
+    result.rows.find((r: any) => r.liveToDate)
 
   const now = new Date().toISOString()
   const rowsToWrite: SnapshotRow[] = []
   let rowsSkippedNoAnchor = 0
   let rowsSkippedNoLive = 0
-  const allCanonicalIds = new Set<string>([
-    ...Object.keys(liveSnapshot),
-    ...Object.keys(anchorSnapshot),
-  ])
+  const allCanonicalIds = new Set<string>(Object.keys(row?.cells ?? {}))
   for (const canonicalId of allCanonicalIds) {
-    const live = liveSnapshot[canonicalId]
-    const anchor = anchorSnapshot[canonicalId]
-    if (!live || !(live.liveUSD > 0)) { rowsSkippedNoLive++; continue }
-    if (!anchor || !(anchor.anchorUSD > 0)) { rowsSkippedNoAnchor++; continue }
-    const pct = ((live.liveUSD - anchor.anchorUSD) / anchor.anchorUSD) * 100
+    const cell: any = row.cells[canonicalId]
+    const pct = cell?.pct
+    if (pct == null || !Number.isFinite(pct)) { rowsSkippedNoLive++; continue } // blank "—" cells stay unfrozen
+    const bd: any = cell.breakdown
+    const hasLevels = bd && bd.todayUSD != null && bd.anchorUSD != null && Number(bd.anchorUSD) > 0
+    // Index-based cells (no dollar levels) store as a base-1 index — the
+    // snapshot columns are NOT NULL. buildTrendView reconstructs anchor=1 +
+    // a 'Like-for-like' label back into level-less breakdowns at read time.
     rowsToWrite.push({
       view,
       periodEndDate,
       canonicalId,
-      todayUSD: live.liveUSD,
-      todayDate: live.liveDate,
-      anchorUSD: anchor.anchorUSD,
-      anchorDate: anchor.anchorDate,
-      anchorLabel: anchor.anchorLabel,
+      todayUSD: hasLevels ? bd.todayUSD : 1 + pct / 100,
+      todayDate: bd?.todayDate ?? periodEndDate,
+      anchorUSD: hasLevels ? bd.anchorUSD : 1,
+      anchorDate: bd?.anchorDate ?? periodEndDate,
+      anchorLabel: bd?.anchorLabel ?? 'Constant-basket base',
       pct,
-      representativePart: live.representativePartUsed ?? null,
-      latestSource: live.latestSource ?? null,
+      representativePart: bd?.representativePartUsed ?? (hasLevels ? null : 'Like-for-like (frozen index)'),
+      latestSource: bd?.latestSource ?? 'ti_inventory',
       snapshottedAt: now,
     })
   }
