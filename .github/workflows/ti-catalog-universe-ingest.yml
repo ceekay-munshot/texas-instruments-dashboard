@@ -71,6 +71,11 @@ on:
   # steps and exited green in ~6s without capturing anything.
   schedule:
     - cron: '47 19 * * 0'
+    # Backup retry slots (Mon/Wed 07:47 UTC). The preflight's freshness gate
+    # skips them when Sunday already captured (<4 days old), so they only
+    # spend TI quota when the primary slot failed (quota 429, TI outage, …).
+    - cron: '47 7 * * 1'
+    - cron: '47 7 * * 3'
   workflow_dispatch:
     inputs:
       test_mode:
@@ -105,6 +110,7 @@ on:
 
 permissions:
   contents: read
+  issues: write # scheduled-run failures auto-file an issue so they are never silent
 
 concurrency:
   group: ti-catalog-universe-ingest
@@ -403,6 +409,30 @@ jobs:
           CAPTURE_SECRET: ${{ secrets.SNAPSHOT_CAPTURE_SECRET }}
         run: |
           set -uo pipefail
+          # Freshness gate (scheduled runs only): the Mon/Wed crons are RETRY
+          # slots for a failed Sunday — if a successful capture already landed
+          # within the last 4 days, skip without spending TI quota. Manual
+          # dispatches always proceed to the quota preflight.
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            status_json="$(mktemp)"
+            if curl -sS -f -o "$status_json" "${BASE_URL}/api/ti/universe/catalog/status"; then
+              last_capture=$(jq -r '.latestRun.captured_at // empty' < "$status_json")
+              parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_json")
+              if [ -n "$last_capture" ] && [ "$parsed_ok" = "1" ]; then
+                age_days=$(( ( $(date -u +%s) - $(date -u -d "${last_capture}" +%s) ) / 86400 ))
+                if [ "$age_days" -lt 4 ]; then
+                  echo "::notice::Catalog already captured ${age_days}d ago (${last_capture}) — backup slot not needed."
+                  echo "skip_real_catalog=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo "Freshness gate: last successful capture ${last_capture} (${age_days}d old) — proceeding."
+              else
+                echo "Freshness gate: no successful capture on record — proceeding."
+              fi
+            else
+              echo "::warning::Freshness gate could not read /catalog/status — proceeding to quota preflight."
+            fi
+          fi
           response_file="$(mktemp)"
           http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
             -X POST \
@@ -821,3 +851,60 @@ jobs:
             artifacts/diagnostics/sample_error_payload.json
           if-no-files-found: warn
           retention-days: 1
+
+      # ── Phase 28.2 — the silent-green killer ────────────────────────────────
+      # Runs on EVERY scheduled run regardless of which steps ran or skipped
+      # (the May–June failure mode was steps silently skipping while the job
+      # reported success). Asserts from the OUTSIDE that production actually
+      # holds a fresh capture: latestRun parsed within 5 days AND the L4L
+      # part-level snapshot kept pace. If not, the run fails loudly.
+      - name: 'Guard: assert fresh data actually landed (scheduled runs)'
+        if: always() && github.event_name == 'schedule'
+        run: |
+          set -uo pipefail
+          status_json="$(mktemp)"
+          curl -sS -f -o "$status_json" "${BASE_URL}/api/ti/universe/catalog/status"
+          last_capture=$(jq -r '.latestRun.captured_at // empty' < "$status_json")
+          parsed_ok=$(jq -r '.latestRun.parsed_ok // 0' < "$status_json")
+          if [ -z "$last_capture" ] || [ "$parsed_ok" != "1" ]; then
+            echo "::error::No successful catalog capture on record (latestRun.captured_at='${last_capture}', parsed_ok='${parsed_ok}')."
+            exit 1
+          fi
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "${last_capture}" +%s) ) / 86400 ))
+          if [ "$age_days" -ge 5 ]; then
+            echo "::error::Catalog capture is ${age_days} days old (${last_capture}) — the weekly pipeline is NOT collecting. Investigate."
+            exit 1
+          fi
+          echo "Guard OK: catalog capture ${last_capture} (${age_days}d old)."
+          lfl_json="$(mktemp)"
+          if curl -sS -f -o "$lfl_json" "${BASE_URL}/api/ti/universe/catalog/lfl/status"; then
+            lfl_last=$(jq -r '.total.last_date // empty' < "$lfl_json")
+            capture_date="${last_capture:0:10}"
+            if [ -z "$lfl_last" ] || [ "$lfl_last" \< "$capture_date" ]; then
+              echo "::error::L4L part-level history is behind the catalog (lfl last_date='${lfl_last}' vs capture '${capture_date}') — the like-for-like index is not accumulating."
+              exit 1
+            fi
+            echo "Guard OK: L4L history current (${lfl_last})."
+          else
+            echo "::error::Could not read /lfl/status — like-for-like accumulation unverifiable."
+            exit 1
+          fi
+
+      - name: File an issue so a failed scheduled run is never silent
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          title="TI catalog scheduled capture failed ($(date -u +%F))"
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title \"${title}\"" --json number --jq 'length' || echo 0)
+          if [ "${existing}" != "0" ]; then
+            echo "Issue already filed today — not duplicating."
+            exit 0
+          fi
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "${title}" \
+            --body "Scheduled run failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+The backup crons (Mon/Wed 07:47 UTC) will retry automatically while the last capture is >4 days old. If this issue keeps appearing, the pipeline needs attention — common causes: TI quota 429 (check /api/ti/universe/catalog/quota/status), expired TI_CLIENT_ID/TI_CLIENT_SECRET, or Cloudflare deploy issues." \
+            || echo "::warning::Could not create issue (permissions?)."

@@ -36,6 +36,7 @@ import {
 } from './data/historicalBaseline'
 import { buildWeightedSeries, applyWeightedSeriesOverride } from './sources/weightedSeries'
 import { buildBroadLfl, applyBroadLflOverride, snapshotOpnPriceHistory } from './sources/likeForLikeSeries'
+import { buildPanelLfl, applyPanelGapOverride } from './sources/panelLflSeries'
 import { SNAPSHOT_SCHEMA_VERSION, type Snapshot } from './data/snapshotSchema'
 import {
   PART_MAP,
@@ -995,6 +996,13 @@ app.get('/api/ti/trend/series', async (c) => {
   if (useWeighted || useLfl) {
     const series = await buildWeightedSeries(c.env.TI_INVENTORY_HISTORY_DB as any)
     applyWeightedSeriesOverride(result, series, liveAsOf)
+    // Phase 28.2 — rows the sparse broad series can't DATE (its bracketing
+    // points sit far outside the row) get the daily panel's matched-pairs
+    // like-for-like instead, so a move lands in the week/month it actually
+    // happened (e.g. the real May-8 list-price hike showed up as "May 30–Jun 5
+    // / MTD Jun" before this). Self-retires as weekly broad points accumulate.
+    const panel = await buildPanelLfl(c.env.TI_INVENTORY_HISTORY_DB as any)
+    applyPanelGapOverride(result, panel, series, liveAsOf)
   }
   // Phase 28 — like-for-like overlay (pure price). Runs AFTER the weighted
   // overlay so it upgrades covered cells from ASP-incl-mix to constant-basket
