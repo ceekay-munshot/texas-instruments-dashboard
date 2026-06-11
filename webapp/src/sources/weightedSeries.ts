@@ -33,7 +33,15 @@ type D1Like = { prepare: (sql: string) => any } | null
 // needed; every capture from here on appends real points to rollup_history.
 const HANDOFF_DATE = '2026-05-04'
 
+// Phase 28.4 — per-isolate result cache. The series changes at most weekly
+// (one capture appends one point) but was rebuilt from D1 on EVERY request;
+// on the 250-row WoW view that work helped push the Worker over its CPU
+// limit (Cloudflare 1102). 5-minute TTL bounds staleness after a capture.
+const CACHE_TTL_MS = 300_000
+let _seriesCache: { at: number; data: WeightedSeries } | null = null
+
 export async function buildWeightedSeries(d1: D1Like): Promise<WeightedSeries> {
+  if (_seriesCache && Date.now() - _seriesCache.at < CACHE_TTL_MS) return _seriesCache.data
   const byDate: Record<string, Record<string, number>> = {}
   if (d1) {
     try {
@@ -65,6 +73,7 @@ export async function buildWeightedSeries(d1: D1Like): Promise<WeightedSeries> {
   for (const sub of Object.keys(byDate)) {
     out[sub] = Object.keys(byDate[sub]).sort().map(date => ({ date, asp: byDate[sub][date] }))
   }
+  _seriesCache = { at: Date.now(), data: out }
   return out
 }
 
@@ -77,9 +86,23 @@ export function weightedAt(pts: SeriesPoint[] | undefined, date: string): Series
 }
 
 export const BROAD_SLACK_DAYS = 8 // a broad point within 8d of a boundary dates that boundary
+
+// No overlay source reaches further back than this (panel starts 2026-05-02
+// with a 5-day snap; the broad series starts 2026-05-04), so overlays skip
+// older rows outright — on the 250-row WoW view that's ~97% of the grid.
+export const OVERLAY_EARLIEST = '2026-04-20'
+
 const dayMs = 86400000
+// Date.parse memo — the same handful of boundary/point dates is parsed tens of
+// thousands of times per WoW request; the map stays a few hundred entries.
+const _dayNum = new Map<string, number>()
+export function dayNum(d: string): number {
+  let v = _dayNum.get(d)
+  if (v === undefined) { v = Date.parse(d + 'T00:00:00Z'); _dayNum.set(d, v) }
+  return v
+}
 function daysApart(a: string, b: string): number {
-  return Math.abs(Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / dayMs))
+  return Math.abs(Math.round((dayNum(b) - dayNum(a)) / dayMs))
 }
 
 /** True when the broad series can honestly MEASURE this row: a point sits
@@ -114,6 +137,7 @@ export function applyWeightedSeriesOverride(
       const endDate = row.liveToDate ? liveAsOf : row.periodEnd
       const startDate = result.rows[i - 1].periodEnd
       if (!startDate) continue
+      if (endDate < OVERLAY_EARLIEST) continue // pre-coverage history — skip cheaply
       // Phase 28.3 — only override rows the series can honestly MEASURE (a
       // point within BROAD_SLACK_DAYS of both boundaries). Rows it can't are
       // left for the daily-panel overlay or the trust-or-blank stage; rows

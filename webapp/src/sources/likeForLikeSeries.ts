@@ -100,16 +100,37 @@ export async function snapshotOpnPriceHistory(
   return { inserted, subcats, errors }
 }
 
+// Phase 28.4 — this table holds ~19k rows PER weekly snapshot, so loading it
+// into the Worker on every request (and doubling weekly) is what tipped the
+// 250-row WoW view over Cloudflare's CPU limit (1102). Three defenses:
+// per-isolate TTL cache; a short-circuit while only one snapshot date exists
+// (no matched pair is computable, so loading anything is pure waste); and,
+// once moves ARE computable, loading only parts present on 2+ dates — parts
+// seen once can never form a pair.
+const CACHE_TTL_MS = 300_000
+let _lflCache: { at: number; data: BroadLfl } | null = null
+
 export async function buildBroadLfl(d1: D1Like): Promise<BroadLfl> {
+  if (_lflCache && Date.now() - _lflCache.at < CACHE_TTL_MS) return _lflCache.data
   const out: BroadLfl = {}
   if (!d1) return out
   try {
+    const dc: any = await d1.prepare(
+      `SELECT COUNT(DISTINCT captured_date) AS d FROM ${HIST_TABLE}`,
+    ).first()
+    if (Number(dc?.d ?? 0) < 2) {
+      _lflCache = { at: Date.now(), data: out }
+      return out
+    }
     const res: any = await d1.prepare(
       `SELECT canonical_subcategory AS sub, ti_part_number AS opn,
               captured_date AS date, normalized_unit_price AS price
          FROM ${HIST_TABLE}
         WHERE canonical_subcategory IS NOT NULL
           AND normalized_unit_price IS NOT NULL AND normalized_unit_price > 0
+          AND ti_part_number IN (
+            SELECT ti_part_number FROM ${HIST_TABLE}
+             GROUP BY ti_part_number HAVING COUNT(DISTINCT captured_date) >= 2)
         ORDER BY captured_date ASC`,
     ).all()
     for (const r of res?.results ?? []) {
@@ -119,6 +140,7 @@ export async function buildBroadLfl(d1: D1Like): Promise<BroadLfl> {
       if (!sub || !opn || !(price > 0)) continue
       ;((out[sub] ||= {})[opn] ||= []).push({ date: r.date as string, price })
     }
+    _lflCache = { at: Date.now(), data: out }
   } catch { /* table may not exist yet → empty (no override) */ }
   return out
 }

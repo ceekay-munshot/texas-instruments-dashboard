@@ -21,23 +21,27 @@
 // the 72k catalog going forward", panel only bridges the bootstrap gap.
 
 import { mapOpnToCanonical } from './tiCatalogMapping'
-import { broadOwnsRow, type WeightedSeries } from './weightedSeries'
+import { broadOwnsRow, dayNum, OVERLAY_EARLIEST, type WeightedSeries } from './weightedSeries'
 
 type D1Like = { prepare: (sql: string) => any } | null
 
 const PANEL_EARLIEST = '2026-04-25' // read a little before the first capture (May-2)
 const START_SNAP_DAYS = 5 // a row-start ≤5d before the panel's first price may snap forward to it
 const MIN_PARTS = 2
+const CACHE_TTL_MS = 300_000 // panel grows once a day; rebuilding per request burned WoW's CPU budget
 
 export type PanelPoint = { date: string; price: number }
 export type PanelLfl = Record<string, Record<string, PanelPoint[]>> // sub -> opn -> points asc
 
 const dayMs = 86400000
 function daysBetween(a: string, b: string): number {
-  return Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / dayMs)
+  return Math.round((dayNum(b) - dayNum(a)) / dayMs)
 }
 
+let _panelCache: { at: number; data: PanelLfl } | null = null
+
 export async function buildPanelLfl(d1: D1Like): Promise<PanelLfl> {
+  if (_panelCache && Date.now() - _panelCache.at < CACHE_TTL_MS) return _panelCache.data
   const out: PanelLfl = {}
   if (!d1) return out
   let rows: any[] = []
@@ -65,6 +69,7 @@ export async function buildPanelLfl(d1: D1Like): Promise<PanelLfl> {
     const pts = Object.keys(byPart[opn].days).sort().map(date => ({ date, price: byPart[opn].days[date] }))
     if (pts.length) ((out[sub] ||= {})[opn] = pts)
   }
+  _panelCache = { at: Date.now(), data: out }
   return out
 }
 
@@ -121,6 +126,7 @@ export function applyPanelGapOverride(
       const endDate = row.liveToDate ? liveAsOf : row.periodEnd
       const startDate = result.rows[i - 1].periodEnd
       if (!startDate || !endDate) continue
+      if (endDate < OVERLAY_EARLIEST) continue // pre-coverage history — skip cheaply
       if (broadOwnsRow(broad[sub], startDate, endDate)) continue // broad owns the row — panel never second-guesses it
       const mv = panelLflMove(panel, sub, startDate, endDate)
       if (!mv) continue

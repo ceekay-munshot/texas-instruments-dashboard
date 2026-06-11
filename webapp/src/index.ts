@@ -994,7 +994,9 @@ app.get('/api/ti/trend/series', async (c) => {
   // the move between its two period boundaries, read from rollup_history. The
   // weekly capture appends a point automatically, so this fills in on its own.
   // Rows whose start predates the series keep their historical value.
+  let overlayMs = 0
   if (useWeighted || useLfl) {
+    const tOverlay = Date.now()
     const series = await buildWeightedSeries(c.env.TI_INVENTORY_HISTORY_DB as any)
     applyWeightedSeriesOverride(result, series, liveAsOf)
     // Phase 28.2 — rows the sparse broad series can't DATE (its bracketing
@@ -1010,6 +1012,7 @@ app.get('/api/ti/trend/series', async (c) => {
     // BEFORE the broad-L4L overlay so accumulated 72k part-level history
     // overwrites blanks automatically as it grows.
     applyTrustOrBlank(result, series, panel, liveAsOf)
+    overlayMs = Date.now() - tOverlay
   }
   // Phase 28 — like-for-like overlay (pure price). Runs AFTER the weighted
   // overlay so it upgrades covered cells from ASP-incl-mix to constant-basket
@@ -1038,6 +1041,7 @@ app.get('/api/ti/trend/series', async (c) => {
         view,
         serverMs,
         d1LookupMs,
+        overlayMs,
       },
     }),
     {
