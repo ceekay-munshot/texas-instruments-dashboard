@@ -1,0 +1,115 @@
+name: TI Data Freshness Monitor
+
+# Phase 28.7 — the independent staleness watchdog.
+#
+# WHY THIS EXISTS, SEPARATE FROM THE CAPTURE WORKFLOW: the capture workflow's
+# own failure-issue step only runs from INSIDE a capture run. On 2026-06-21/22
+# two scheduled runs died at startup (4-second job failures, transient GitHub
+# infra) BEFORE any step executed — so the in-run alarm never fired and no
+# issue was filed. The Wednesday backup cron recovered the data, but had all
+# slots failed that way the dashboard would have gone stale silently.
+#
+# This monitor is decoupled from captures entirely: it just asks production
+# "how old is your newest data?" on its own twice-daily schedule and alarms if
+# it's too old — so a capture that never starts cannot hide. It writes to the
+# SAME deduped issue and AUTO-CLOSES it once data is fresh again.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'   # 06:17 UTC daily
+    - cron: '17 18 * * *'  # 18:17 UTC daily (twice/day → a transient monitor blip self-recovers within 12h)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  BASE_URL: https://texas-instruments-dashboard-final.pages.dev
+  # Healthy cadence is weekly (≤7d). Worst-case normal recovery (Sun+Mon fail,
+  # Wed backup) tops out ~10d, but we want to be TOLD when the primary slot is
+  # missed, so 9d alarms on a missed week while still riding through a clean
+  # single-slot miss. Tunable.
+  MAX_AGE_DAYS: '9'
+  ISSUE_TITLE: 'TI production data is STALE'
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check production data freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+          now_s="$(date -u +%s)"
+
+          age_days() { # whole days between an ISO date/timestamp and now; 99999 if unparseable
+            local iso="$1"
+            [ -z "$iso" ] && { echo 99999; return; }
+            # Key on the YYYY-MM-DD prefix only — robust to '.000Z'/'Z'/date-only
+            # and timezone-agnostic; we only need day granularity vs a 9-day gate.
+            local d="${iso:0:10}"
+            local t; t="$(date -u -d "${d} UTC" +%s 2>/dev/null || echo '')"
+            [ -z "$t" ] && { echo 99999; return; }
+            echo $(( (now_s - t) / 86400 ))
+          }
+
+          # --- Pull production state (read-only). A transient network blip must
+          #     NOT alarm — the monitor runs again in 12h, and the capture
+          #     backups are the real recovery. Only DATA age alarms. ---
+          status="$(mktemp)"
+          if ! curl -sS -f -A "$UA" -o "$status" "${BASE_URL}/api/ti/universe/catalog/status"; then
+            echo "::warning::Could not reach /catalog/status (transient?). No alarm; next cycle re-checks."
+            exit 0
+          fi
+          cat_at="$(jq -r '.latestRun.captured_at // empty' < "$status")"
+          parsed="$(jq -r '.latestRun.parsed_ok // 0' < "$status")"
+          cat_age="$(age_days "$cat_at")"
+
+          lfl="$(mktemp)"; lfl_last=''; lfl_age=99999
+          if curl -sS -f -A "$UA" -o "$lfl" "${BASE_URL}/api/ti/universe/catalog/lfl/status"; then
+            lfl_last="$(jq -r '.total.last_date // empty' < "$lfl")"
+            lfl_age="$(age_days "$lfl_last")"
+          fi
+
+          echo "catalog: captured_at=${cat_at:-none} parsed_ok=${parsed} age=${cat_age}d"
+          echo "lfl: last_date=${lfl_last:-none} age=${lfl_age}d (threshold ${MAX_AGE_DAYS}d)"
+
+          stale=0; reasons=''
+          if [ "$parsed" != "1" ] || [ -z "$cat_at" ]; then
+            stale=1; reasons="${reasons}- No successful catalog capture on record (parsed_ok=${parsed}).\n"
+          elif [ "$cat_age" -gt "${MAX_AGE_DAYS}" ]; then
+            stale=1; reasons="${reasons}- Newest catalog capture is ${cat_age} days old (${cat_at}) — exceeds ${MAX_AGE_DAYS}d.\n"
+          fi
+          if [ "$lfl_age" -gt "${MAX_AGE_DAYS}" ]; then
+            stale=1; reasons="${reasons}- Like-for-like snapshot is ${lfl_age} days old (${lfl_last:-none}) — the L4L pipeline may be stalled while catalog still runs.\n"
+          fi
+
+          # Look up an existing open alarm (deduped by exact title).
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title \"${ISSUE_TITLE}\"" --json number --jq '.[0].number // empty' 2>/dev/null || echo '')"
+
+          if [ "$stale" = "1" ]; then
+            echo "::error::Production data is STALE."
+            body="$(printf 'Production data is older than the freshness threshold (%sd).\n\n%b\nChecked: %s\nCatalog status: %s/api/ti/universe/catalog/status\n\nThe capture backup crons (Sun/Mon/Wed) self-recover most misses; this alarm means they have NOT, or a capture is failing at startup (which bypasses the in-run alarm). Investigate: TI quota (/quota/status), TI_CLIENT_* secrets, recent failed runs, Cloudflare deploy. This issue auto-closes when data is fresh again.' \
+              "${MAX_AGE_DAYS}" "${reasons}" "$(date -u +%FT%TZ)" "${BASE_URL}")"
+            if [ -z "$existing" ]; then
+              gh issue create --repo "${GITHUB_REPOSITORY}" --title "${ISSUE_TITLE}" --body "$body" \
+                || echo "::warning::Could not create issue."
+            else
+              echo "Alarm already open as #${existing}; adding a heartbeat comment."
+              gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "Still stale as of $(date -u +%FT%TZ): catalog ${cat_age}d, lfl ${lfl_age}d." \
+                || echo "::warning::Could not comment."
+            fi
+            exit 1
+          fi
+
+          echo "Data is fresh (catalog ${cat_age}d, lfl ${lfl_age}d)."
+          if [ -n "$existing" ]; then
+            gh issue close "${existing}" --repo "${GITHUB_REPOSITORY}" \
+              --comment "Resolved: data is fresh again ($(date -u +%FT%TZ)) — catalog ${cat_age}d, lfl ${lfl_age}d." \
+              || echo "::warning::Could not auto-close #${existing}."
+          fi
