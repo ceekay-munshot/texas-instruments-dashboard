@@ -1067,7 +1067,6 @@ async function computeAndPersistSnapshot(
   env: Bindings,
   view: ViewKind,
   periodEndDate: string,
-  useWeighted: boolean = false,
 ): Promise<{
   view: ViewKind
   periodEndDate: string
@@ -1085,9 +1084,8 @@ async function computeAndPersistSnapshot(
   // at quarter close. Now: build the same trend view the GET handler serves
   // (cascade + weighted + panel + trust-or-blank + broad L4L overlays) for
   // liveAsOf = periodEndDate, locate the period's row, and persist its cells
-  // verbatim. The useWeighted flag is retained for signature compatibility
-  // but the display stack is always used.
-  void useWeighted
+  // verbatim. The full display stack is always used (no legacy path), so there
+  // is no weighted/unweighted flag to get wrong.
   const { pricesData } = await resolveLivePricesContext(env)
   const [cascade, snapshotByPeriodCanonical] = await Promise.all([
     resolveLiveCascade(env, view, periodEndDate, pricesData, true),
@@ -1202,12 +1200,13 @@ app.post('/api/ti/trend/snapshot-period', async (c) => {
   }
 
   // Phase 27.3 — weighted=true recomputes the frozen row with the stock-weighted
-  // engine (used to repair the May single-SKU artifact rows). Defaults to the
-  // legacy single-SKU path so existing automated freezes stay unchanged.
+  // engine. The freeze ALWAYS uses the full display overlay stack now, so the
+  // `weighted` body flag is accepted for API back-compat but no longer alters
+  // behavior (echoed in the response for callers that still send it).
   const useWeighted = body.weighted === true || c.req.query('weighted') === '1'
   const runs = []
   for (const view of views) {
-    runs.push(await computeAndPersistSnapshot(env, view, dateISO, useWeighted))
+    runs.push(await computeAndPersistSnapshot(env, view, dateISO))
   }
   return c.json({ success: true, date: dateISO, weighted: useWeighted, runs })
 })

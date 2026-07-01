@@ -22,7 +22,7 @@
 // audit verified this reconstruction to 4 decimals) and replace the broad leg
 // with the panel's like-for-like May-4→today move. No panel coverage → blank.
 
-import { HANDOFF_WEIGHTED_ASP } from '../data/historicalBaseline'
+import { HANDOFF_WEIGHTED_ASP, histLegFromBaseline } from '../data/historicalBaseline'
 import { broadOwnsRow, type WeightedSeries } from './weightedSeries'
 import { panelLflMove, type PanelLfl } from './panelLflSeries'
 
@@ -52,27 +52,31 @@ export function applyTrustOrBlank(
       // row would blank dashboard-wide the day the quarter closes.
       if (srcLabel.startsWith('Hist baseline × Like-for-like')) continue
       if (startDate < HANDOFF_DATE) {
-        // Straddle row (live QTD, or closed quarter pre-freeze): hist leg ×
-        // panel like-for-like leg. PROVENANCE GUARD: anchorUSD is only in
-        // weighted-ASP units when the cascade's weighted stopgap wrote it —
-        // composing the seed against a legacy single-SKU anchor would produce
-        // a confidently-wrong number, so anything else falls through to "—".
-        const seed = HANDOFF_WEIGHTED_ASP[sub]
-        const anchorUSD = Number(row.cells[sub]?.breakdown?.anchorUSD)
+        // Straddle row (the QoQ Q2-2026 seam quarter — the only row whose start
+        // predates all our captured data): compose hist leg × panel leg.
+        //   histLeg = pre-handoff move (Q1 close → our first capture), a PURE
+        //             historical-baseline ratio — NOT read from the cell, so it
+        //             works on the CLOSED row too (this is the whole fix: the
+        //             old code read anchorUSD/srcLabel that only the LIVE row
+        //             carried, so the cell blanked the instant the quarter closed).
+        //   panelLeg = daily-panel like-for-like May-4 → endDate.
+        // No provenance guard needed: histLeg is intrinsically in the same units
+        // as the seed, so the legacy mis-unit risk that guard protected is gone.
+        const histLeg = histLegFromBaseline(sub, startDate)
         const mv = panelLflMove(panel, sub, HANDOFF_DATE, endDate)
-        if (srcLabel === 'Stock-weighted ASP (catalog)' && seed > 0 && anchorUSD > 0 && mv) {
-          const histLeg = seed / anchorUSD - 1
+        const seed = HANDOFF_WEIGHTED_ASP[sub]
+        if (histLeg != null && mv) {
           const pctVal = ((1 + histLeg) * (1 + mv.pct / 100) - 1) * 100
+          // Implied Q1-close weighted-ASP level (seed rolled back through the
+          // hist leg) so the click-receipt shows real dollars, not "$0.0000".
+          const anchorLevel = seed > 0 ? seed / (1 + histLeg) : null
           row.cells[sub] = {
             ...row.cells[sub],
             pct: pctVal,
             breakdown: {
               ...row.cells[sub]?.breakdown,
-              // The implied level (= May-4 seed × the panel's pure-price move,
-              // i.e. today's weighted ASP with the basket mix held constant).
-              // Gives the click-receipt real, internally consistent arithmetic
-              // — a null here rendered as "$0.0000 → −100.00%" in the popover.
-              todayUSD: anchorUSD * (1 + pctVal / 100),
+              anchorUSD: anchorLevel, anchorDate: startDate, anchorLabel: 'Historical baseline',
+              todayUSD: anchorLevel != null ? anchorLevel * (1 + pctVal / 100) : null,
               todayDate: endDate, todayLabel: 'Implied level · mix held constant',
               latestSource: 'ti_inventory',
               representativePartUsed: `Hist baseline × Like-for-like · ${mv.n} daily-tracked parts`,

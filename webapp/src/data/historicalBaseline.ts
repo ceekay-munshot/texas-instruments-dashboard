@@ -201,6 +201,22 @@ export function resolveHistoricalPoint(
   return { index: ans[1], date: ans[0] }
 }
 
+// Phase 28.8 — the pre-handoff "hist leg" of a straddle-quarter composition:
+// the historical move from the row's start (prior-quarter close) up to our
+// first own capture (OWN_CAPTURE_FIRST_DATE). It is a PURE ratio of two bundled
+// historical-index points — the same value resolveLiveCascade derives as
+// seed/anchorUSD-1, where anchorUSD = seed × (hClose.index / hHandoff.index);
+// the HANDOFF seed cancels, leaving hHandoff.index / hClose.index - 1. So this
+// needs NO live cascade, D1, or per-cell anchorUSD, which is exactly why a
+// closed straddle row can recompute its own value forever. Returns null for
+// anchor-kind subs or dates before the series (→ caller leaves the cell "—").
+export function histLegFromBaseline(canonicalId: string, qCloseISO: string): number | null {
+  const hClose = resolveHistoricalPoint(canonicalId, qCloseISO)
+  const hHandoff = resolveHistoricalPoint(canonicalId, OWN_CAPTURE_FIRST_DATE)
+  if (!hClose || !hHandoff || hClose.index <= 0) return null
+  return hHandoff.index / hClose.index - 1
+}
+
 // Convert a captured live USD price for a subcategory to an index value
 // continuous with the historical series.
 //
