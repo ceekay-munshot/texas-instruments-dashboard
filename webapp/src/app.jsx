@@ -2794,7 +2794,7 @@ function xlsxFmtPctText(v){
 // the two-row header (group banner + leaf labels), an Average column on
 // the right, and composite-cell hover comments listing the TI sources
 // each UBS bucket aggregates.
-function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs }){
+function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs, includeAverage = isUbs }){
   const merges = [];
   const headerRowCount = isUbs ? 2 : 1;
   // ── Row 0: group banner (UBS only) ──
@@ -2813,7 +2813,7 @@ function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs }){
   }
   // ── Header row: Period | leaf labels | Average? ──
   const headerRow = ['Period', ...columns.map(c => c.label)];
-  if (isUbs) headerRow.push('Average');
+  if (includeAverage) headerRow.push('Average');
   const aoaHeader = isUbs ? [bannerRow, headerRow] : [headerRow];
   // ── Data rows (newest-first to match the on-screen reversed display) ──
   const reversedRows = [...rows].reverse();
@@ -2824,7 +2824,7 @@ function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs }){
       const pct = cell?.pct;
       r.push((pct == null || !isFinite(pct)) ? null : pct);
     });
-    if (isUbs) {
+    if (includeAverage) {
       const avg = averageVisiblePct(row, columns);
       r.push((avg == null || !isFinite(avg)) ? null : avg);
     }
@@ -2892,8 +2892,8 @@ function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs }){
         wsCell.c.hidden = true;
       }
     });
-    // Average cell (UBS only)
-    if (isUbs) {
+    // Average cell (any sheet with includeAverage)
+    if (includeAverage) {
       const ref = encode({ r: wsRowIdx, c: totalCols - 1 });
       const avg = averageVisiblePct(row, columns);
       const hasAvg = (avg != null && isFinite(avg));
@@ -2908,7 +2908,7 @@ function xlsxBuildTrendSheet(XLSX, { columns, rows, isUbs }){
   // ── Layout properties ──
   const cols = [{ wch: 22 }];
   for (let i = 0; i < columns.length; i++) cols.push({ wch: 16 });
-  if (isUbs) cols.push({ wch: 18 });
+  if (includeAverage) cols.push({ wch: 18 });
   ws['!cols'] = cols;
   const rowsMeta = [];
   if (isUbs) rowsMeta.push({ hpt: 22 });
@@ -4206,6 +4206,9 @@ function App(){
           columns: visibleCols,
           rows: dataset.rows,
           isUbs: false,
+          // Prices tab now shows the Average column (mean of visible subcats,
+          // blanks excluded) — keep the downloaded TI sheets consistent.
+          includeAverage: true,
         });
         XLSX.utils.book_append_sheet(wb, ws, `TI · ${v.short}`);
       });
@@ -4528,7 +4531,7 @@ function App(){
         })}
       </div>
 
-      {activeTab==='prices'&&<TrendSeriesPanel vis={vis} setVis={setVis} hiddenSub={hiddenSub} setHiddenSub={setHiddenSub} isRateLimited={isRateLimited} fetchedAt={fetchedAt} GC={GC} CATS={CATS} B={B} />}
+      {activeTab==='prices'&&<TrendSeriesPanel vis={vis} setVis={setVis} hiddenSub={hiddenSub} setHiddenSub={setHiddenSub} isRateLimited={isRateLimited} fetchedAt={fetchedAt} GC={GC} CATS={CATS} B={B} showAverageColumn />}
       {activeTab==='ubs'&&(
         <div className="ubs-compare-scope">
           <TrendSeriesPanel
